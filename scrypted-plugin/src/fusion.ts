@@ -11,6 +11,8 @@ export type Verdict = 'pending' | 'confirmed' | 'vetoed' | 'unverified';
 
 export interface SourceStat {
     role: Role;
+    /** the source's observations were ambiguous (a split camera's whole-frame AI) */
+    ambiguous?: boolean;
     count: number;
     max_score: number | null;
     first: number;
@@ -162,6 +164,7 @@ export function addTo(s: Subject, o: Observation) {
     const st = s.sources[o.source] ??= { role: o.role, count: 0, max_score: null, first: o.t, last: o.t };
     st.count++;
     st.role = o.role;
+    if (o.ambiguous) st.ambiguous = true;
     st.first = Math.min(st.first, o.t);
     st.last = Math.max(st.last, o.t);
     if (o.score !== null) {

@@ -99,7 +99,7 @@ export function publicEvent(ev: EventRecord) {
 }
 
 export function publicObservation(o: Observation) {
-    return { t: o.t, source: o.source, role: o.role, kind: o.kind, class: o.class, raw: o.raw, score: o.score, box: o.box, track: o.track, label: o.label, zones: o.zones };
+    return { t: o.t, source: o.source, role: o.role, kind: o.kind, class: o.class, raw: o.raw, score: o.score, box: o.box, track: o.track, label: o.label, zones: o.zones, ambiguous: !!o.ambiguous };
 }
 
 export class EpisodeTracker {
@@ -121,10 +121,50 @@ export class EpisodeTracker {
     private get fusion() { return this.cfg.fusion ?? DEFAULT_FUSION; }
     private now() { return this.env.clock.now(); }
 
+    /** recent ambiguous observations, attached when a view-specific subject of their family appears within the class-time window */
+    private ambiguousBuf: Observation[] = [];
+
+    /**
+     * An ambiguous observation (a split camera's whole-frame AI): never opens an event or creates a subject; it is trigger
+     * evidence for a subject of the same family within the class-time window, now or when one appears shortly after.
+     */
+    private observeAmbiguous(o: Observation) {
+        const fam = familyOf(o.class);
+        if (fam === 'any') return;
+        const ev = this.current;
+        const s = ev?.subjects.filter(x => x.family === fam && Math.abs(o.recv - x.lastRecv) <= this.fusion.classTimeMs)
+            .sort((a, b) => b.lastRecv - a.lastRecv)[0];
+        if (!ev || !s) {
+            this.ambiguousBuf = [...this.ambiguousBuf.filter(x => this.now() - x.recv <= this.fusion.classTimeMs), o].slice(-16);
+            return;
+        }
+        this.attachAmbiguous(ev, s, o);
+        this.queueUpdate(o);
+        this.scheduleEnd();
+    }
+
+    private attachAmbiguous(ev: EventRecord, s: Subject, o: Observation) {
+        this.count(ev, o);
+        addTo(s, o);
+        ev.last_observation = Math.max(ev.last_observation, o.t);
+        ev.lastRecv = Math.max(ev.lastRecv, o.recv);
+    }
+
+    /** A new view-specific subject: buffered ambiguous observations of its family from the last seconds join it. */
+    private claimBuffered(ev: EventRecord, s: Subject) {
+        const keep: Observation[] = [];
+        for (const o of this.ambiguousBuf) {
+            if (familyOf(o.class) === s.family && Math.abs(s.firstRecv - o.recv) <= this.fusion.classTimeMs) this.attachAmbiguous(ev, s, o);
+            else keep.push(o);
+        }
+        this.ambiguousBuf = keep;
+    }
+
     /** A trigger, verifier or enricher observation (ignore is filtered out before). */
     observe(o: Observation) {
         if (this.stopped || o.role === 'ignore')
             return;
+        if (o.ambiguous) { this.observeAmbiguous(o); return; }
         if (o.role === 'enricher') {
             const ev = this.current;
             if (!ev) return;
@@ -264,6 +304,7 @@ export class EpisodeTracker {
             }
             s = newSubject(`s${ev.subjects.length + 1}`, o);
             ev.subjects.push(s);
+            if (this.ambiguousBuf.length) this.claimBuffered(ev, s);
             if (confirming) {
                 this.verdict(ev, s, 'confirmed', o.source, false);
                 return s;

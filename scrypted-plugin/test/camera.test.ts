@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CameraCore, CameraSink, PLAIN_DEDUPE_MS } from '../src/camera';
-import { RolesTable } from '../src/roles';
+import { CameraCore, CameraSink, isMirror, PLAIN_DEDUPE_MS } from '../src/camera';
+import { RolesTable, signalRole } from '../src/roles';
 import { FakeScrypted } from './fakes';
 import { FakeClock } from './helpers';
 
@@ -193,7 +193,8 @@ test('a source first seen through motion is not locked as a trigger: its first d
     x.sc.emit('7', 'MotionSensor', true, {}, '914');
     const row = x.roles.get('some/analyzer')!;
     assert.equal(row.roleSet, false);
-    assert.equal(row.signalRole, 'trigger', 'never a verifier from a signal');
+    assert.equal(row.role, 'trigger', 'a trigger until its first detection');
+    assert.equal(signalRole(row), 'trigger', 'never a verifier from a signal');
     x.sc.emit('7', 'ObjectDetector', { sourceId: '914', timestamp: x.clock.now(), detections: [{ className: 'person', score: 1 }] });
     assert.equal(x.roles.get('some/analyzer')!.role, 'verifier');
     assert.equal(x.roles.get('some/analyzer')!.roleSet, true);
@@ -275,4 +276,90 @@ test('a verifier is present only while it is a mixin of the camera; its liveness
     assert.equal(x.core.verifierLive(), false);
     x.sc.devices.get('7')!.mixins = ['911'];
     assert.deepEqual(x.core.verifiers(), [], 'removed from the camera: no longer present');
+});
+
+// ---- split cameras: a parent whose stitched frame is split into views (crop children; mirrors for another Home) ---------
+
+function splitSetup() {
+    const sc = new FakeScrypted();
+    const clock = new FakeClock();
+    const roles = new RolesTable();
+    const cams = ['VideoCamera', 'Camera', 'MotionSensor', 'OccupancySensor', 'ObjectDetector'];
+    sc.add({ id: '913', pluginId: CG, interfaces: [] });
+    sc.add({ id: '501', name: 'Parent', pluginId: CAMP, nativeId: 'cam1', interfaces: cams, mixins: ['913'] });
+    sc.add({ id: '502', name: 'Parent crop', pluginId: CAMP, nativeId: 'cam1-crop-gate', providerId: '501', interfaces: cams, mixins: ['913'] });
+    sc.add({ id: '503', name: 'Parent mirror', pluginId: CAMP, nativeId: 'cam1-mirror-gate', providerId: '501', interfaces: cams, mixins: [] });
+    sc.pluginIds.set(CAMP, CAMP);
+    const out: Record<string, { type: string; body: any }[]> = { '501': [], '502': [] };
+    const mk = (id: string) => {
+        const core = new CameraCore(sc.env(id, clock, roles), {
+            publish: (type, body) => out[id].push({ type, body }), eventStarted: () => { }, eventEnded: () => { }, subjectDecided: () => { },
+        });
+        core.bind();
+        return core;
+    };
+    const parent = mk('501'), crop = mk('502');
+    // Coral Guard was seen on both views earlier (so subjects wait for it), then the scene went quiet
+    sc.emit('501', 'ObjectDetector', { sourceId: '913', timestamp: clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    sc.emit('502', 'ObjectDetector', { sourceId: '913', timestamp: clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    clock.advance(30_000);
+    out['501'].length = 0; out['502'].length = 0;
+    const ai = () => sc.emit('501', 'ObjectDetector', { sourceId: CAMP, timestamp: clock.now(), detections: [{ className: 'people', score: 0.9 }] });
+    const coralOnCrop = () => sc.emit('502', 'ObjectDetector', { sourceId: '913', timestamp: clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    return { sc, clock, roles, parent, crop, out, ai, coralOnCrop };
+}
+
+test('split: capabilities name the views and the parent; mirrors are not views and are never observed', () => {
+    const x = splitSetup();
+    assert.equal(x.parent.isSplit(), true);
+    assert.deepEqual(x.parent.views(), ['502']);
+    assert.equal(x.parent.parentId(), undefined);
+    assert.equal(x.crop.isSplit(), true);
+    assert.equal(x.crop.parentId(), '501');
+    assert.equal(isMirror(x.sc.devices.get('503')), true);
+    assert.equal(isMirror(x.sc.devices.get('502')), false);
+});
+
+test('split: the parent\'s whole-frame AI alone opens no event, on the parent or on the crop', () => {
+    const x = splitSetup();
+    for (let i = 0; i < 5; i++) { x.ai(); x.clock.advance(1000); }
+    x.clock.advance(20_000);
+    assert.equal(x.out['501'].length, 0);
+    assert.equal(x.out['502'].length, 0);
+});
+
+test('split: Coral Guard on the crop opens the event; the parent\'s AI within 2 s joins it as ambiguous trigger evidence', () => {
+    const x = splitSetup();
+    x.ai();                      // the camera AI is usually first (spike S1: 0.8-1 s before Coral Guard)
+    x.clock.advance(900);
+    x.coralOnCrop();
+    x.clock.advance(800);
+    x.ai();
+    x.clock.advance(1000);
+    const starts = x.out['502'].filter(m => m.type === 'event.start');
+    assert.equal(starts.length, 1);
+    assert.equal(x.out['501'].filter(m => m.type === 'event.start').length, 0, 'nothing on the parent view');
+    const ev = x.out['502'].filter(m => m.type === 'event.update').pop()!.body.event;
+    assert.equal(ev.subjects.length, 1);
+    const s = ev.subjects[0];
+    assert.equal(s.verdict, 'confirmed');
+    assert.deepEqual(Object.keys(s.sources).sort(), [CAMP, CG].sort());
+    assert.equal(s.sources[CAMP].ambiguous, true);
+    assert.equal(s.sources[CAMP].role, 'trigger');
+    assert.equal(s.sources[CAMP].count, 2, 'the buffered one and the later one');
+    assert.equal(s.sources[CG].ambiguous, undefined);
+    const obs = x.out['502'].filter(m => m.type === 'event.update').flatMap(m => m.body.observations);
+    assert.ok(obs.some((o: any) => o.source === CAMP && o.ambiguous === true));
+});
+
+test('split: the parent\'s AI of another family, or later than 2 s, does not join', () => {
+    const x = splitSetup();
+    x.coralOnCrop();
+    x.clock.advance(2500);
+    x.ai();
+    x.sc.emit('501', 'ObjectDetector', { sourceId: CAMP, timestamp: x.clock.now(), detections: [{ className: 'vehicle', score: 0.9 }] });
+    x.clock.advance(1000);
+    const ev = x.out['502'].filter(m => m.type === 'event.update').pop()?.body.event ?? x.out['502'][0].body.event;
+    assert.equal(ev.subjects.length, 1);
+    assert.equal(ev.subjects[0].sources[CAMP], undefined);
 });

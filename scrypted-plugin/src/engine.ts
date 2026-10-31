@@ -129,6 +129,8 @@ export class Engine implements CameraSink {
         const clock = host.clock;
         this.started = clock.now();
         this.roles = new RolesTable(host.storageGet('roles'), () => this.saveRoles());
+        // rows stored by 0.1.0 (a separate signal role) are rewritten once in the current shape
+        if (RolesTable.needsMigration(host.storageGet('roles'))) host.storageSet('roles', this.roles.toJSON());
         this.store = new SegmentStore({ ttlMs: 10 * 60_000, maxBytes: this.num('memoryMB') * 1024 * 1024, maxEvents: RECENT_EVENTS }, clock);
         this.store.onEvict = (id, ns) => this.evicted(id, ns);
         this.playback = new PlaybackManager(undefined, () => clock.now());
@@ -627,6 +629,9 @@ export class Engine implements CameraSink {
                     video_recorder: ifs.includes('VideoRecorder'),
                     video_clips: ifs.includes('VideoClips'),
                     audio: opt ? opt.audio : null,
+                    split: c.isSplit(),
+                    views: c.views(),
+                    parent: c.parentId() ?? null,
                     verifier_present: verifiers.length > 0,
                     verifier_live: c.verifierLive(),
                     verifiers,

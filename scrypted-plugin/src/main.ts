@@ -5,10 +5,10 @@ import sdk, { FFmpegInput, HttpRequest, HttpRequestHandler, HttpResponse, MixinP
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from '@scrypted/sdk/settings-mixin';
 import child_process from 'child_process';
 import { apiPath, ClipInfo, clipInfo } from './api';
-import { CameraCore, CameraEnv, DeviceState, Iface } from './camera';
+import { CameraCore, CameraEnv, DeviceState, Iface, isMirror } from './camera';
 import { NUMBER_SETTINGS, PLUGIN_ID, readNumber, NumberKey } from './config';
 import { Engine, Host, StreamOptionsInfo } from './engine';
-import { formatClassMap, parseClassMap, Role, ROLES } from './roles';
+import { applySourceSetting, sourceSettings } from './settings';
 import { buildInputArgs, StreamInput } from './segmenter';
 import { cleanLabel, errText, realClock, tokenFingerprint, withTimeout } from './util';
 
@@ -20,7 +20,7 @@ function deviceState(id: string): DeviceState | undefined {
     const d: any = systemManager.getDeviceById(id);
     if (!d || !Array.isArray(d.interfaces)) return undefined;
     return {
-        name: d.name, pluginId: d.pluginId, interfaces: d.interfaces, mixins: d.mixins,
+        name: d.name, pluginId: d.pluginId, nativeId: d.nativeId, providerId: d.providerId, interfaces: d.interfaces, mixins: d.mixins,
         motionDetected: d.motionDetected, occupied: d.occupied, audioDetected: d.audioDetected, binaryState: d.binaryState, online: d.online,
     };
 }
@@ -40,7 +40,8 @@ async function toInput(mo: any): Promise<StreamInput> {
 }
 
 export class StaminaMixin extends SettingsMixinDeviceBase<any> {
-    readonly core: CameraCore;
+    /** undefined for a mirror camera: it is never observed (its source camera is), so no duplicate events */
+    readonly core?: CameraCore;
 
     constructor(options: SettingsMixinDeviceOptions<any>, private provider: StaminaProvider) {
         super(options);
@@ -66,11 +67,18 @@ export class StaminaMixin extends SettingsMixinDeviceBase<any> {
             episode: () => provider.engine.episodeConfig(),
             selfPlugin: PLUGIN_ID,
         };
+        // a mirror view repeats a crop for another Home: observing it would duplicate that crop's events
+        if (isMirror(deviceState(id))) {
+            this.console.log(`${this.name || id}: a mirror view, not observed (its source camera is)`);
+            return;
+        }
         // a rebuilt mixin chain re-creates the mixin: the camera's core (tracker, open event) carries over
         this.core = provider.engine.attach(env);
     }
 
     async getMixinSettings(): Promise<Setting[]> {
+        if (!this.core)
+            return [{ key: 'stamina:status', title: 'Stamina', readonly: true, value: 'Mirror view: not observed. Its source camera is, so its events are not duplicated.' }];
         const info = this.provider.engine.camerasInfo().find(c => c.id === this.id);
         const caps = info?.capabilities;
         const yes = (v: unknown) => v === null || v === undefined ? 'unknown' : v ? 'yes' : 'no';
@@ -96,7 +104,7 @@ export class StaminaMixin extends SettingsMixinDeviceBase<any> {
 
     async release() {
         if (this.provider.live.get(this.id) === this) this.provider.live.delete(this.id);
-        if (!this.replaced) this.provider.engine.detach(this.id);
+        if (!this.replaced && this.core) this.provider.engine.detach(this.id);
     }
 }
 
@@ -104,6 +112,8 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
     readonly engine: Engine;
     readonly live = new Map<string, StaminaMixin>();
     private ffmpegPromise?: Promise<string>;
+    /** class map rows dropped at the last save, per source (shown in its description) */
+    private classMapInvalid = new Map<string, string[]>();
     private endpoint?: string;
 
     constructor(nativeId?: string) {
@@ -160,6 +170,12 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
         return this.ffmpegPromise;
     }
 
+    /** A plugin's display name (its root device's name), when Scrypted knows it. */
+    private pluginName(source: string): string | undefined {
+        try { return cleanLabel((systemManager.getDeviceById(source) as any)?.name, 64); }
+        catch { return undefined; }
+    }
+
     private async integrationUrl(): Promise<string> {
         if (!this.endpoint) {
             try { this.endpoint = await withTimeout(endpointManager.getInsecurePublicLocalEndpoint(), 5000, 'endpoint'); }
@@ -180,25 +196,7 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
             { group: 'Video', key: 'segments', title: 'Video segments', type: 'boolean', value: e.segmentsEnabled(), description: 'Cut fMP4 segments from the prebuffer at every event start. Off: events only (shadow mode).' },
             ...NUMBER_SETTINGS.map((s): Setting => ({ group: s.group, key: s.key, title: s.title, type: 'integer', range: [s.min, s.max], description: `${s.description} ${s.min} to ${s.max}, default ${s.def}.`, value: readNumber(s.key as NumberKey, this.storage.getItem(s.key)) })),
         ];
-        for (const r of e.roles.list()) {
-            settings.push({
-                group: 'Roles', subgroup: r.source, key: `role:${r.source}`, title: 'Detections', choices: ROLES, value: r.role,
-                description: `${!r.roleSet ? 'No detection seen yet' : r.inferred ? 'Inferred default' : 'Chosen'}; first seen ${new Date(r.firstSeen).toISOString().slice(0, 16)}. Applies to every camera.`,
-            });
-            settings.push({
-                group: 'Roles', subgroup: r.source, key: `signal:${r.source}`, title: 'Motion, occupancy, audio', choices: ROLES, value: r.signalRole,
-                description: 'Role of the classless signals. Verifier takes effect only for a gated source.',
-            });
-            settings.push({
-                group: 'Roles', subgroup: r.source, key: `gated:${r.source}`, title: 'Gated', type: 'boolean', value: r.gated,
-                description: 'Its motion/occupancy turn on only after its own verification (Coral Guard Gate mode): such a signal may confirm a subject.',
-            });
-        }
-        for (const r of e.roles.list()) {
-            settings.push({ group: 'Class map', key: `classmap:${r.source}`, title: r.source, value: formatClassMap(r.classMap), description: 'raw=normalised pairs, comma separated (people=person, dog_cat=animal). Unknown classes pass through.' });
-        }
-        if (!e.roles.list().length)
-            settings.push({ group: 'Roles', key: 'rolesEmpty', title: 'Sources', readonly: true, value: 'A row appears for each plugin the first time it emits a detection on a camera with the Stamina extension.' });
+        settings.push(...sourceSettings(e.roles.list(), src => this.pluginName(src), this.classMapInvalid));
         return settings;
     }
 
@@ -208,15 +206,7 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
         else if (key === 'regenerateToken') { e.regenerateToken(); this.console.log('API token regenerated.'); }
         else if (key === 'segments') this.storage.setItem('segments', String(value === true || value === 'true'));
         else if (NUMBER_SETTINGS.some(s => s.key === key)) this.storage.setItem(key, String(readNumber(key as NumberKey, String(value))));
-        else if (key.startsWith('role:')) {
-            const src = key.slice(5);
-            if (ROLES.includes(value as Role)) e.roles.setRole(src, value as Role);
-        }
-        else if (key.startsWith('signal:')) {
-            if (ROLES.includes(value as Role)) e.roles.setSignalRole(key.slice(7), value as Role);
-        }
-        else if (key.startsWith('gated:')) e.roles.setGated(key.slice(6), value === true || value === 'true');
-        else if (key.startsWith('classmap:')) e.roles.setClassMap(key.slice(9), parseClassMap(String(value ?? '')));
+        else if (applySourceSetting(e.roles, key, value, this.classMapInvalid)) { /* roles and class maps */ }
         else return;
         e.applySettings();
         this.onDeviceEvent(ScryptedInterface.Settings, undefined);

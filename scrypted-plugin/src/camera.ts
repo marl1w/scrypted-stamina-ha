@@ -12,6 +12,9 @@ export type Iface = 'ObjectDetector' | 'MotionSensor' | 'OccupancySensor' | 'Aud
 export interface DeviceState {
     name?: string;
     pluginId?: string;
+    nativeId?: string;
+    /** the device that provides it (a crop camera's parent camera) */
+    providerId?: string;
     interfaces: string[];
     mixins?: string[];
     motionDetected?: boolean;
@@ -67,6 +70,11 @@ export const PLAIN_DEDUPE_MS = 300;
 const SAME_EDGE_MS = 1000;
 type BinaryKind = 'motion' | 'occupancy' | 'audio';
 const KIND_IFACE: Record<BinaryKind, Iface> = { motion: 'MotionSensor', occupancy: 'OccupancySensor', audio: 'AudioSensor' };
+
+/** A mirror camera repeats another camera's view (for another Home): never observed, so no duplicate events. */
+export function isMirror(st: Pick<DeviceState, 'nativeId'> | undefined): boolean {
+    return /-mirror-/i.test(String(st?.nativeId ?? ''));
+}
 
 export type Feature = 'night_mode' | 'tamper' | 'motion' | 'occupied' | 'audio' | 'online';
 
@@ -133,7 +141,8 @@ export class CameraCore {
         if (!st) return;
         const kids = this.env.children();
         this.kids = kids;
-        const key = JSON.stringify([st.interfaces, st.mixins ?? [], kids]);
+        const parent = this.parentId();
+        const key = JSON.stringify([st.interfaces, st.mixins ?? [], kids, parent ?? null]);
         if (key === this.boundKey) return;
         this.unbind();
         this.boundKey = key;
@@ -145,6 +154,8 @@ export class CameraCore {
         const has = (s: DeviceState | undefined, i: string) => !!s?.interfaces?.includes(i);
         // ObjectDetector events are not masked by mixins and carry sourceId: one plain listener (spike S1)
         if (has(st, 'ObjectDetector')) on(id, 'ObjectDetector', (d, data) => this.onDetections(d, data));
+        // a crop camera: its parent's whole-frame AI applies to it as ambiguous evidence (nothing else of the parent does)
+        if (parent && has(this.env.state(parent), 'ObjectDetector')) on(parent, 'ObjectDetector', (d, data) => this.onDetections(d, data, parent));
         // property events (motion, occupancy, audio) carry no mixinId and a mixin that owns the interface masks the camera's
         // own value: listen per layer (the device itself, then each mixin), attributed to that layer's plugin; the plain
         // listener is the fallback for a layer that cannot be listened to, deduplicated against the layer edges
@@ -172,7 +183,7 @@ export class CameraCore {
         for (const k of kids) {
             const ks = this.env.state(k);
             if (!ks) continue;
-            // a child camera has its own mixin: not ours to observe
+            // a child camera (a view: crop or mirror) has its own mixin: not ours to observe
             if (has(ks, 'VideoCamera')) continue;
             if (has(ks, 'OccupancySensor')) on(k, 'OccupancySensor', (d, v) => this.onBinary('occupancy', `occupancy:${k}`, d, !!v, k));
             if (has(ks, 'BinarySensor')) on(k, 'BinarySensor', (_d, v) => this.contextChanged(k, featureOf(ks.name), !!v));
@@ -250,12 +261,43 @@ export class CameraCore {
         return { roles: this.env.roles, cameraPlugin: this.cameraPlugin, now: this.env.clock.now() };
     }
 
-    onDetections(d: Details, data: any) {
+    /** The parent camera, when this camera is a view (crop) of another camera. */
+    parentId(): string | undefined {
+        const p = this.env.state(this.env.id)?.providerId;
+        return p && p !== this.env.id && this.env.state(p)?.interfaces?.includes('VideoCamera') ? p : undefined;
+    }
+
+    /** The views of this camera: its VideoCamera children that are not mirrors (crops). */
+    views(): string[] {
+        return this.kids.filter(k => this.env.state(k)?.interfaces?.includes('VideoCamera') && !isMirror(this.env.state(k))).sort();
+    }
+
+    /** A split camera: its frame is shared with views (it has VideoCamera children), or it is a view of another camera. */
+    isSplit(): boolean {
+        return !!this.parentId() || this.kids.some(k => this.env.state(k)?.interfaces?.includes('VideoCamera'));
+    }
+
+    /**
+     * Detections of this camera, or (`fromParent`) of its parent camera. On a split camera a box-less detection from the camera's
+     * own plugin (or the parent's) covers the whole stitched frame: it is ambiguous, evidence only for a view-specific subject.
+     * From the parent only those ambiguous ones are taken (the parent's other detections belong to the parent's own view).
+     */
+    onDetections(d: Details, data: any, fromParent?: string) {
         if (!data || typeof data !== 'object') return;
         const ctx = this.ctx();
-        const source = attribute({ mixinId: d.mixinId, sourceId: typeof data.sourceId === 'string' ? data.sourceId : undefined }, x => this.env.pluginOf(x), ctx.cameraPlugin);
-        const obs = fromDetections(data, source, d.eventTime, ctx);
-        for (const o of obs) this.feed(o);
+        const ownPlugin = fromParent ? (this.env.state(fromParent)?.pluginId ?? ctx.cameraPlugin) : ctx.cameraPlugin;
+        const source = attribute({ mixinId: d.mixinId, sourceId: typeof data.sourceId === 'string' ? data.sourceId : undefined }, x => this.env.pluginOf(x), ownPlugin);
+        const split = this.isSplit();
+        const parentPlugin = this.parentId() ? this.env.state(this.parentId()!)?.pluginId : undefined;
+        const obs = fromDetections(data, source, d.eventTime, { ...ctx, cameraPlugin: ownPlugin });
+        for (const o of obs) {
+            if (split && !o.box && o.role !== 'enricher' && (o.source === ctx.cameraPlugin || o.source === parentPlugin)) {
+                o.ambiguous = true;
+                o.role = 'trigger';
+            }
+            if (fromParent && !o.ambiguous) continue;
+            this.feed(o);
+        }
     }
 
     onBinary(kind: BinaryKind, key: string, d: Details, on: boolean, device: string, layerSource?: string) {

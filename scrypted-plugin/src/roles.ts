@@ -17,9 +17,7 @@ export interface RoleRow {
     inferred: boolean;
     /** the detection role is decided (from a detection or by the user); false while only signals were seen */
     roleSet: boolean;
-    /** role of the source's classless signals (motion, occupancy, audio edges): never `verifier` unless `gated` */
-    signalRole: Role;
-    /** the source gates the camera's signals on its own verification (Coral Guard): its classless signals may confirm */
+    /** a verifier whose motion/occupancy turn on only after its own verification (Coral Guard): those signals confirm */
     gated: boolean;
     /** raw class name -> normalised class */
     classMap: Record<string, string>;
@@ -94,9 +92,13 @@ export function inferRole(f: FirstSeen): Role {
     return 'verifier';
 }
 
-/** Inferred role of a source's classless signals: a trigger, or a verifier only when the source is gated. */
-export function inferSignalRole(gated: boolean): Role {
-    return gated ? 'verifier' : 'trigger';
+/**
+ * Role of a source's classless signals (motion, occupancy, audio), derived from its one role: ignored with it, a
+ * verifier only for a gated verifier, otherwise always a trigger (a signal never verifies by itself).
+ */
+export function signalRole(r: Pick<RoleRow, 'role' | 'gated'>): Role {
+    if (r.role === 'ignore') return 'ignore';
+    return r.role === 'verifier' && r.gated ? 'verifier' : 'trigger';
 }
 
 const SOURCE_RE = /^[A-Za-z0-9@._/-]{1,100}$/;
@@ -123,6 +125,29 @@ export function formatClassMap(m: Record<string, string>): string {
     return Object.entries(m).map(([a, b]) => `${a}=${b}`).join(', ');
 }
 
+/** The class map as list rows for the settings page: "people → person". */
+export function classMapRows(m: Record<string, string>): string[] {
+    return Object.entries(m).map(([a, b]) => `${a} → ${b}`);
+}
+
+const CLASS_RE = /^[\w.:-]{1,48}$/;
+
+/** List rows ("raw → class" or "raw = class", one each) to a map; rows that do not parse are returned as invalid. */
+export function parseClassMapRows(rows: unknown): { map: Record<string, string>; invalid: string[] } {
+    const list = Array.isArray(rows) ? rows : typeof rows === 'string' ? rows.split(/[\n,;]/) : [];
+    const map: Record<string, string> = {};
+    const invalid: string[] = [];
+    for (const raw of list.slice(0, 128)) {
+        const text = String(raw ?? '').trim();
+        if (!text) continue;
+        const m = /^(.+?)\s*(?:→|->|=)\s*(.+)$/.exec(text);
+        const from = m?.[1].trim(), to = m?.[2].trim();
+        if (from && to && CLASS_RE.test(from) && CLASS_RE.test(to) && Object.keys(map).length < 64) map[from] = to;
+        else invalid.push(text.slice(0, 60));
+    }
+    return { map, invalid };
+}
+
 /** The table, persisted as JSON by the provider. Bounded: at most 64 sources. */
 export class RolesTable {
     private rows = new Map<string, RoleRow>();
@@ -142,15 +167,15 @@ export class RolesTable {
             for (const r of arr.slice(0, RolesTable.MAX_ROWS)) {
                 if (!r || typeof r.source !== 'string' || !validSource(r.source)) continue;
                 const role: Role = ROLES.includes(r.role) ? r.role : 'trigger';
+                // rows of 0.1.0 had a separate signal role: it is dropped (signals now follow the one role)
                 const gated = typeof r.gated === 'boolean' ? r.gated : KNOWN_GATED.includes(r.source);
-                const signalRole: Role = ROLES.includes(r.signalRole) ? r.signalRole : role === 'ignore' ? 'ignore' : inferSignalRole(gated);
                 const classMap: Record<string, string> = {};
                 if (r.classMap && typeof r.classMap === 'object')
                     for (const [k, v] of Object.entries(r.classMap).slice(0, 64))
                         if (typeof v === 'string' && cleanLabel(k) && cleanLabel(v)) classMap[cleanLabel(k)!] = cleanLabel(v)!;
                 this.rows.set(r.source, {
                     source: r.source, role, inferred: !!r.inferred, roleSet: typeof r.roleSet === 'boolean' ? r.roleSet : true,
-                    signalRole, gated, classMap, firstSeen: Number(r.firstSeen) || 0, lastSeen: Number(r.lastSeen) || 0,
+                    gated, classMap, firstSeen: Number(r.firstSeen) || 0, lastSeen: Number(r.lastSeen) || 0,
                 });
             }
         }
@@ -159,6 +184,12 @@ export class RolesTable {
 
     toJSON(): string {
         return JSON.stringify([...this.rows.values()]);
+    }
+
+    /** Rows of 0.1.0 still carry a separate signal role: rewritten once in the current shape. */
+    static needsMigration(json: string | null | undefined): boolean {
+        try { return Array.isArray(JSON.parse(json || '[]')) && JSON.parse(json || '[]').some((r: any) => r && 'signalRole' in r); }
+        catch { return false; }
     }
 
     list(): RoleRow[] {
@@ -182,8 +213,9 @@ export class RolesTable {
             const gated = KNOWN_GATED.includes(f.source);
             const isObject = f.kind === 'object';
             r = {
-                source: f.source, role: isObject ? inferRole(f) : (f.cameraPlugin === f.source ? 'trigger' : 'verifier'), inferred: true, roleSet: isObject,
-                signalRole: inferSignalRole(gated), gated, classMap: defaultClassMap(f.source), firstSeen: now, lastSeen: now,
+                // a row first seen through a signal is a trigger until its first detection decides (a known verifier plugin is
+                // a verifier by name, not because of the signal)
+                source: f.source, role: isObject ? inferRole(f) : KNOWN_VERIFIERS.includes(f.source) ? 'verifier' : 'trigger', inferred: true, roleSet: isObject, gated, classMap: defaultClassMap(f.source), firstSeen: now, lastSeen: now,
             };
             this.rows.set(f.source, r);
             this.persistedAt.set(f.source, now);
@@ -209,13 +241,6 @@ export class RolesTable {
         r.role = role;
         r.inferred = false;
         r.roleSet = true;
-        this.onChange?.();
-    }
-
-    setSignalRole(source: string, role: Role) {
-        const r = this.rows.get(source);
-        if (!r || !ROLES.includes(role)) return;
-        r.signalRole = role;
         this.onChange?.();
     }
 

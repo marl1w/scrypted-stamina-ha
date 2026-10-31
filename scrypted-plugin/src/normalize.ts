@@ -1,6 +1,6 @@
 // Normalisation: a raw Scrypted signal (ObjectsDetected, a sensor edge) -> Observations with a source, role and mapped class.
 
-import { ObsKind, Role, RolesTable } from './roles';
+import { ObsKind, Role, RolesTable, signalRole } from './roles';
 import { clampNum, cleanLabel } from './util';
 
 /** Normalised box: [x1, y1, x2, y2] as fractions of the frame (0..1). */
@@ -24,6 +24,8 @@ export interface Observation {
     zones: string[] | null;
     /** the source is flagged gated: a classless verifier signal from it may confirm */
     gated?: boolean;
+    /** a box-less detection of a split camera's own AI (whole stitched frame): evidence for a view's subject only */
+    ambiguous?: boolean;
 }
 
 /** A detection timestamp further than this from the receive time is not trusted (clock skew, replays). */
@@ -124,7 +126,7 @@ const KIND_CLASS: Record<Exclude<ObsKind, 'object'>, string> = { motion: 'motion
 export function fromBinary(kind: Exclude<ObsKind, 'object'>, on: boolean, source: string, eventTime: number | undefined, ctx: NormalizeContext): Observation | undefined {
     const row = ctx.roles.ensure({ source, kind, cameraPlugin: ctx.cameraPlugin }, ctx.now);
     // classless signals use the row's signal role: never a verifier unless the source is gated
-    const role: Role | undefined = row ? (row.signalRole === 'verifier' && !row.gated ? 'trigger' : row.signalRole) : undefined;
+    const role: Role | undefined = row ? signalRole(row) : undefined;
     if (!role || role === 'ignore' || !on)
         return undefined;
     const cls = KIND_CLASS[kind];
