@@ -58,11 +58,9 @@ def _classify(what: str, err: Exception) -> Exception:
 class WebDavDestination(Destination):
     """Event folders on a WebDAV server.
 
-    WebDAV has `MOVE` for collections (RFC 4918 §9.9) and a recursive `DELETE`, so a commit
-    is one request and so is a drop.
+    WebDAV has a recursive `DELETE` (RFC 4918 §9.6.1), so deleting a pending folder, after a
+    commit or for a drop, is one request.
     """
-
-    can_move = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Bind to a loaded WebDAV config entry."""
@@ -182,20 +180,6 @@ class WebDavDestination(Destination):
             return bytes(data)
 
         return await async_attempt(f"WebDAV read of {path}", attempt)
-
-    async def async_move(self, source: str, target: str) -> None:
-        """Move a folder with one `MOVE`, creating the target's parents first."""
-        parent, _, _ = target.rpartition("/")
-
-        async def attempt() -> None:
-            client = self._client
-            if parent:
-                await self._async_ensure_folder(parent)
-            await self._async_call(
-                f"move of {source}", client.move(source, target, overwrite=False)
-            )
-
-        await async_attempt(f"WebDAV move of {source}", attempt)
 
     async def async_delete_folder(self, folder: str) -> None:
         """Remove a folder with one recursive `DELETE`."""

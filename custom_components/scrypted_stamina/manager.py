@@ -139,7 +139,7 @@ from .decider import (
 from .devices import CameraDevice, async_relink, own_identifier, resolve_camera
 from .index import ACTION_COMMIT, ACTION_DROP, EventIndex
 from .link import StaminaLink
-from .naming import event_folder_name
+from .naming import event_file_name, event_folder_name
 from .protocol import (
     MSG_END,
     MSG_SEGMENT,
@@ -1035,8 +1035,6 @@ class StaminaManager:
             elif state is EventState.DROPPING:
                 await self._async_set_state(record, state)
                 await self._async_drop(record)
-        elif record.state in (EventState.COMMITTED, EventState.ORPHANED):
-            await self.uploader.async_update_details(record)
         if not record.admitted and record.state is not EventState.FOLLOW_UP:
             # Uploads were off and the window did not change that: let the plugin go.
             await self.uploader.async_release(record)
@@ -1419,12 +1417,16 @@ class StaminaManager:
             self._one_shots[key] = async_call_later(self.hass, delay, _later)
 
     def cloud_path(self, record: EventRecord) -> str | None:
-        """Return the event's path inside each destination's folder, for attributes."""
+        """Return the event's path inside each destination's folder, for attributes.
+
+        A settled event is its video; one still uploading is its pending folder.
+        """
         if record.state is EventState.DROPPED or not record.folder:
             return None
-        settled = record.state is EventState.COMMITTED or ORPHAN_COMPLETE in record.notes
-        kind = (record.target or FOLDER_EVENTS) if settled else "pending"
-        return f"{kind}/{record.area}/{record.folder}"
+        if record.state is EventState.COMMITTED or ORPHAN_COMPLETE in record.notes:
+            kind = record.target or FOLDER_EVENTS
+            return f"{kind}/{event_file_name(record.area, record.folder, record.id)}"
+        return f"pending/{record.area}/{record.folder}"
 
     def attributes(self, record: EventRecord) -> dict[str, Any]:
         """Return an event's entity attributes (architecture §3.7)."""

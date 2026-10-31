@@ -308,10 +308,7 @@ async def event_detail(
     capabilities = status.info.capabilities if status is not None else {}
     verifiers = _verifiers(capabilities)
     copies = await data.index.async_copies(record.id)
-    cloud = any(
-        copy.committed and not copy.deleted and "index.m3u8" in copy.files
-        for copy in copies.values()
-    )
+    cloud = any(copy.playable for copy in copies.values())
     age_days = (time.time() - record.facts.started) / 86400
     recorder = has_recorder(capabilities) and age_days <= manager.recorder_retention_days
     linked_kinds = getattr(manager, "linked_kinds", None)

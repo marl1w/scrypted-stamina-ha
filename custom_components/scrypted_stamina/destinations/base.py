@@ -1,14 +1,17 @@
 """What a destination has to be, and the one thing they all get wrong the same way.
 
 Ported from Reolink Stamina, where a destination stored, deleted and listed whole clips.
-Scrypted Stamina writes one file per segment into an event folder and commits the folder by
-moving it, so the interface grows three operations:
+Scrypted Stamina writes one file per segment into a pending folder while the event lasts,
+then commits it as one video: the segments read back, joined, stored, and the folder
+deleted. So the interface grows:
 
-* `async_read` — read a file back, for the copy-then-delete fallback and for playing a
-  committed event through Home Assistant;
-* `async_move` — move a whole folder; providers that cannot leave `can_move` False and the
-  uploader copies then deletes instead;
-* `async_delete_folder` — remove an event folder and everything in it.
+* `async_read` — read a file back, to join the segments and to play a committed event
+  through Home Assistant;
+* `async_store_video` — store the joined video and confirm its size: `async_store`, then
+  `async_size`. A provider with a per-request limit lower than a long event overrides
+  `async_store` with its chunked upload;
+* `async_size` — one file's size, by listing its folder unless the provider can ask;
+* `async_delete_folder` — remove a pending folder and everything in it.
 
 Retrying is still the implementations' problem, and treated as one: a throttled or briefly
 unavailable service is waited out here, with the service's own `Retry-After` honoured, and
@@ -69,14 +72,6 @@ class DestinationError(Exception):
     """Raised when a destination cannot do what was asked of it."""
 
 
-class MoveUnsupportedError(DestinationError):
-    """Raised by `async_move` when this server turns out not to offer a folder move.
-
-    The uploader answers it by copying then deleting, so a provider may advertise
-    `can_move` on the strength of an API that only some servers have.
-    """
-
-
 class UploadTooLargeError(DestinationError):
     """Raised when a file exceeds what this destination will take in one go."""
 
@@ -130,11 +125,7 @@ async def async_attempt[T](
 
 
 class Destination(ABC):
-    """Somewhere event folders can be kept."""
-
-    # Whether `async_move` moves a folder in one server-side operation. Where it does not,
-    # the uploader commits by copying each file and deleting the original.
-    can_move: bool = False
+    """Somewhere events can be kept: pending folders of segments, then one video each."""
 
     @property
     @abstractmethod
@@ -157,9 +148,23 @@ class Destination(ABC):
     async def async_read(self, path: str) -> bytes:
         """Return one file's content."""
 
-    async def async_move(self, source: str, target: str) -> None:
-        """Move a folder, server-side. Only called when `can_move` is True."""
-        raise DestinationError(f"{self.label} cannot move folders")
+    async def async_size(self, path: str) -> int | None:
+        """Return one file's size, or None when it is not there.
+
+        The default lists the file's folder, which every provider can do; the ones that can
+        ask about one file override it.
+        """
+        folder, _, _ = path.rpartition("/")
+        return (await self.async_list(folder)).get(path)
+
+    async def async_store_video(self, path: str, data: bytes) -> None:
+        """Store a committed event's video, and confirm the destination holds all of it."""
+        await self.async_store(path, data)
+        stored = await self.async_size(path)
+        if stored != len(data):
+            raise DestinationError(
+                f"{self.label} holds {stored} bytes of {path}, not the {len(data)} stored"
+            )
 
     async def async_delete_folder(self, folder: str) -> None:
         """Remove a folder and the files in it. Succeeds quietly when it is already gone.

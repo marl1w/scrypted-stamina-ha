@@ -1,8 +1,7 @@
-"""The ported destinations' new operations: move, read and folder delete (spike S4)."""
+"""The destinations' operations beyond store: read, size, the video, folder delete."""
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,18 +9,21 @@ from homeassistant.config_entries import ConfigEntryState
 import pytest
 
 from custom_components.scrypted_stamina.destinations import (
+    DestinationError,
     GoogleDriveDestination,
-    MoveUnsupportedError,
     OneDriveDestination,
     SftpDestination,
     SynologyDestination,
     WebDavDestination,
     async_create_destination,
+    onedrive,
 )
 from custom_components.scrypted_stamina.destinations.base import content_type
 
+from .conftest import FakeDestination
+
 SOURCE = "scrypted-stamina/pending/garden/261031_210509_front-door_ev_1"
-TARGET = "scrypted-stamina/events/garden/261031_210509_front-door_ev_1"
+VIDEO = "scrypted-stamina/events/garden-front-door-261031_210509.mp4"
 
 
 def loaded(domain: str, runtime=None) -> MagicMock:
@@ -42,30 +44,33 @@ def loaded(domain: str, runtime=None) -> MagicMock:
         ("sftp_storage", SftpDestination),
     ],
 )
-def test_every_ported_provider_can_move(domain, cls) -> None:
-    destination = async_create_destination(MagicMock(), loaded(domain))
-    assert isinstance(destination, cls)
-    assert destination.can_move
+def test_every_provider_is_created_from_its_domain(domain, cls) -> None:
+    assert isinstance(async_create_destination(MagicMock(), loaded(domain)), cls)
 
 
 def test_content_types() -> None:
     assert content_type("x/00001.m4s") == "video/iso.segment"
-    assert content_type("x/index.m3u8") == "application/vnd.apple.mpegurl"
-    assert content_type("x/event.json") == "application/json"
+    assert content_type("x/garden-front-door-261031_210509.mp4") == "video/mp4"
 
 
-async def test_webdav_moves_with_one_request_after_making_the_parent() -> None:
+async def test_a_video_is_stored_and_its_size_confirmed() -> None:
+    fake = FakeDestination()
+    await fake.async_store_video(VIDEO, b"video")
+    assert fake.files[VIDEO] == b"video"
+
+    class Lossy(FakeDestination):
+        async def async_store(self, path: str, data: bytes) -> None:
+            await super().async_store(path, data[:2])
+
+    with pytest.raises(DestinationError, match="2 bytes"):
+        await Lossy().async_store_video(VIDEO, b"video")
+
+
+async def test_webdav_deletes_a_folder_with_one_request() -> None:
     client = MagicMock()
-    client.check = AsyncMock(return_value=False)
-    client.mkdir = AsyncMock(return_value=True)
-    client.move = AsyncMock()
+    client.check = AsyncMock(return_value=True)
     client.clean = AsyncMock()
     destination = WebDavDestination(MagicMock(), loaded("webdav", client))
-    await destination.async_move(SOURCE, TARGET)
-    client.move.assert_awaited_once_with(SOURCE, TARGET, overwrite=False)
-    assert client.mkdir.await_args_list[-1].args[0] == "scrypted-stamina/events/garden"
-
-    client.check = AsyncMock(return_value=True)
     await destination.async_delete_folder(SOURCE)
     client.clean.assert_awaited_once_with(SOURCE)
 
@@ -78,106 +83,69 @@ async def test_webdav_reads_a_file_back() -> None:
     client = MagicMock()
     client.download_iter = AsyncMock(return_value=chunks())
     destination = WebDavDestination(MagicMock(), loaded("webdav", client))
-    assert await destination.async_read(f"{TARGET}/init.mp4") == b"abcd"
+    assert await destination.async_read(f"{SOURCE}/init.mp4") == b"abcd"
 
 
-async def test_sftp_renames_and_removes_trees() -> None:
+async def test_sftp_removes_trees() -> None:
     sftp = MagicMock()
-    sftp.makedirs = AsyncMock()
-    sftp.rename = AsyncMock()
     sftp.isdir = AsyncMock(return_value=True)
     sftp.rmtree = AsyncMock()
     config = SimpleNamespace(backup_location="/backups")
     destination = SftpDestination(MagicMock(), loaded("sftp_storage", config))
     destination._sftp = sftp
-    await destination.async_move(SOURCE, TARGET)
-    sftp.rename.assert_awaited_once_with(f"/backups/{SOURCE}", f"/backups/{TARGET}")
-    sftp.makedirs.assert_awaited_once_with("/backups/scrypted-stamina/events/garden", exist_ok=True)
     await destination.async_delete_folder(SOURCE)
     sftp.rmtree.assert_awaited_once_with(f"/backups/{SOURCE}")
 
 
-async def test_onedrive_moves_by_patching_the_parent() -> None:
+async def test_onedrive_stores_a_small_video_in_one_request_and_asks_its_size() -> None:
     destination = OneDriveDestination(MagicMock(), loaded("onedrive"))
     calls = []
 
     async def request(method, url, **kwargs):
         calls.append((method, url, kwargs))
-        if method == "GET":
-            return {"id": f"id-{len(calls)}"}  # every parent exists already
-        return {"id": "moved"}
+        if method == "PUT":
+            return {"id": "v", "size": len(kwargs["data"])}
+        return {"size": 5}
 
     destination._async_request = request
-    await destination.async_move(SOURCE, TARGET)
-    method, url, kwargs = calls[-1]
-    assert method == "PATCH" and url.endswith(f"{SOURCE}:")
-    assert '"name": "261031_210509_front-door_ev_1"' in kwargs["data"]
-    assert '"parentReference": {"id": "id-3"}' in kwargs["data"]
-    # an existing folder is never created again (Graph answers 400 for that under the app folder)
-    assert not [c for c in calls if c[0] == "POST"]
+    await destination.async_store_video(VIDEO, b"video")
+    assert [c[0] for c in calls] == ["PUT", "GET"]
+    assert calls[0][1].endswith(f"{VIDEO}:/content")
+    assert calls[1][2]["params"] == {"$select": "size"}
 
 
-async def test_onedrive_creates_only_missing_parents() -> None:
+async def test_onedrive_uploads_a_large_video_through_a_session(monkeypatch) -> None:
+    monkeypatch.setattr(onedrive, "SIMPLE_UPLOAD_LIMIT", 4)
+    monkeypatch.setattr(onedrive, "SESSION_CHUNK", 4)
     destination = OneDriveDestination(MagicMock(), loaded("onedrive"))
     calls = []
 
     async def request(method, url, **kwargs):
         calls.append((method, url, kwargs))
-        if method == "GET":
-            return {"id": "root"} if url.endswith("scrypted-stamina:") else None  # 404
         if method == "POST":
-            assert kwargs.get("allow_conflict")
-            return {"id": "new-" + json.loads(kwargs["data"])["name"]}
-        return {"id": "moved"}
+            return {"uploadUrl": "https://upload.example/session"}
+        if kwargs["headers"]["Content-Range"].endswith("9/10"):
+            return {"id": "v", "size": 10}
+        return {"nextExpectedRanges": ["4-"]}
 
     destination._async_request = request
-    await destination.async_move(SOURCE, TARGET)
-    posted = [json.loads(c[2]["data"])["name"] for c in calls if c[0] == "POST"]
-    assert posted == ["events", "garden"]
-    assert '"parentReference": {"id": "new-garden"}' in calls[-1][2]["data"]
+    await destination.async_store(VIDEO, b"0123456789")
+    assert calls[0][1].endswith(f"{VIDEO}:/createUploadSession")
+    puts = [c for c in calls if c[0] == "PUT"]
+    assert [c[2]["headers"]["Content-Range"] for c in puts] == [
+        "bytes 0-3/10",
+        "bytes 4-7/10",
+        "bytes 8-9/10",
+    ]
+    assert [c[2]["data"] for c in puts] == [b"0123", b"4567", b"89"]
+    # The session URL is its own credential: Graph refuses a bearer token on it.
+    assert all(c[1] == "https://upload.example/session" and not c[2]["authorize"] for c in puts)
 
 
-async def test_google_drive_moves_by_swapping_parents() -> None:
+async def test_google_drive_asks_one_file_its_size() -> None:
     destination = GoogleDriveDestination(MagicMock(), loaded("google_drive"))
-    destination._folders = {
-        SOURCE: "event-folder",
-        "scrypted-stamina/pending/garden": "pending-garden",
-        "scrypted-stamina/events/garden": "events-garden",
-    }
-    destination._async_request = AsyncMock(return_value={"id": "event-folder"})
-    await destination.async_move(SOURCE, TARGET)
+    destination._folders = {"scrypted-stamina/events": "events"}
+    destination._async_request = AsyncMock(return_value={"files": [{"id": "v", "size": "7"}]})
+    assert await destination.async_size(VIDEO) == 7
     _, kwargs = destination._async_request.await_args
-    assert kwargs["params"]["addParents"] == "events-garden"
-    assert kwargs["params"]["removeParents"] == "pending-garden"
-    assert SOURCE not in destination._folders
-
-
-async def test_synology_moves_with_copymove_and_waits_for_it() -> None:
-    dsm = MagicMock()
-    dsm.get = AsyncMock(
-        side_effect=[
-            {"success": True},  # CreateFolder
-            {"data": {"taskid": "t1"}},  # CopyMove start
-            {"data": {"finished": False}},
-            {"data": {"finished": True}},
-        ]
-    )
-    runtime = SimpleNamespace(api=SimpleNamespace(file_station=MagicMock(), dsm=dsm))
-    destination = SynologyDestination(MagicMock(), loaded("synology_dsm", runtime))
-    await destination.async_move(SOURCE, TARGET)
-    start = dsm.get.await_args_list[1]
-    assert start.args[:2] == ("SYNO.FileStation.CopyMove", "start")
-    assert start.args[2]["dest_folder_path"] == "/scrypted-stamina/events/garden"
-    assert start.args[2]["remove_src"] == "true"
-
-
-async def test_synology_without_copymove_asks_for_the_copy_fallback() -> None:
-    class SynologyDSMAPINotExistsException(Exception):
-        pass
-
-    dsm = MagicMock()
-    dsm.get = AsyncMock(side_effect=SynologyDSMAPINotExistsException("SYNO.FileStation.CopyMove"))
-    runtime = SimpleNamespace(api=SimpleNamespace(file_station=MagicMock(), dsm=dsm))
-    destination = SynologyDestination(MagicMock(), loaded("synology_dsm", runtime))
-    with pytest.raises(MoveUnsupportedError):
-        await destination.async_move(SOURCE, TARGET)
+    assert "'garden-front-door-261031_210509.mp4'" in kwargs["params"]["q"]

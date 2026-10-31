@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 import json
+import re
 import time
 from typing import Any
 from unittest.mock import patch
@@ -48,9 +49,15 @@ def auto_enable_custom_integrations(enable_custom_integrations):
     return enable_custom_integrations
 
 
+@pytest.fixture
+def hass_config_dir(tmp_path) -> str:
+    """Give every test an empty config dir of its own: concurrent runs never share an index."""
+    return str(tmp_path)
+
+
 @pytest.fixture(autouse=True)
 def clean_index(hass: HomeAssistant):
-    """Remove the index after every test: the config dir is shared across the run."""
+    """Remove the index after every test, wherever its config dir is."""
     yield
     from pathlib import Path
 
@@ -429,10 +436,9 @@ async def stamina(socket_enabled, aiohttp_server) -> FakeStamina:
 class FakeDestination(Destination):
     """An in-memory destination, recording what it was asked to do."""
 
-    def __init__(self, *, can_move: bool = True, name: str = "Fake") -> None:
+    def __init__(self, *, name: str = "Fake") -> None:
         self.files: dict[str, bytes] = {}
         self.ops: list[tuple[str, str]] = []
-        self.can_move = can_move
         self.fail: set[str] = set()
         self._name = name
 
@@ -464,11 +470,6 @@ class FakeDestination(Destination):
             raise DestinationError(f"no {path}")
         return self.files[path]
 
-    async def async_move(self, source: str, target: str) -> None:
-        self.ops.append(("move", f"{source} -> {target}"))
-        for path in [p for p in self.files if p.startswith(f"{source}/")]:
-            self.files[target + path[len(source) :]] = self.files.pop(path)
-
     async def async_delete_folder(self, folder: str) -> None:
         self.ops.append(("delete_folder", folder))
         for path in [p for p in self.files if p.startswith(f"{folder}/")]:
@@ -476,6 +477,28 @@ class FakeDestination(Destination):
 
     def under(self, prefix: str) -> list[str]:
         return sorted(path for path in self.files if path.startswith(prefix))
+
+    def videos(self, prefix: str = "scrypted-stamina/events/") -> list[str]:
+        """Return the committed videos under `prefix`."""
+        return [
+            path for path in self.under(prefix) if path.endswith(".mp4") and "/pending/" not in path
+        ]
+
+
+def joined(fake: FakeDestination, prefix: str = "scrypted-stamina/events/") -> set[str]:
+    """Return the files joined into the videos under `prefix`, told apart by their content.
+
+    `FakeStamina` cuts segment n as `seg<n>` repeated, init as `init-<event id>` and a later
+    init k as `init<k>`.
+    """
+    found: set[str] = set()
+    for path in fake.videos(prefix):
+        data = fake.files[path]
+        if b"init-ev_" in data:
+            found.add("init.mp4")
+        found |= {f"init-{int(k)}.mp4" for k in re.findall(rb"init(\d+)", data)}
+        found |= {f"{int(n):05d}.m4s" for n in re.findall(rb"seg(\d+)", data)}
+    return found
 
 
 async def until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:

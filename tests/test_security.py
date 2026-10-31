@@ -33,7 +33,7 @@ from custom_components.scrypted_stamina.const import (
     CONF_VERIFY_SSL,
     DOMAIN,
 )
-from custom_components.scrypted_stamina.playback import _FILE, rewrite_playlist, safe_type
+from custom_components.scrypted_stamina.playback import _byte_range, rewrite_playlist, safe_type
 from custom_components.scrypted_stamina.protocol import EventFacts
 from custom_components.scrypted_stamina.uploader import Target
 
@@ -265,11 +265,15 @@ def test_unrewritable_uris_are_dropped() -> None:
     assert "EXT-X-MAP" not in out and "bad" not in out and "/signed/ok.m4s" in out
 
 
-def test_cloud_file_names_and_types() -> None:
-    for name in ("00001.m4s", "init.mp4", "index.m3u8", "event.json"):
-        assert _FILE.match(name)
-    for name in (".", "..", "...", ".hidden", "a/b", ""):
-        assert not _FILE.match(name)
+def test_video_ranges_and_types() -> None:
+    assert _byte_range(None, 10) is None
+    assert _byte_range("bytes=2-5", 10) == (2, 5)
+    assert _byte_range("bytes=8-", 10) == (8, 9)
+    assert _byte_range("bytes=4-99", 10) == (4, 9)
+    assert _byte_range("bytes=-3", 10) == (7, 9)
+    assert _byte_range("bytes=10-12", 10) == (10, 9)  # past the end: 416
+    for unusable in ("bytes=0-1,4-5", "items=0-1", "bytes=a-b", "bytes=5-2"):
+        assert _byte_range(unusable, 10) is None  # served whole
     assert safe_type("text/html") == "application/octet-stream"
     assert safe_type("video/iso.segment") == "video/iso.segment"
     assert safe_type("application/x-mpegURL") == "application/vnd.apple.mpegurl"

@@ -52,11 +52,9 @@ def _classify(what: str, err: Exception) -> Exception:
 class SftpDestination(Destination):
     """Event folders on an SFTP server, under the integration's backup location.
 
-    SFTP renames directories natively (`SSH_FXP_RENAME`) and asyncssh offers a recursive
-    `rmtree`, so commit and drop are one operation each.
+    asyncssh offers a recursive `rmtree`, so deleting a pending folder, after a commit or
+    for a drop, is one operation.
     """
-
-    can_move = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Bind to a loaded SFTP Storage config entry."""
@@ -222,21 +220,6 @@ class SftpDestination(Destination):
                     await handle.close()
 
         return await async_attempt(f"SFTP read of {path}", attempt)
-
-    async def async_move(self, source: str, target: str) -> None:
-        """Rename a folder on the server, creating the target's parent first."""
-        old, new = self._remote(source), self._remote(target)
-        parent, _, _ = new.rpartition("/")
-
-        async def attempt() -> None:
-            sftp = await self._async_sftp()
-            if parent:
-                await self._async_call(
-                    f"creation of {parent}", sftp.makedirs(parent, exist_ok=True)
-                )
-            await self._async_call(f"rename of {old}", sftp.rename(old, new))
-
-        await async_attempt(f"SFTP move of {source}", attempt)
 
     async def async_delete_folder(self, folder: str) -> None:
         """Remove a folder and its files, treating a missing folder as success."""

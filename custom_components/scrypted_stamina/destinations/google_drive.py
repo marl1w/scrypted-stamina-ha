@@ -27,8 +27,9 @@ UPLOAD = "https://www.googleapis.com/upload/drive/v3"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
-# A simple (non-resumable) upload is documented up to 5 MB, but the endpoint accepts more;
-# segments are a few hundred kilobytes and this is the point at which one is a bug.
+# A simple (non-resumable) upload is documented up to 5 MB, but the endpoint accepts more.
+# Segments are a few dozen kilobytes and a committed video about 70 MB an hour, so only an
+# event of well over an hour meets this, and is refused with a clear error.
 SIMPLE_UPLOAD_LIMIT = 100 * 1024 * 1024
 
 _JSON = {"Content-Type": "application/json"}
@@ -47,13 +48,11 @@ def _quoted(value: str) -> str:
 class GoogleDriveDestination(OAuthDestination):
     """Event folders this integration creates in the user's Drive.
 
-    Drive moves a folder by changing its parents (`addParents`/`removeParents` on a files
-    PATCH), and deleting a folder deletes everything in it that this client owns, so commit
-    and drop are one request each once the ids are known.
+    Deleting a folder deletes everything in it that this client owns, so removing a pending
+    folder, after a commit or for a drop, is one request once its id is known.
     """
 
     service = "Google Drive"
-    can_move = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Start with no folder resolved."""
@@ -179,6 +178,17 @@ class GoogleDriveDestination(OAuthDestination):
             )
         _LOGGER.debug("Uploaded %s (%s bytes) to %s", path, len(data), self.label)
 
+    async def async_size(self, path: str) -> int | None:
+        """Return one file's size, asking for that file alone."""
+        folder, name = self._split(path)
+        parent = await self._async_folder_id(folder, create=False)
+        if parent is None:
+            return None
+        found = await self._async_children(parent, f"name = {_quoted(name)}")
+        if not found or found[0].get("size") is None:
+            return None
+        return int(found[0]["size"])
+
     async def async_delete(self, path: str) -> None:
         """Remove one file, treating an already-missing file as success."""
         folder, name = self._split(path)
@@ -216,7 +226,7 @@ class GoogleDriveDestination(OAuthDestination):
                 return found
 
     def _forget(self, folder: str) -> None:
-        """Drop cached ids at and under a folder that has moved or gone."""
+        """Drop cached ids at and under a folder that has gone."""
         for known in [
             path for path in self._folders if path == folder or path.startswith(f"{folder}/")
         ]:
@@ -232,26 +242,6 @@ class GoogleDriveDestination(OAuthDestination):
         if isinstance(data, (bytes, bytearray)):
             return bytes(data)
         return json.dumps(data).encode()
-
-    async def async_move(self, source: str, target: str) -> None:
-        """Move a folder by swapping its parent, renaming it if the name changes."""
-        source_parent, _, _ = source.rpartition("/")
-        target_parent, _, name = target.rpartition("/")
-        folder_id = await self._async_folder_id(source, create=False)
-        old_parent = await self._async_folder_id(source_parent, create=False)
-        if folder_id is None or old_parent is None:
-            raise DestinationError(f"Google Drive has no folder {source}")
-        new_parent = await self._async_folder_id(target_parent)
-        item = await self._async_request(
-            "PATCH",
-            f"{DRIVE}/files/{folder_id}",
-            params={"addParents": str(new_parent), "removeParents": old_parent, "fields": "id"},
-            data=json.dumps({"name": name}),
-            headers=_JSON,
-        )
-        if not isinstance(item, dict) or not item.get("id"):
-            raise DestinationError(f"Google Drive did not confirm moving {source}")
-        self._forget(source)
 
     async def async_delete_folder(self, folder: str) -> None:
         """Remove a folder and everything in it, in one request."""

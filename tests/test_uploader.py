@@ -1,15 +1,17 @@
-"""The uploader against a fake destination: order, commit, move fallbacks, gaps, eviction."""
+"""The uploader against a fake destination: order, the committed video, gaps, eviction."""
 
 from __future__ import annotations
 
 import asyncio
-import json
+import re
 
 from custom_components.scrypted_stamina.decider import EventState
-from custom_components.scrypted_stamina.destinations import MoveUnsupportedError
+from custom_components.scrypted_stamina.uploader import video_playlist
 
-from .conftest import FakeDestination, event_id, subject, until
+from .conftest import event_id, subject, until
 from .test_events import run_event
+
+VIDEO = re.compile(r"^scrypted-stamina/events/no-area-front-door-\d{6}_\d{6}(-\d+)?\.mp4$")
 
 
 async def committed(manager, eid: str) -> None:
@@ -18,10 +20,9 @@ async def committed(manager, eid: str) -> None:
     )
 
 
-async def test_commit_copies_then_deletes_where_rename_is_unsupported(
+async def test_a_commit_joins_the_segments_into_one_video_and_deletes_pending(
     hass, stamina, destinations, setup
 ) -> None:
-    destinations["storage0"].can_move = False
     entry = await setup()
     manager = entry.runtime_data.manager
     eid = event_id(60)
@@ -29,33 +30,21 @@ async def test_commit_copies_then_deletes_where_rename_is_unsupported(
     await committed(manager, eid)
 
     fake = destinations["storage0"]
-    ops = [op for op, _ in fake.ops]
-    assert "move" not in ops
-    assert ops.count("read") == 5  # init, two segments, manifest, details
-    assert ("delete_folder", next(p for o, p in fake.ops if o == "delete_folder")) in fake.ops
+    assert fake.under("scrypted-stamina/") == fake.videos()
+    [path] = fake.videos()
+    assert VIDEO.match(path)
+    init, first, second = (stamina.files[(eid, name)] for name in ("init.mp4", "0.m4s", "1.m4s"))
+    assert fake.files[path] == init + first + second  # joined in play order, as uploaded
+    assert [op for op, _ in fake.ops].count("read") == 3
     assert not fake.under("scrypted-stamina/pending/")
-    assert len(fake.under("scrypted-stamina/events/")) == 5
-    await hass.config_entries.async_unload(entry.entry_id)
-
-
-class NoMoveAfterAll(FakeDestination):
-    """Advertises a move the server then turns out not to have (a Synology without CopyMove)."""
-
-    async def async_move(self, source: str, target: str) -> None:
-        raise MoveUnsupportedError("no CopyMove here")
-
-
-async def test_a_move_the_server_refuses_falls_back_to_copying(
-    hass, stamina, destinations, setup
-) -> None:
-    destinations["storage0"] = NoMoveAfterAll(name="NAS 0")
-    entry = await setup()
-    manager = entry.runtime_data.manager
-    eid = event_id(61)
-    run_event(stamina, eid, "confirmed")
-    await committed(manager, eid)
-    assert len(destinations["storage0"].under("scrypted-stamina/events/")) == 5
-    assert not destinations["storage0"].under("scrypted-stamina/pending/")
+    [copy] = (await manager.index.async_copies(eid)).values()
+    assert copy.playable and copy.video == path
+    assert copy.ranges == {
+        "init.mp4": [0, len(init)],
+        "00000.m4s": [len(init), len(first)],
+        "00001.m4s": [len(init) + len(first), len(second)],
+    }
+    assert copy.size == len(fake.files[path])  # the quota counts the video
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -73,12 +62,13 @@ async def test_an_expired_segment_is_a_gap_and_playback_skips_it(
     stamina.end(eid, subjects=[subject("s1", verdict="confirmed")], next_segment=3, init=True)
     await committed(manager, eid)
 
-    fake = destinations["storage0"]
-    files = fake.under("scrypted-stamina/events/")
-    manifest = next(fake.files[p] for p in files if p.endswith("index.m3u8")).decode()
-    assert "00001.m4s" not in manifest and "#EXT-X-DISCONTINUITY" in manifest
-    details = json.loads(next(fake.files[p] for p in files if p.endswith("event.json")))
-    assert details["gaps"] == [1]
+    record = manager.records[eid]
+    assert record.gaps == [1]
+    [copy] = (await manager.index.async_copies(eid)).values()
+    assert set(copy.ranges) == {"init.mp4", "00000.m4s", "00002.m4s"}
+    playlist = video_playlist(record, copy, "video.mp4")
+    assert "#EXT-X-DISCONTINUITY" in playlist
+    assert playlist.count("#EXT-X-BYTERANGE:") == 2
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -112,13 +102,11 @@ async def test_quota_evicts_the_oldest_committed_event(hass, stamina, destinatio
     await committed(manager, second)
 
     fake = destinations["storage0"]
-    assert not any(first in path for path in fake.files)
-    assert any(second in path for path in fake.files)
+    first_copy = next(iter((await manager.index.async_copies(first)).values()))
+    second_copy = next(iter((await manager.index.async_copies(second)).values()))
+    assert first_copy.deleted and ("delete", first_copy.video) in fake.ops
+    assert fake.videos() == [second_copy.video]
     assert target.usage.get(first) is None
-    assert (
-        "delete_folder",
-        next(p for o, p in fake.ops if o == "delete_folder" and first in p),
-    ) in fake.ops
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -155,6 +143,6 @@ async def test_every_kept_event_goes_to_every_destination(
     run_event(stamina, eid, "confirmed")
     await committed(manager, eid)
     for fake in destinations.values():
-        assert len(fake.under("scrypted-stamina/events/")) == 5
+        assert len(fake.videos()) == 1 and not fake.under("scrypted-stamina/pending/")
     # Fetched from the plugin once, whatever the number of destinations.
     await hass.config_entries.async_unload(entry.entry_id)

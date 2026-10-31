@@ -35,6 +35,11 @@ async def test_proxy_follows_the_session_redirect_and_signs_every_uri(
     await hass.config_entries.async_unload(entry.entry_id)
 
 
+def fake_video(destinations) -> bytes:
+    [path] = destinations["storage0"].videos()
+    return destinations["storage0"].files[path]
+
+
 async def test_media_source_browses_and_resolves(
     hass, hass_client_no_auth, stamina, destinations, setup
 ) -> None:
@@ -85,8 +90,17 @@ async def test_media_source_browses_and_resolves(
     # Without a recorder at all, the cloud copy plays too.
     manager.cameras["38"].info.capabilities["video_recorder"] = False
     playlist = await (await client.get(played.url)).text()
-    first = next(
-        line for line in playlist.splitlines() if line.startswith("/api/") and "00000.m4s" in line
-    )
-    assert (await client.get(first)).status == 200
+    lines = playlist.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("#EXT-X-BYTERANGE:"))
+    length, offset = (int(n) for n in lines[at].split(":")[1].split("@"))
+    first = lines[at + 1]
+    assert first.startswith("/api/scrypted_stamina/cloud/") and "/video.mp4?" in first
+    # The player asks for each segment as a range of the one video.
+    response = await client.get(first, headers={"Range": f"bytes={offset}-{offset + length - 1}"})
+    assert response.status == 206
+    assert response.headers["Content-Range"].endswith(f"/{len(fake_video(destinations))}")
+    assert await response.read() == fake_video(destinations)[offset : offset + length]
+    assert await response.read() == stamina.files[(eid, "0.m4s")]
+    whole = await client.get(first)
+    assert whole.status == 200 and await whole.read() == fake_video(destinations)
     await hass.config_entries.async_unload(entry.entry_id)

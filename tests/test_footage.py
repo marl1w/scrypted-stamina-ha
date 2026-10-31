@@ -18,9 +18,17 @@ from custom_components.scrypted_stamina.decider import EventRecord, EventState
 from custom_components.scrypted_stamina.index import Copy, EventIndex
 from custom_components.scrypted_stamina.protocol import EventFacts
 from custom_components.scrypted_stamina.relevance import RelevanceResult
-from custom_components.scrypted_stamina.uploader import Uploader
+from custom_components.scrypted_stamina.uploader import video_playlist
 
-from .conftest import CAMERA, FakeDestination, event_id, event_object, make_entry, subject, until
+from .conftest import (
+    CAMERA,
+    event_id,
+    event_object,
+    joined,
+    make_entry,
+    subject,
+    until,
+)
 from .test_events import GATE, OPTIONS, Clock, run_event, wire
 
 
@@ -40,7 +48,8 @@ def state_is(manager, eid, state):
 
 
 def files(fake, prefix):
-    return [path.rsplit("/", 1)[1] for path in fake.under(prefix)]
+    """Files under `prefix`: pending files by name, and those joined into videos."""
+    return [path.rsplit("/", 1)[1] for path in fake.under(prefix)] + sorted(joined(fake, prefix))
 
 
 # ------------------------------------------------------------------ 1. orphans keep uploading
@@ -81,13 +90,13 @@ async def test_an_orphan_keeps_uploading_until_the_plugin_says_it_is_done(
     }
     await until(lambda: eid not in manager.records)
     kept = files(destinations["storage0"], "scrypted-stamina/events/")
-    assert {"init.mp4", "00000.m4s", "00001.m4s", "00002.m4s", "index.m3u8"} <= set(kept)
+    assert {"init.mp4", "00000.m4s", "00001.m4s", "00002.m4s"} <= set(kept)
     record = await manager.index.async_get(eid)
     assert record.state is EventState.ORPHANED and "orphan_complete" in record.notes
     await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_the_manifest_lists_only_what_the_destination_holds(
+async def test_the_playlist_lists_only_what_the_destination_holds(
     hass, stamina, destinations, setup
 ) -> None:
     destinations["storage0"].fail = {"00001.m4s"}
@@ -98,14 +107,11 @@ async def test_the_manifest_lists_only_what_the_destination_holds(
     await until(
         lambda: eid in manager.records and manager.records[eid].state is EventState.COMMITTED
     )
-    fake = destinations["storage0"]
-    manifest = next(
-        fake.files[p].decode()
-        for p in fake.under("scrypted-stamina/events/")
-        if p.endswith(".m3u8")
-    )
-    assert "00000.m4s" in manifest and "00002.m4s" in manifest
-    assert "00001.m4s" not in manifest and "#EXT-X-DISCONTINUITY" in manifest
+    record = manager.records[eid]
+    [copy] = (await manager.index.async_copies(eid)).values()
+    assert set(copy.ranges) == {"init.mp4", "00000.m4s", "00002.m4s"}
+    manifest = video_playlist(record, copy, "video.mp4")
+    assert manifest.count("#EXT-X-BYTERANGE:") == 2 and "#EXT-X-DISCONTINUITY" in manifest
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -165,8 +171,8 @@ async def test_a_gap_orphans_held_events_and_recovers_missed_ones(
     record = held(manager, eid) or await manager.index.async_get(eid)
     assert record.state is EventState.ORPHANED
     # Kept where it can be found, never deleted.
-    await until(lambda: bool(destinations["storage0"].under("scrypted-stamina/events/")))
-    assert not any(op == "delete_folder" for op, _ in destinations["storage0"].ops)
+    await until(lambda: bool(destinations["storage0"].videos()))
+    assert {"init.mp4", "00000.m4s", "00001.m4s"} <= joined(destinations["storage0"])
 
     await until(lambda: missed in manager.records)
     assert "recovered_after_gap" in manager.records[missed].notes
@@ -251,41 +257,6 @@ async def test_the_cap_never_evicts_an_event_with_late_evidence(
     pending = destinations["storage0"].under("scrypted-stamina/pending/")
     assert pending and all(first in path for path in pending)
     await hass.config_entries.async_unload(entry.entry_id)
-
-
-# ------------------------------------------------------------------ 5. idempotent commit
-
-
-async def test_a_commit_already_moved_is_not_moved_again(hass) -> None:
-    fake = FakeDestination()
-    uploader = Uploader(
-        hass, None, None, {}, on_change=lambda: None, on_uploaded=lambda r: None, on_latency=print
-    )
-    record = EventRecord(facts=EventFacts(id="ev_1", camera=CAMERA, started=1.0, ended=2.0))
-    final = "f/events/a/x"
-    fake.files[f"{final}/init.mp4"] = b"i"
-    fake.files[f"{final}/00000.m4s"] = b"s"
-    copy = Copy(folder="f/pending/a/x", files={"init.mp4": 1, "00000.m4s": 1})
-    await uploader._async_commit_copy(fake, record, copy, final, b"{}")
-    assert not any(op == "move" for op, _ in fake.ops)
-    assert f"{final}/index.m3u8" in fake.files and f"{final}/event.json" in fake.files
-
-
-async def test_the_copy_fallback_skips_files_already_there(hass) -> None:
-    fake = FakeDestination(can_move=False)
-    uploader = Uploader(
-        hass, None, None, {}, on_change=lambda: None, on_uploaded=lambda r: None, on_latency=print
-    )
-    record = EventRecord(facts=EventFacts(id="ev_1", camera=CAMERA, started=1.0, ended=2.0))
-    source, final = "f/pending/a/x", "f/events/a/x"
-    for name in ("init.mp4", "00000.m4s"):
-        fake.files[f"{source}/{name}"] = b"d"
-    fake.files[f"{final}/init.mp4"] = b"d"  # copied before a restart
-    copy = Copy(folder=source, files={"init.mp4": 1, "00000.m4s": 1})
-    await uploader._async_commit_copy(fake, record, copy, final, b"{}")
-    reads = [path for op, path in fake.ops if op == "read"]
-    assert f"{source}/init.mp4" not in reads and f"{source}/00000.m4s" in reads
-    assert not fake.under(source) and len(fake.under(final)) == 4
 
 
 # ------------------------------------------------------------------ 7. the tail
@@ -560,14 +531,19 @@ async def test_a_released_segmenter_that_resumes_is_followed_with_a_new_init(
     fake = destinations["storage0"]
     kept = files(fake, "scrypted-stamina/events/")
     assert {"init.mp4", "init-1.mp4", "00000.m4s", "00001.m4s"} <= set(kept)
-    manifest = next(
-        fake.files[p].decode()
-        for p in fake.under("scrypted-stamina/events/")
-        if p.endswith(".m3u8")
-    ).splitlines()
-    at = manifest.index("00001.m4s")
-    assert manifest[at - 3 : at - 1] == ["#EXT-X-DISCONTINUITY", '#EXT-X-MAP:URI="init-1.mp4"']
-    assert manifest.index('#EXT-X-MAP:URI="init.mp4"') < manifest.index("00000.m4s")
+    [copy] = (await manager.index.async_copies(eid)).values()
+    # Joined in play order: each init before the segments that need it.
+    order = sorted(copy.ranges, key=lambda name: copy.ranges[name][0])
+    assert order == ["init.mp4", "00000.m4s", "init-1.mp4", "00001.m4s"]
+    manifest = video_playlist(manager.records[eid], copy, "v.mp4").splitlines()
+    at = manifest.index(
+        f"#EXT-X-BYTERANGE:{copy.ranges['00001.m4s'][1]}@{copy.ranges['00001.m4s'][0]}"
+    )
+    offset, length = copy.ranges["init-1.mp4"]
+    assert manifest[at - 3 : at - 1] == [
+        "#EXT-X-DISCONTINUITY",
+        f'#EXT-X-MAP:URI="v.mp4",BYTERANGE="{length}@{offset}"',
+    ]
     await hass.config_entries.async_unload(entry.entry_id)
 
 

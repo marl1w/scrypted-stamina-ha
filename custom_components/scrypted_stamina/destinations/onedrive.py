@@ -4,9 +4,10 @@ The cost of borrowing that session is the scope the integration holds —
 `Files.ReadWrite.AppFolder` — so event folders live inside Home Assistant's own app folder
 rather than at the root of the drive.
 
-Graph moves a folder by patching its `parentReference` (one request), deletes a folder with
-everything in it (one request), and creates missing parents on a path-addressed upload, so
-every operation the uploader needs is native.
+Graph deletes a folder with everything in it (one request), creates missing parents on a
+path-addressed upload, and answers a file's size by path, so every operation the uploader
+needs is native. A file over the single-request limit (a
+committed video of several hours) goes up through an upload session, in chunks.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import json
 import logging
 from urllib.parse import quote
 
-from .base import DestinationError, UploadTooLargeError, content_type
+from .base import DestinationError, content_type
 from .oauth import OAuthDestination
 
 _LOGGER = logging.getLogger(__name__)
@@ -24,8 +25,11 @@ _LOGGER = logging.getLogger(__name__)
 GRAPH = "https://graph.microsoft.com/v1.0"
 APPROOT = f"{GRAPH}/me/drive/special/approot"
 
-# Graph accepts a single PUT up to 250 MB; a segment is a few hundred kilobytes.
+# Graph accepts a single PUT up to 250 MB; a segment is a few dozen kilobytes, and a
+# committed video about 70 MB an hour. Past the limit, an upload session takes it in chunks,
+# which Graph wants in multiples of 320 KiB.
 SIMPLE_UPLOAD_LIMIT = 240 * 1024 * 1024
+SESSION_CHUNK = 32 * 320 * 1024
 
 _JSON = {"Content-Type": "application/json"}
 
@@ -34,7 +38,6 @@ class OneDriveDestination(OAuthDestination):
     """Event folders in Home Assistant's OneDrive app folder."""
 
     service = "OneDrive"
-    can_move = True
 
     @staticmethod
     def _item(path: str) -> str:
@@ -52,15 +55,14 @@ class OneDriveDestination(OAuthDestination):
         is worse than a reported failure — a failure gets retried.
         """
         if len(data) > SIMPLE_UPLOAD_LIMIT:
-            raise UploadTooLargeError(
-                f"{len(data)} bytes exceeds the {SIMPLE_UPLOAD_LIMIT} byte single-request limit"
+            item = await self._async_upload_session(path, data)
+        else:
+            item = await self._async_request(
+                "PUT",
+                f"{self._item(path)}/content",
+                data=data,
+                headers={"Content-Type": content_type(path)},
             )
-        item = await self._async_request(
-            "PUT",
-            f"{self._item(path)}/content",
-            data=data,
-            headers={"Content-Type": content_type(path)},
-        )
         if not isinstance(item, dict) or not item.get("id"):
             raise DestinationError(f"OneDrive did not confirm storing {path}")
         stored = item.get("size")
@@ -69,6 +71,43 @@ class OneDriveDestination(OAuthDestination):
                 f"OneDrive stored {stored} bytes of {path}, not the {len(data)} sent"
             )
         _LOGGER.debug("Uploaded %s (%s bytes) to %s", path, len(data), self.label)
+
+    async def _async_upload_session(self, path: str, data: bytes) -> object:
+        """Upload a large file through a Graph upload session; return the stored item.
+
+        The session URL carries its own authorisation, and Graph refuses a bearer token on
+        it. Each chunk is retried on its own; the last one answers with the item.
+        """
+        session = await self._async_request(
+            "POST",
+            f"{self._item(path)}/createUploadSession",
+            data=json.dumps({"item": {"@microsoft.graph.conflictBehavior": "replace"}}),
+            headers=_JSON,
+        )
+        upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
+        if not upload_url:
+            raise DestinationError(f"OneDrive did not open an upload session for {path}")
+        item: object = None
+        total = len(data)
+        for start in range(0, total, SESSION_CHUNK):
+            chunk = data[start : start + SESSION_CHUNK]
+            item = await self._async_request(
+                "PUT",
+                str(upload_url),
+                data=chunk,
+                headers={"Content-Range": f"bytes {start}-{start + len(chunk) - 1}/{total}"},
+                authorize=False,
+            )
+        return item
+
+    async def async_size(self, path: str) -> int | None:
+        """Return one file's size, from its own item."""
+        item = await self._async_request(
+            "GET", self._item(path), params={"$select": "size"}, allow_missing=True
+        )
+        if not isinstance(item, dict) or item.get("size") is None:
+            return None
+        return int(item["size"])
 
     async def async_delete(self, path: str) -> None:
         """Remove one file or folder, treating an already-missing one as success."""
@@ -99,59 +138,3 @@ class OneDriveDestination(OAuthDestination):
         if isinstance(data, (bytes, bytearray)):
             return bytes(data)
         return json.dumps(data).encode()
-
-    async def _async_folder_id(self, folder: str) -> str:
-        """Return the id of a folder, creating it and its parents where missing.
-
-        Each segment is read by path first and only created when missing: creating one that
-        exists answers 409 in a subfolder but 400 directly under the app folder. It is created
-        with `conflictBehavior: fail` ("replace" would empty it), and a creation that loses a
-        race is read by path again.
-        """
-        parent_url = APPROOT
-        walked: list[str] = []
-        folder_id: str | None = None
-        for segment in [part for part in folder.split("/") if part]:
-            walked.append(segment)
-            item = await self._async_request(
-                "GET", self._item("/".join(walked)), allow_missing=True
-            )
-            if isinstance(item, dict) and item.get("id"):
-                folder_id = str(item["id"])
-                parent_url = f"{GRAPH}/me/drive/items/{folder_id}"
-                continue
-            item = await self._async_request(
-                "POST",
-                f"{parent_url}/children",
-                data=json.dumps(
-                    {
-                        "name": segment,
-                        "folder": {},
-                        "@microsoft.graph.conflictBehavior": "fail",
-                    }
-                ),
-                headers=_JSON,
-                allow_conflict=True,
-            )
-            if not isinstance(item, dict) or not item.get("id"):
-                item = await self._async_request("GET", self._item("/".join(walked)))
-            if not isinstance(item, dict) or not item.get("id"):
-                raise DestinationError(f"OneDrive could not resolve {folder}")
-            folder_id = str(item["id"])
-            parent_url = f"{GRAPH}/me/drive/items/{folder_id}"
-        if folder_id is None:
-            raise DestinationError("OneDrive will not move into the app folder root")
-        return folder_id
-
-    async def async_move(self, source: str, target: str) -> None:
-        """Move a folder by patching its parent and name."""
-        parent, _, name = target.rpartition("/")
-        parent_id = await self._async_folder_id(parent)
-        item = await self._async_request(
-            "PATCH",
-            self._item(source),
-            data=json.dumps({"parentReference": {"id": parent_id}, "name": name}),
-            headers=_JSON,
-        )
-        if not isinstance(item, dict) or not item.get("id"):
-            raise DestinationError(f"OneDrive did not confirm moving {source}")

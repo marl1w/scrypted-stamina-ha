@@ -10,8 +10,10 @@ Views, all answering only URLs this module signed:
   to the plugin with the bearer token added here. Redirects (playback answers with one to a
   session) are followed by the API client, same origin only. Playlists are rewritten so
   every URI points back here with a fresh signature; media is streamed through.
-* **Cloud copy** — `/api/scrypted_stamina/cloud/<entry>/<destination>/<event>/<file>` reads
-  one file of a committed event from a destination, and rewrites `index.m3u8` the same way.
+* **Cloud copy** — the play view answers with a playlist of byte ranges of the committed
+  video (`hls.py`); `/api/scrypted_stamina/cloud/<entry>/<destination>/<event>/video.mp4`
+  serves those ranges, reading the video from the destination once and keeping the last
+  few in memory, since a player asks for one range per segment.
 * **Thumbnail** — the event's 320 px JPEG from the index.
 
 Why signatures rather than Home Assistant auth: a media player fetches segments itself and
@@ -26,6 +28,7 @@ response says `nosniff` and `sandbox`; playlists and cloud reads have size limit
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from collections.abc import Callable
 import hashlib
@@ -45,9 +48,12 @@ from homeassistant.core import HomeAssistant, callback
 from .api import StaminaApiError, async_read_limited, playback_path
 from .const import DOMAIN, MAX_SEGMENT_BYTES
 from .destinations import DestinationError
+from .uploader import video_playlist
 
 if TYPE_CHECKING:
     from . import StaminaData
+    from .decider import EventRecord
+    from .destinations import Destination
     from .index import Copy
 
 PLAY_PREFIX = f"/api/{DOMAIN}/play"
@@ -60,6 +66,11 @@ PLAY_URL_LIFETIME = 3600
 # A signed thumbnail URL is itself the capability, so the picture may be cached privately.
 THUMBNAIL_CACHE = "private, max-age=3600"
 MAX_PLAYLIST_BYTES = 1024 * 1024
+# A committed video is read whole to serve its ranges (about 70 MB an hour), and the last few
+# are kept: a player asks for each segment's range in turn.
+VIDEO_NAME = "video.mp4"
+MAX_VIDEO_BYTES = 512 * 1024 * 1024
+VIDEO_CACHE = 2
 # Seconds of recording either side of an event, for in-place playback.
 PLAYBACK_LEAD = 5.0
 PLAYBACK_TAIL = 5.0
@@ -81,8 +92,6 @@ _ALLOWED = re.compile(
     r"^v1/(cameras/[A-Za-z0-9_-]{1,32}(/playback/pb_[A-Za-z0-9_-]{22})?"
     r"|events/ev_[A-Za-z0-9_-]{22})/[A-Za-z0-9_.-]{1,64}$"
 )
-# A cloud file name: no path, not `.` or `..`, at least one letter or digit.
-_FILE = re.compile(r"^(?!\.)(?=[^.]*[A-Za-z0-9])[A-Za-z0-9_.-]{1,64}$")
 _URI_ATTR = re.compile(r'URI="([^"]+)"')
 # A playback session's playlist path, and which event it plays (to start a new session when
 # the plugin stopped this one: it does after 2 minutes paused, or when memory runs short).
@@ -348,30 +357,73 @@ _LOOKUPS = _Lookups()
 
 
 async def _async_cloud_playlist(
-    hass: HomeAssistant, entry_id: str, data: StaminaData, event_id: str, cap: int | None = None
+    hass: HomeAssistant,
+    entry_id: str,
+    data: StaminaData,
+    record: EventRecord,
+    cap: int | None = None,
 ) -> web.Response | None:
-    """Return a committed cloud copy's playlist, rewritten, or None when there is none."""
-    for subentry, copy in (await _LOOKUPS.get(data, event_id)).items():
+    """Return a committed video's playlist, or None when there is none."""
+    for subentry, copy in (await _LOOKUPS.get(data, record.id)).items():
         target = data.manager.uploader.targets.get(subentry)
-        if target is None or copy.deleted or not copy.committed:
+        if target is None or not copy.playable or not copy.ranges:
             continue
-        if "index.m3u8" not in copy.files:
-            continue
-        try:
-            body = await target.destination.async_read(f"{copy.folder}/index.m3u8")
-        except DestinationError:
-            continue
-        if len(body) > MAX_PLAYLIST_BYTES:
-            continue
-
-        def resolve(uri: str, subentry: str = subentry) -> str | None:
-            if not _FILE.match(uri):
-                return None
-            return cloud_url(hass, entry_id, subentry, event_id, uri, cap)
-
-        text = rewrite_playlist(body.decode("utf-8", errors="replace"), resolve)
-        return _response(text=text, content_type=HLS)
+        uri = cloud_url(hass, entry_id, subentry, record.id, VIDEO_NAME, cap)
+        return _response(text=video_playlist(record, copy, uri), content_type=HLS)
     return None
+
+
+class _Videos:
+    """The last few committed videos read, so each range of one is not a download of it."""
+
+    def __init__(self, size: int = VIDEO_CACHE) -> None:
+        self._items: OrderedDict[tuple[str, str, int], asyncio.Future[bytes]] = OrderedDict()
+        self._size = size
+
+    async def get(self, subentry: str, destination: Destination, path: str, size: int) -> bytes:
+        key = (subentry, path, size)
+        future = self._items.get(key)
+        if future is None:
+            future = asyncio.get_running_loop().create_future()
+            self._items[key] = future
+            while len(self._items) > self._size:
+                self._items.popitem(last=False)
+            try:
+                body = await destination.async_read(path)
+            except BaseException as err:
+                self._items.pop(key, None)
+                future.set_exception(err)
+                future.exception()  # retrieved: a waiter may not exist
+                raise
+            future.set_result(body[:size])
+        else:
+            self._items.move_to_end(key)
+        return await asyncio.shield(future)
+
+
+_VIDEOS = _Videos()
+
+
+def _byte_range(header: str | None, size: int) -> tuple[int, int] | None:
+    """Return `(start, end)` (inclusive) of a single `bytes=` range, or None to send it all.
+
+    A range that is not one this understands is ignored, as HTTP allows; one that lies past
+    the end comes back as `(size, size - 1)`, which the caller answers with 416.
+    """
+    if not header or not header.startswith("bytes=") or "," in header:
+        return None
+    first, _, last = header[6:].strip().partition("-")
+    try:
+        if not first:
+            length = int(last)
+            return (max(0, size - length), size - 1) if length > 0 else None
+        start = int(first)
+        end = min(int(last), size - 1) if last else size - 1
+    except ValueError:
+        return None
+    if start >= size:
+        return (size, size - 1)
+    return (start, end) if 0 <= start <= end else None
 
 
 def _has_recorder(capabilities: dict) -> bool:
@@ -430,7 +482,7 @@ class PlayView(HomeAssistantView):
                         raise web.HTTPFound(session, headers=SECURITY_HEADERS)
         if mode in ("auto", "cloud"):
             played = await _async_cloud_playlist(
-                hass, entry_id, data, event_id, request_expiry(request)
+                hass, entry_id, data, record, request_expiry(request)
             )
             if played is not None:
                 return played
@@ -507,7 +559,7 @@ class ProxyView(HomeAssistantView):
 
 
 class CloudView(HomeAssistantView):
-    """Serves one file of a committed event from a destination."""
+    """Serves a committed event's video from a destination, by byte range."""
 
     url = CLOUD_PREFIX + "/{entry_id}/{subentry}/{event_id}/{name}"
     name = f"api:{DOMAIN}:cloud"
@@ -520,43 +572,39 @@ class CloudView(HomeAssistantView):
     async def get(
         self, request: web.Request, entry_id: str, subentry: str, event_id: str, name: str
     ) -> web.StreamResponse:
-        """Serve one file."""
+        """Serve the video, or the range of it asked for."""
         hass = self._hass
-        if not verify(hass, request) or not _FILE.match(name):
+        if not verify(hass, request) or name != VIDEO_NAME:
             return _response(403)
         data = _data(hass, entry_id)
         if data is None:
             return _response(404)
         target = data.manager.uploader.targets.get(subentry)
         copy = (await _LOOKUPS.get(data, event_id)).get(subentry)
-        if target is None or copy is None or copy.deleted or not copy.committed:
+        if target is None or copy is None or not copy.playable or copy.video is None:
             return _response(404)
-        if name not in copy.files:
-            return _response(404)
-        if copy.files[name] > MAX_SEGMENT_BYTES:
+        size = copy.video_size
+        if size > MAX_VIDEO_BYTES:
             return _response(502)
         try:
-            body = await target.destination.async_read(f"{copy.folder}/{name}")
+            body = await _VIDEOS.get(subentry, target.destination, copy.video, size)
         except DestinationError:
             return _response(502)
-        if len(body) > MAX_SEGMENT_BYTES:
+        if len(body) != size:
             return _response(502)
-        if name.endswith(".m3u8"):
-            cap = request_expiry(request)
-
-            def resolve(uri: str) -> str | None:
-                if not _FILE.match(uri):
-                    return None
-                return cloud_url(hass, entry_id, subentry, event_id, uri, cap)
-
-            text = rewrite_playlist(body.decode("utf-8", errors="replace"), resolve)
-            return _response(text=text, content_type=HLS)
-        content_type = {
-            ".mp4": "video/mp4",
-            ".m4s": "video/iso.segment",
-            ".jpg": "image/jpeg",
-        }.get(name[name.rfind(".") :], "application/octet-stream")
-        return _response(body=body, content_type=content_type)
+        headers = {**SECURITY_HEADERS, "Accept-Ranges": "bytes"}
+        span = _byte_range(request.headers.get("Range"), size)
+        if span is None:
+            return web.Response(body=body, content_type="video/mp4", headers=headers)
+        start, end = span
+        if start >= size:
+            return web.Response(status=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+        return web.Response(
+            status=206,
+            body=body[start : end + 1],
+            content_type="video/mp4",
+            headers={**headers, "Content-Range": f"bytes {start}-{end}/{size}"},
+        )
 
 
 class ThumbnailView(HomeAssistantView):

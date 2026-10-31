@@ -11,12 +11,22 @@ import pytest
 from custom_components.scrypted_stamina import uploader as uploader_module
 from custom_components.scrypted_stamina.const import INDEX_FILENAME
 from custom_components.scrypted_stamina.decider import EventRecord, EventState
+from custom_components.scrypted_stamina.destinations import DestinationError
 from custom_components.scrypted_stamina.index import Copy, EventIndex
 from custom_components.scrypted_stamina.protocol import EventFacts
 from custom_components.scrypted_stamina.relevance import RelevanceResult
-from custom_components.scrypted_stamina.uploader import Target, Uploader, manifest_for
+from custom_components.scrypted_stamina.uploader import Target, Uploader, video_playlist
 
-from .conftest import CAMERA, FakeDestination, event_id, event_object, make_entry, subject, until
+from .conftest import (
+    CAMERA,
+    FakeDestination,
+    event_id,
+    event_object,
+    joined,
+    make_entry,
+    subject,
+    until,
+)
 from .test_events import Clock, run_event, wire
 
 
@@ -31,7 +41,8 @@ def state_is(manager, eid, state):
 
 
 def names(fake, prefix):
-    return {path.rsplit("/", 1)[1] for path in fake.under(prefix)}
+    """Files under `prefix`: pending files by name, and those joined into videos."""
+    return {path.rsplit("/", 1)[1] for path in fake.under(prefix)} | joined(fake, prefix)
 
 
 # ------------------------------------------------------------------ 2, 3: ring and breaker
@@ -122,18 +133,18 @@ async def test_a_committed_orphan_that_gets_more_segments_is_committed_again(
     stamina.gap_next = True
     stamina.drop_streams()
     await until(lambda: eid not in manager.records, timeout=10)  # orphaned, committed, done
-    assert "index.m3u8" in names(destinations["storage0"], "scrypted-stamina/events/")
+    fake = destinations["storage0"]
+    [video] = fake.videos()
+    first = fake.files[video]
 
     stamina.segment(eid, 1)  # the plugin had more after all
-    await until(lambda: "00001.m4s" in names(destinations["storage0"], "scrypted-stamina/events/"))
+    await until(lambda: "00001.m4s" in names(fake, "scrypted-stamina/events/"))
     await until(lambda: eid not in manager.records, timeout=10)
-    fake = destinations["storage0"]
-    manifest = next(
-        fake.files[p].decode()
-        for p in fake.under("scrypted-stamina/events/")
-        if p.endswith(".m3u8")
-    )
-    assert "00001.m4s" in manifest
+    assert fake.videos() == [video]  # appended to, in place
+    assert fake.files[video] == first + stamina.files[(eid, "1.m4s")]
+    assert not fake.under("scrypted-stamina/pending/")
+    [copy] = (await manager.index.async_copies(eid)).values()
+    assert copy.ranges["00001.m4s"] == [len(first), len(stamina.files[(eid, "1.m4s")])]
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -264,26 +275,127 @@ async def test_retention_never_removes_an_unsettled_orphan(hass) -> None:
 # ------------------------------------------------------------------ 11: manifest, copy
 
 
-def test_the_manifest_leaves_out_segments_without_their_init() -> None:
+def test_the_playlist_leaves_out_segments_without_their_init() -> None:
     record = EventRecord(facts=EventFacts(id="e", camera=CAMERA, started=1.0, init_of={1: 1}))
-    copy = Copy(folder="f", files={"init.mp4": 1, "00000.m4s": 1, "00001.m4s": 1})
-    text = manifest_for(record, copy).decode()
-    assert "00000.m4s" in text and "00001.m4s" not in text  # init-1.mp4 is not there
-
-
-async def test_copy_then_delete_copies_everything_in_the_source(hass) -> None:
-    fake = FakeDestination(can_move=False)
-    uploader = Uploader(
-        hass, None, None, {}, on_change=lambda: None, on_uploaded=lambda r: None, on_latency=print
+    copy = Copy(
+        folder="f",
+        video="f/events/v.mp4",
+        committed=True,
+        ranges={"init.mp4": [0, 4], "00000.m4s": [4, 10], "00001.m4s": [14, 10]},
     )
+    text = video_playlist(record, copy, "video.mp4")
+    assert '#EXT-X-MAP:URI="video.mp4",BYTERANGE="4@0"' in text
+    assert "#EXT-X-BYTERANGE:10@4" in text and "@14" not in text  # init-1.mp4 is not there
+
+
+class SavedCopies:
+    """The one index call a commit makes, remembered."""
+
+    def __init__(self) -> None:
+        self.saved: list[Copy] = []
+
+    async def async_save_copy(self, event_id: str, destination: str, copy: Copy) -> None:
+        self.saved.append(Copy.from_header(copy.header(), dict(copy.files)))
+
+
+def bare_uploader(hass, index=None) -> Uploader:
+    return Uploader(
+        hass, None, index, {}, on_change=lambda: None, on_uploaded=lambda r: None, on_latency=print
+    )
+
+
+async def test_a_commit_joins_everything_in_the_pending_folder(hass) -> None:
+    fake = FakeDestination()
+    index = SavedCopies()
     record = EventRecord(facts=EventFacts(id="e", camera=CAMERA, started=1.0, ended=2.0))
-    source, final = "f/pending/a/x", "f/events/a/x"
+    source, video = "f/pending/a/x", "f/events/a-cam-261031_211349.mp4"
+    fake.files[f"{source}/00001.m4s"] = b"t"  # uploaded, but its row never written
+    fake.files[f"{source}/00000.m4s"] = b"s"
+    fake.files[f"{source}/init.mp4"] = b"i"
+    fake.files[f"{source}/notes.txt"] = b"?"  # not footage: not joined
+    copy = Copy(folder=source, files={"init.mp4": 1, "00000.m4s": 1})
+    await bare_uploader(hass, index)._async_commit_copy(fake, record, "dest", copy, video)
+    assert fake.files[video] == b"ist" and not fake.under(source)
+    assert copy.files["00001.m4s"] == 1 and copy.committed and copy.video == video
+    assert index.saved[-1].ranges == copy.ranges  # recorded before the folder went
+
+
+async def test_a_commit_repeated_after_a_crash_does_not_join_twice(hass) -> None:
+    fake = FakeDestination()
+    record = EventRecord(facts=EventFacts(id="e", camera=CAMERA, started=1.0, ended=2.0))
+    source, video = "f/pending/a/x", "f/events/a-cam-261031_211349.mp4"
+    for name, data in (("init.mp4", b"i"), ("00000.m4s", b"s")):
+        fake.files[f"{source}/{name}"] = data
+    copy = Copy(folder=source, files={"init.mp4": 1, "00000.m4s": 1})
+    uploader = bare_uploader(hass, SavedCopies())
+    # Stored, then a crash before the index recorded it: the same video again.
+    fake.files[video] = b"is"
+    await uploader._async_commit_copy(fake, record, "dest", copy, video)
+    assert fake.files[video] == b"is"
+    # Recorded, then a crash before the folder was deleted: nothing joined twice.
+    fake.files[f"{source}/00000.m4s"] = b"s"
+    await uploader._async_commit_copy(fake, record, "dest", copy, video)
+    assert fake.files[video] == b"is" and not fake.under(source)
+    # More of an orphan arrives after its commit: appended to the recorded length only.
+    fake.files[video] = b"is" + b"junk from a store never recorded"
+    fake.files[f"{source}/00001.m4s"] = b"t"
+    copy.files["00001.m4s"] = 1
+    await uploader._async_commit_copy(fake, record, "dest", copy, video)
+    assert fake.files[video] == b"ist"
+    assert copy.ranges == {"init.mp4": [0, 1], "00000.m4s": [1, 1], "00001.m4s": [2, 1]}
+
+
+async def test_a_pending_folder_missing_an_uploaded_file_is_kept(hass) -> None:
+    fake = FakeDestination()
+    record = EventRecord(facts=EventFacts(id="e", camera=CAMERA, started=1.0, ended=2.0))
+    source = "f/pending/a/x"
+    fake.files[f"{source}/init.mp4"] = b"i"
+    # The index says 00000.m4s was stored, but the listing does not show it.
+    copy = Copy(folder=source, files={"init.mp4": 1, "00000.m4s": 1})
+    await bare_uploader(hass, SavedCopies())._async_commit_copy(
+        fake, record, "dest", copy, "f/events/v.mp4"
+    )
+    assert fake.files["f/events/v.mp4"] == b"i"
+    assert not any(op == "delete_folder" for op, _ in fake.ops)
+
+
+async def test_a_video_that_did_not_land_whole_is_not_committed(hass) -> None:
+    class Short(FakeDestination):
+        async def async_store(self, path: str, data: bytes) -> None:
+            await super().async_store(path, data[:-1])
+
+    fake = Short()
+    record = EventRecord(facts=EventFacts(id="e", camera=CAMERA, started=1.0, ended=2.0))
+    source = "f/pending/a/x"
     fake.files[f"{source}/init.mp4"] = b"i"
     fake.files[f"{source}/00000.m4s"] = b"s"
-    fake.files[f"{source}/00001.m4s"] = b"t"  # uploaded, but its row never written
     copy = Copy(folder=source, files={"init.mp4": 1, "00000.m4s": 1})
-    await uploader._async_commit_copy(fake, record, copy, final, b"{}")
-    assert f"{final}/00001.m4s" in fake.files and not fake.under(source)
+    with pytest.raises(DestinationError):
+        await bare_uploader(hass, SavedCopies())._async_commit_copy(
+            fake, record, "dest", copy, "f/events/v.mp4"
+        )
+    assert fake.under(source) and not copy.committed  # the segments are still there
+
+
+async def test_two_events_starting_in_the_same_second_get_two_videos(
+    hass, stamina, destinations, setup
+) -> None:
+    entry = await setup()
+    manager = await wire(entry, Clock())
+    first, second = event_id(320), event_id(321)
+    start = time.time()
+    for eid in (first, second):
+        stamina.start(eid, subjects=[subject("s1")], start=start)
+        stamina.segment(eid, 0, init=True)
+        stamina.verdict(eid, subject("s1", verdict="confirmed"))
+        stamina.end(eid, subjects=[subject("s1", verdict="confirmed")], next_segment=1, init=True)
+    for eid in (first, second):
+        await until(state_is(manager, eid, EventState.COMMITTED))
+    fake = destinations["storage0"]
+    videos = fake.videos()
+    one = next(video for video in videos if not video.endswith("-2.mp4"))
+    assert sorted(videos) == sorted([one, one.removesuffix(".mp4") + "-2.mp4"])
+    await hass.config_entries.async_unload(entry.entry_id)
 
 
 # ------------------------------------------------------------------ 13: derived URLs

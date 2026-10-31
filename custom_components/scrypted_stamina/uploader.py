@@ -1,4 +1,4 @@
-"""Segments from the plugin to every destination, then commit or drop the folder.
+"""Segments from the plugin to every destination, then commit the video or drop the folder.
 
 Per event, a **pump**: one fetcher and one **lane** per destination.
 
@@ -28,13 +28,17 @@ The pump runs while the event is PENDING, KEEPING, FOLLOW_UP — or ORPHANED: an
 be closed and a plugin unreachable for the segment TTL, nothing more can be had and it ends;
 for an event not known closed, it never ends on silence alone.
 
-Commit writes `index.m3u8` (only segments that destination holds, with their init) and
-`event.json`, then moves the folder: one server-side move where the provider has one, else
-copy then delete — listing the *source* folder, so a file the index does not know about is
-not deleted uncopied. It is idempotent: a folder already at its target with nothing left at
-the source is a commit that already happened, and the copy skips files already there. Drop
-deletes the pending folder; the uploader never deletes `pending/` on its own initiative,
-only for an event the manager hands it in DROPPING.
+Commit turns the pending folder into one video, `<kind>/<area>-<camera>-<YYMMDD_HHMMSS>.mp4`:
+the files the folder holds — listed, so one the index does not know about is not deleted
+unjoined — are read back and joined in play order (init, then segments: a fragmented MP4,
+no re-encoding), stored, its size confirmed, recorded in the index with where each file lies
+in it, and only then is the pending folder deleted. The plugin no longer holds the segments
+by then (they are acked as each destination confirms them), so the destination's own copy is
+the source. It is idempotent: a file already joined is not joined again, and a video stored
+before a crash is read back only up to the length the index recorded. An orphan that
+receives more after its commit uploads them into the pending folder again, and its next
+commit appends them to the video. Drop deletes the pending folder; the uploader never
+deletes `pending/` on its own initiative, only for an event the manager hands it in DROPPING.
 """
 
 from __future__ import annotations
@@ -44,10 +48,8 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-import json
 import logging
 import time
-from typing import Any
 
 from homeassistant.core import HomeAssistant
 
@@ -67,19 +69,17 @@ from .const import (
     SEGMENT_TTL_SECONDS,
 )
 from .decider import EventRecord, EventState
-from .destinations import Destination, DestinationError, MoveUnsupportedError
+from .destinations import Destination, DestinationError
 from .destinations.base import attempts_limited
 from .hls import playlist
 from .index import Copy, EventIndex
-from .naming import event_path, segment_name
+from .naming import event_file_path, event_path, segment_name
 from .quota import DestinationUsage
 from .redact import scrub_credentials
 
 _LOGGER = logging.getLogger(__name__)
 
 INIT = "init.mp4"
-MANIFEST = "index.m3u8"
-EVENT_JSON = "event.json"
 # The init segment's key wherever segments are numbered (segments count from 0).
 INIT_KEY = -1
 
@@ -130,6 +130,8 @@ class Target:
     over_quota: bool = False
     slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(2))
     evicting: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # One commit at a time: choosing a free video name and recording it is one step.
+    committing: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
     def label(self) -> str:
@@ -267,52 +269,58 @@ def satisfied(record: EventRecord, copy: Copy, key: int) -> bool:
     return _name(key) in copy.files
 
 
-def event_json(record: EventRecord) -> dict[str, Any]:
-    """Return what `event.json` holds: facts, context, scores, decision, latency.
+def file_key(name: str) -> int | None:
+    """Return the key of an uploaded file's name (init -1, init-k, segment n), or None."""
+    if name == INIT:
+        return INIT_KEY
+    stem, dot, extension = name.partition(".")
+    if dot and extension == "m4s" and stem.isdigit():
+        return int(stem)
+    if extension == "mp4" and stem.startswith("init-") and stem[5:].isdigit():
+        return init_key(int(stem[5:]))
+    return None
 
-    Never a URL, a token or anything else that authenticates (architecture §7).
+
+def play_order(record: EventRecord, names: list[str]) -> list[str]:
+    """Return the uploaded files among `names` in play order: each init before its segments.
+
+    Anything that is not an init or a segment is left out.
     """
-    return {
-        "version": 1,
-        "event": record.facts.as_dict(),
-        "camera_name": record.camera_name,
-        "area": record.area,
-        "state": str(record.state),
-        "keep_reason": record.keep_reason,
-        "unusual": record.unusual,
-        "score": {
-            "live": record.live_score,
-            "provisional": record.provisional_score,
-            "final": record.final_score,
-            "unusual_provisional": record.unusual_provisional,
-            "unusual_final": record.unusual_final,
-        },
-        "reason": record.reason,
-        "reasons": record.reasons,
-        "context": {"start": record.context_start, "end": record.context_end},
-        "late": record.late,
-        "follow_up_until": record.follow_up_until,
-        "gaps": sorted(record.gaps),
-        "notes": record.notes,
-        "latency": {**record.facts.stamps, **record.latency},
-    }
+    first_use: dict[int, int] = {}
+    for number, k in sorted(record.facts.init_of.items()):
+        first_use.setdefault(k, number)
+
+    def position(key: int) -> tuple[float, int]:
+        if key >= 0:
+            return (key, 1)
+        k = -1 - key
+        return (-1 if k == 0 else first_use.get(k, float("inf")), 0)
+
+    keyed = [(key, name) for name in names if (key := file_key(name)) is not None]
+    return [name for key, name in sorted(keyed, key=lambda item: position(item[0]))]
 
 
-def manifest_for(record: EventRecord, copy: Copy) -> bytes:
-    """Return the playlist of the segments one destination holds *with their init*."""
+def video_playlist(record: EventRecord, copy: Copy, uri: str) -> str:
+    """Return a playlist over a committed video: each segment a byte range of `uri`.
+
+    Only segments joined into the video *with their init* are listed, so a player is never
+    sent to a range that does not decode.
+    """
     init_of = record.facts.init_of
     held = sorted(
         number
-        for name in copy.files
-        if name.endswith(".m4s") and (number := int(name.split(".")[0])) >= 0
-        if _name(init_key(init_of.get(number, 0))) in copy.files
+        for name in copy.ranges
+        if (number := file_key(name)) is not None and number >= 0
+        if _name(init_key(init_of.get(number, 0))) in copy.ranges
     )
     return playlist(
         held,
         durations=record.facts.durations,
         discontinuities=record.facts.discontinuities,
         init_of=init_of,
-    ).encode()
+        ranges=copy.ranges,
+        uri=uri,
+    )
 
 
 class Uploader:
@@ -832,10 +840,12 @@ class Uploader:
                     return
 
     async def _async_evict(self, target: Target, event_id: str) -> None:
-        """Delete one event folder from one destination."""
+        """Delete one event's video, and any pending folder, from one destination."""
         copies = await self._index.async_copies(event_id)
         copy = copies.get(target.subentry_id)
         if copy is not None and not copy.deleted:
+            if copy.video is not None:
+                await target.destination.async_delete(copy.video)
             await target.destination.async_delete_folder(copy.folder)
             copy.deleted = True
             await self._index.async_save_copy(event_id, target.subentry_id, copy)
@@ -927,102 +937,118 @@ class Uploader:
         ]
 
     async def async_commit(self, record: EventRecord) -> None:
-        """Write the manifest and `event.json`, and move the folder to its final place.
+        """Join each destination's pending folder into the event's video, then delete it.
 
         A copy already committed (an orphan that received more segments after its first
-        commit) gets its `index.m3u8` and `event.json` rewritten where it is.
+        commit) has what arrived since appended to its video.
         """
         await self.async_halt(record.id)
         copies = await self._async_copies(record)
         kind = record.target or FOLDER_EVENTS
-        details = json.dumps(event_json(record), indent=2, default=str).encode()
         for subentry_id, copy in copies.items():
             target = self.targets.get(subentry_id)
             if target is None or copy.deleted:
                 continue
-            if copy.committed:
-                if copy.files and any(name.endswith(".m4s") for name in copy.files):
-                    manifest = manifest_for(record, copy)
-                    for name, data in ((MANIFEST, manifest), (EVENT_JSON, details)):
-                        await target.destination.async_store(f"{copy.folder}/{name}", data)
-                        copy.files[name] = len(data)
-                    await self._index.async_save_copy(record.id, subentry_id, copy)
-                continue
-            final = event_path(target.folder, kind, record.area, record.folder)
             if not copy.files:
-                # Nothing reached this destination: no folder to move, none worth making.
-                copy.committed, copy.folder = True, final
+                # Nothing reached this destination: no video to make.
+                copy.committed = True
                 await self._index.async_save_copy_header(record.id, subentry_id, copy)
                 continue
             try:
-                await self._async_commit_copy(target.destination, record, copy, final, details)
+                async with target.committing:
+                    path = await self._async_video_path(
+                        subentry_id,
+                        record,
+                        copy,
+                        event_file_path(target.folder, kind, record.area, record.folder, record.id),
+                    )
+                    await self._async_commit_copy(
+                        target.destination, record, subentry_id, copy, path
+                    )
             except DestinationError as err:
                 target.error(err)
                 _LOGGER.warning(
                     "%s could not commit %s: %s", target.label, record.id, target.last_error
                 )
                 raise
-            copy.folder, copy.committed = final, True
             target.errors = 0
             target.usage.set(record.id, record.facts.started, record.state, copy.size)
-            await self._index.async_save_copy(record.id, subentry_id, copy)
         record.latency["committed"] = time.time()
         self._on_quota()
 
+    async def _async_video_path(
+        self, subentry_id: str, record: EventRecord, copy: Copy, path: str
+    ) -> str:
+        """Return the path for an event's video: `path`, or `-2`, `-3`… if another has it.
+
+        Two events of one camera starting in the same second would otherwise share a name,
+        and the second commit would overwrite the first's footage. The index decides, so a
+        commit repeated after a crash picks the same path again; a copy keeps the path it
+        was committed to.
+        """
+        stem = path.removesuffix(".mp4")
+        candidates = [path, *(f"{stem}-{n}.mp4" for n in range(2, 100))]
+        if copy.video in candidates:
+            return copy.video
+        for candidate in candidates:
+            if not await self._index.async_video_taken(subentry_id, candidate, record.id):
+                return candidate
+        raise DestinationError(f"no free name for the video of {record.id} at {path}")
+
     async def _async_commit_copy(
-        self, destination: Destination, record: EventRecord, copy: Copy, final: str, details: bytes
+        self, destination: Destination, record: EventRecord, subentry_id: str, copy: Copy, path: str
     ) -> None:
         """Commit one copy, safely repeatable after a crash at any point."""
-        manifest = manifest_for(record, copy)
-        if copy.folder != final:
-            source = await destination.async_list(copy.folder)
-            if not source:
-                at_target = await destination.async_list(final)
-                if at_target:
-                    # Moved already (a restart after the move, before it was recorded).
-                    if f"{final}/{MANIFEST}" not in at_target:
-                        await destination.async_store(f"{final}/{MANIFEST}", manifest)
-                    await destination.async_store(f"{final}/{EVENT_JSON}", details)
-                    copy.files[MANIFEST], copy.files[EVENT_JSON] = len(manifest), len(details)
-                    return
-        for name, data in ((MANIFEST, manifest), (EVENT_JSON, details)):
-            await destination.async_store(f"{copy.folder}/{name}", data)
-            copy.files[name] = len(data)
-        if copy.folder == final:
-            return
-        if destination.can_move:
-            try:
-                await destination.async_move(copy.folder, final)
-                return
-            except MoveUnsupportedError as err:
-                _LOGGER.debug("%s cannot move (%s); copying instead", destination.label, err)
-        # Copy whatever the source folder holds — not only what the index knows — before
-        # deleting it, so nothing there is lost uncopied.
-        source = await destination.async_list(copy.folder)
-        present = await destination.async_list(final)
         prefix = f"{copy.folder}/"
-        for path in sorted(source):
-            name = path[len(prefix) :] if path.startswith(prefix) else path.rsplit("/", 1)[-1]
-            if f"{final}/{name}" in present:
-                continue
-            data = await destination.async_read(path)
-            await destination.async_store(f"{final}/{name}", data)
-            copy.files.setdefault(name, len(data))
+        held = {
+            source[len(prefix) :]: size
+            for source, size in (await destination.async_list(copy.folder)).items()
+            if source.startswith(prefix)
+        }
+        new = [name for name in play_order(record, list(held)) if name not in copy.ranges]
+        if new or (copy.video is not None and copy.video != path):
+            ranges = {name: list(span) for name, span in copy.ranges.items()}
+            parts: list[bytes] = []
+            if copy.video is not None and ranges:
+                # Only as much as the index recorded: a store that crashed before being
+                # recorded may have left a longer file, whose tail is joined again below.
+                length = copy.video_size
+                parts.append((await destination.async_read(copy.video))[:length])
+                if len(parts[0]) != length:
+                    raise DestinationError(
+                        f"{destination.label} holds {len(parts[0])} bytes of {copy.video}, "
+                        f"not the {length} recorded"
+                    )
+            offset = sum(len(part) for part in parts)
+            for name in new:
+                data = await destination.async_read(f"{prefix}{name}")
+                ranges[name] = [offset, len(data)]
+                parts.append(data)
+                offset += len(data)
+                copy.files.setdefault(name, len(data))
+            await destination.async_store_video(path, b"".join(parts))
+            previous = copy.video
+            copy.video, copy.ranges, copy.committed = path, ranges, True
+            # Recorded before anything is deleted: the video is what holds the footage now.
+            await self._index.async_save_copy(record.id, subentry_id, copy)
+            if previous is not None and previous != path:
+                await destination.async_delete(previous)
+        elif not copy.committed:
+            copy.committed = True
+            await self._index.async_save_copy(record.id, subentry_id, copy)
+        unjoined = [
+            name for name in copy.files if file_key(name) is not None and name not in copy.ranges
+        ]
+        if unjoined:
+            # Uploaded, yet not in the listing: never delete footage that was not joined.
+            _LOGGER.warning(
+                "%s did not list %s of %s; its pending folder is kept",
+                destination.label,
+                ", ".join(sorted(unjoined)),
+                record.id,
+            )
+            return
         await destination.async_delete_folder(copy.folder)
-
-    async def async_update_details(self, record: EventRecord) -> None:
-        """Rewrite `event.json` of an already-committed event (after the follow-up window)."""
-        copies = await self._async_copies(record)
-        details = json.dumps(event_json(record), indent=2, default=str).encode()
-        for subentry_id, copy in copies.items():
-            target = self.targets.get(subentry_id)
-            if target is None or copy.deleted or not copy.committed or not copy.files:
-                continue
-            try:
-                await target.destination.async_store(f"{copy.folder}/{EVENT_JSON}", details)
-            except DestinationError as err:
-                target.error(err)
-                _LOGGER.warning("%s could not update %s: %s", target.label, record.id, err)
 
     async def async_drop(self, record: EventRecord) -> None:
         """Delete an event's pending folder everywhere. Only for an event in DROPPING."""

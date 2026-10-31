@@ -141,18 +141,33 @@ ACTION_COMMIT = "commit"
 class Copy:
     """One event's files on one destination."""
 
-    # Where the folder is now: under `pending/` until committed, then the final folder.
+    # The pending folder segments are uploaded into while the event lasts.
     folder: str
+    # Every file uploaded for the event (init and segments), with its size. A committed
+    # video is these files joined, so their total is what the copy occupies either way.
     files: dict[str, int] = field(default_factory=dict)
     committed: bool = False
     deleted: bool = False
     # Segments this destination could not take (quota full, provider refused); -1 is init.
     failed: list[int] = field(default_factory=list)
+    # The committed video's path, and where each file joined into it lies: `[offset, length]`.
+    video: str | None = None
+    ranges: dict[str, list[int]] = field(default_factory=dict)
 
     @property
     def size(self) -> int:
         """Return the bytes this copy occupies."""
         return 0 if self.deleted else sum(self.files.values())
+
+    @property
+    def video_size(self) -> int:
+        """Return the length of the committed video, as recorded."""
+        return max((offset + length for offset, length in self.ranges.values()), default=0)
+
+    @property
+    def playable(self) -> bool:
+        """Whether a committed video of this copy is on its destination."""
+        return self.committed and not self.deleted and self.video is not None
 
     def header(self) -> dict[str, Any]:
         """Serialise everything but the files, which are rows of their own."""
@@ -161,17 +176,25 @@ class Copy:
             "committed": self.committed,
             "deleted": self.deleted,
             "failed": self.failed,
+            "video": self.video,
+            "ranges": self.ranges,
         }
 
     @classmethod
     def from_header(cls, data: dict[str, Any], files: dict[str, int]) -> Copy:
         """Read back what `header` wrote, with the file rows."""
+        video = data.get("video")
         return cls(
             folder=str(data["folder"]),
             files=files,
             committed=bool(data.get("committed")),
             deleted=bool(data.get("deleted")),
             failed=[int(n) for n in data.get("failed") or ()],
+            video=str(video) if video else None,
+            ranges={
+                str(name): [int(offset), int(length)]
+                for name, (offset, length) in (data.get("ranges") or {}).items()
+            },
         )
 
 
@@ -354,7 +377,7 @@ class BrowseRow:
     unusual: bool
     summary: str
     thumbnail: bool = False
-    # A committed copy with its playlist is still on some destination.
+    # A committed video is still on some destination.
     offsite: bool = False
 
 
@@ -367,11 +390,11 @@ class PruneResult:
     thumbnails: int = 0
 
 
-# Whether an event still has a committed, playable copy somewhere (evicted ones have no files).
+# Whether an event still has a committed video somewhere (evicted copies are `deleted`).
 _OFFSITE = (
-    "EXISTS (SELECT 1 FROM copies c JOIN files f ON f.event_id = c.event_id "
-    "AND f.destination = c.destination AND f.name = 'index.m3u8' "
+    "EXISTS (SELECT 1 FROM copies c "
     "WHERE c.event_id = events.id AND json_extract(c.copy, '$.committed') "
+    "AND json_extract(c.copy, '$.video') IS NOT NULL "
     "AND NOT COALESCE(json_extract(c.copy, '$.deleted'), 0))"
 )
 _THUMBNAIL = "EXISTS (SELECT 1 FROM thumbnails t WHERE t.event_id = events.id)"
@@ -830,6 +853,20 @@ class EventIndex:
             }
 
         return await self._run(_read)
+
+    async def async_video_taken(self, destination: str, path: str, event_id: str) -> bool:
+        """Return whether another event's live copy on a destination is the video at `path`."""
+        return await self._run(
+            lambda db: (
+                db.execute(
+                    "SELECT 1 FROM copies WHERE destination = ? AND event_id != ? "
+                    "AND json_extract(copy, '$.video') = ? "
+                    "AND NOT COALESCE(json_extract(copy, '$.deleted'), 0) LIMIT 1",
+                    (destination, event_id, path),
+                ).fetchone()
+                is not None
+            )
+        )
 
     async def async_destination_usage(self, destination: str) -> list[tuple[str, float, str, int]]:
         """Return `(event id, start, state, bytes)` for every live copy on a destination."""

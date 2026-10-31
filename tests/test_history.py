@@ -155,7 +155,14 @@ async def test_rows_are_slimmed_after_the_fresh_tier_and_still_read(hass, tmp_pa
     await index.async_save(old, features(old))
     await index.async_save(fresh, features(fresh))
     await index.async_save_copy(
-        old.id, "dest", Copy(folder="events/x", files={"index.m3u8": 9}, committed=True)
+        old.id,
+        "dest",
+        Copy(
+            folder="pending/x",
+            files={"init.mp4": 9},
+            committed=True,
+            video="events/v.mp4",
+        ),
     )
 
     result = await prune(index, now)

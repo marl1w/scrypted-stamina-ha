@@ -191,7 +191,7 @@ The exact message and route shapes are in [api.md](api.md). All routes are under
  └────┬─────┘    │    └──────────┘
       │ event.end + post-roll uploaded
       ▼
- ┌───────────┐  manifest written, pending/<id>/ → events/<id>/
+ ┌───────────┐  segments joined into events/<area>-<camera>-<time>.mp4, pending/<id>/ deleted
  │ COMMITTED │─► optional: full-res upgrade from VideoRecorder (duration = event span)
  └───────────┘
 ```
@@ -206,7 +206,7 @@ Some evidence comes after the camera has stopped seeing anything: a door opened 
 - Every state change of the camera's linked entities in that window is attached to the event as late evidence (`{entity, kind, from, to, t_rel_s}`).
 - **Provisional score** at `event.end`; **final score** when the window closes, from facts, context and late evidence. The relevance model learns what late evidence is normal: a door opened at 6 p.m. with someone home is not unusual; at 3 a.m. with the alarm armed it is.
 - If the final score turns the event unusual, `event.<cam>_stamina` fires again as `unusual` with `late: true`.
-- **Decider:** an event that is ordinary at the end and not kept for a chosen class (vetoed, another class, or uploads not on *Chosen classes*) enters `FOLLOW_UP`. Its pending upload is kept until the window closes, then dropped if it is still ordinary, or moved to `unusual-unconfirmed/` if it became unusual. Events kept for a chosen class or for being unusual commit as before; only their `event.json` and index row are updated after the window.
+- **Decider:** an event that is ordinary at the end and not kept for a chosen class (vetoed, another class, or uploads not on *Chosen classes*) enters `FOLLOW_UP`. Its pending upload is kept until the window closes, then dropped if it is still ordinary, or moved to `unusual-unconfirmed/` if it became unusual. Events kept for a chosen class or for being unusual commit as before; only their index row is updated after the window.
 - `FOLLOW_UP` pending data has its own cap (default 1 GB per destination). Over it, the oldest vetoed-and-ordinary events are dropped first.
 - The window end time is persisted, so evaluation resumes after a restart.
 
@@ -216,15 +216,16 @@ Sequences across cameras are already part of the ported relevance model: each ev
 
 **Destinations** are subentries ("Add destination"), as in the earlier prototype. Each one picks an account or server from the storage integrations already set up: Synology DSM, WebDAV, SFTP Storage, OneDrive, Google Drive. Each has its own folder, quota (default 15 GB), and retention (oldest evicted first). Every kept event goes to every destination.
 
-- Destinations are ported from the earlier prototype's `cloud/destinations`. Each must support writing a file per segment; append is not required.
+- Destinations are ported from the earlier prototype's `cloud/destinations`. Each must support writing, reading and listing files and deleting a folder; append is not required.
 - Layout per event:
   ```
-  <folder>/pending/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 00001.m4s, …
-  <folder>/events/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 0000N.m4s, index.m3u8, event.json
-  <folder>/unusual-unconfirmed/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/…   (vetoed but unusual: kept, apart)
+  <folder>/pending/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 00000.m4s, …   (while uploading)
+  <folder>/events/<area>-<camera>-<YYMMDD_HHMMSS>.mp4
+  <folder>/unusual-unconfirmed/<area>-<camera>-<YYMMDD_HHMMSS>.mp4   (vetoed but unusual: kept, apart)
   ```
-  `<area>` is the camera device's Home Assistant area (slugified), or `no-area` when it has none. `index.m3u8` (HLS with fMP4) plays straight from the folder. `event.json` holds the event facts, the context, the score and the reasons.
-- Commit is a folder rename, where the provider supports it; otherwise copy then delete.
+  `<area>` is the camera device's Home Assistant area (slugified), or `no-area` when it has none; the time is the event's local start. A second event of the same camera in the same second gets `-2` (the index decides, under a per-destination commit lock). Facts, context, score and reasons are in the index only.
+- Segments stream to `pending/` during the event: that is what survives the camera or the box being taken. **Commit** joins one destination's pending files into the event's video: listed (so a file the index never recorded is not lost), read back from the destination (the plugin has released them by then), joined in play order — init, then segments, a later init before the segments that need it — as a fragmented MP4 with no re-encoding, stored, its size confirmed (`async_store_video`: store, then `async_size`), recorded in the index with each file's byte range, and only then is the pending folder deleted. Repeating it after a crash joins nothing twice: files already in the video are skipped, and a video is read back only up to the length recorded. An orphan that receives more after its commit uploads into `pending/` again and has the rest appended at its next commit.
+- At about 38 KB per 2 s segment a video is some 70 MB an hour. OneDrive takes up to 240 MB in one request and larger ones through an upload session in 10 MiB chunks; Google Drive refuses one over 100 MB with a clear error; the others have no limit here.
 - Quota and retention evict the oldest committed events first, never pending or orphaned ones.
 - Uploads run in parallel per event, with a bounded queue. The low-res segment is the default, so upstream bandwidth is about 60 KB/s per active event.
 
@@ -232,10 +233,10 @@ Sequences across cameras are already part of the ported relevance model: each ev
 
 - SQLite in HA's config directory holds metadata only: event id, camera, times, subjects with sources and verdicts, context, score, reasons, decision state, and cloud path.
 - It is also the relevance model's history: rebuilt nightly from the last **25 months** of events, dropped ones included, with a **one-year half-life**, so recurring seasonal situations (snow, storms) are learned rather than flagged again each year.
-- **Two tiers per row.** *Fresh* (first 30 days): the full record. *Slim* (after that): id, camera, times, state, unusual, score, finalized, summary, area, duration, features, weight, and a compact record (decision, scores, reason and reasons, keep reason, path pieces, notes, subject classes and verdicts). Observations, per-subject detail, context snapshots and late-evidence detail go. A row is slimmed only once settled: final, features stored, no pending action, no copy still being written, and an orphan only once its upload is complete. Whether footage is still available is derived, not stored: *recording* while the recorder retention option covers the event's day, *offsite* while a committed copy with its `index.m3u8` is on some destination.
+- **Two tiers per row.** *Fresh* (first 30 days): the full record. *Slim* (after that): id, camera, times, state, unusual, score, finalized, summary, area, duration, features, weight, and a compact record (decision, scores, reason and reasons, keep reason, path pieces, notes, subject classes and verdicts). Observations, per-subject detail, context snapshots and late-evidence detail go. A row is slimmed only once settled: final, features stored, no pending action, no copy still being written, and an orphan only once its upload is complete. Whether footage is still available is derived, not stored: *recording* while the recorder retention option covers the event's day, *offsite* while a committed video is on some destination.
 - A **thumbnail** per event: a 320 px JPEG (about 15 KB) of the frame at confirmation, or at event start, served by the plugin. Kept 30 days for kept events (committed, unusual, orphaned) and 7 days for dropped ones. The panel and the media browser show a placeholder without one.
 - **Size cap** ("History size", default 200 MB), measured as the pages SQLite uses (`(page_count − freelist_count) × page_size`; the file itself keeps its high-water size). Over it, the nightly prune **thins** slim rows oldest first: per camera and common kind (500 or more dropped events), one row in four survives and its `weight` counts for the others; the rebuild multiplies its rates and counts by that weight, with the same decay. Never thinned: kept, committed or orphaned events, unusual ones, rare kinds, and rare contexts (tamper, alarm armed or triggered, snow, storm or exceptional weather, any late evidence). If the cap cannot be met, that is logged once and nothing protected goes. Rows past the 25 months are deleted, except while their files are still on a destination.
-- A **media source** ("Scrypted events") lists events by camera, then day. Playback resolves to the plugin's recording HLS, or else the cloud `index.m3u8`; only the sources still available are offered.
+- A **media source** ("Scrypted events") lists events by camera, then day. Playback resolves to the plugin's recording HLS, or else a committed video: Home Assistant answers with a playlist in which each segment is a byte range of the one file (`EXT-X-BYTERANGE`), and serves those ranges from the video, read from the destination once and kept in memory while it plays. Only the sources still available are offered.
 - A **review panel** (sidebar, admins only) on one page: camera chips with each camera's state (working, learning, verifier not responding, no recent events; a tap filters to it), filters, and the event list. From 900 px wide the selected event plays beside the list, the latest unusual one preselected, with why it was flagged, the decision and what was seen; the arrow keys move through the list. On a phone a tapped row opens inline under itself.
 
 ### 3.7 Entities
@@ -262,7 +263,7 @@ A recorder-based clip waits for the recorder to finish writing (about a minute).
 | First segment uploaded | < 3 s from detection, plus uplink time | Fetched at once and uploaded in parallel; 1–2 s segments, copied without re-encoding |
 | Verifier verdict | 1–3 s | Doesn't block anything: uploads start before it |
 
-Every hop is timestamped into `event.json`: camera event time, plugin receive, segment cut, HA fetch, upload done. `sensor.stamina_latency` reports p50/p95 time-to-first-segment-uploaded, so the target is measured continuously.
+Every hop is timestamped into the event's index row: camera event time, plugin receive, segment cut, HA fetch, upload done. `sensor.stamina_latency` reports p50/p95 time-to-first-segment-uploaded, so the target is measured continuously.
 
 ## 5. Data flow of one event
 
@@ -277,10 +278,9 @@ t      SCRYPTED (stamina plugin)              HA (stamina integration)          
 2.3 …  segments every 2 s ─────────────────►  fetch + upload, ack  ─────────────► pending/<id>/…
 40.0   last observation + 10 s margin
        ─ event.end {subjects, span} ───────►  score; context at end
-                                              upload tail; write index.m3u8, event.json
-                                              rename pending/<id> → events/<id>  ► events/<id>/
+                                              upload tail; join pending/<id>/ into one video ► events/<area>-<camera>-<time>.mp4
+                                              size confirmed, then pending/<id>/ deleted
                                               entities: event.<cam>_stamina fires
-later                                         optional full-res upgrade via playback ► events/<id>/full.mp4
 ```
 
 Vetoed path: the same until the verdict. Then `DROPPING` deletes `pending/<id>/` and the index keeps a metadata row (`dropped`).
@@ -309,13 +309,13 @@ Each camera's capabilities are shown as attributes on `event.<cam>_stamina` and 
 ## 7. Failure and safety rules
 
 - Nothing pending is deleted without an explicit `DROPPING` decision made while the link is healthy.
-- A camera going offline during an event keeps the event (safety behaviour, not a rule), with `camera_offline` noted in `event.json`.
-- Segments are uploaded in order. A missing segment is retried until its TTL expires, then marked as a gap in `event.json`. Playback tolerates gaps.
+- A camera going offline during an event keeps the event (safety behaviour, not a rule), with `camera_offline` noted in its index row.
+- Segments are uploaded in order. A missing segment is retried until its TTL expires, then marked as a gap in the index; the video simply lacks it and playback jumps it.
 - Restarts:
   - **The integration** resumes SSE from its stored `seq`, and events still pending in the index are re-evaluated (an expired event becomes `orphaned`, so it is kept).
   - **The plugin** starts a new event sequence (a new `epoch` in `seq`), so the integration closes the old epoch's open events as `orphaned`.
 - Security:
   - token auth on every route, compared in constant time;
-  - no credentials or stream URLs in logs or in `event.json`;
+  - no credentials or stream URLs in logs or in the index;
   - box and score values clamped;
   - event ids are opaque random strings.

@@ -12,7 +12,7 @@ from custom_components.scrypted_stamina.const import INDEX_FILENAME
 from custom_components.scrypted_stamina.decider import EventState
 from custom_components.scrypted_stamina.index import EventIndex
 
-from .conftest import EPOCH, event_id, event_object, subject, until
+from .conftest import EPOCH, event_id, event_object, joined, subject, until
 
 record_stub = type("Stub", (), {"notes": ["orphan_complete"]})()
 
@@ -67,10 +67,9 @@ async def test_a_new_epoch_orphans_open_events(hass, stamina, destinations, setu
     record = await manager.index.async_get(eid)
     assert record.state is EventState.ORPHANED
     assert "plugin_restarted" in record.notes
-    # Kept: what was uploaded is committed where it is, nothing deleted.
-    kept = destinations["storage0"].under("scrypted-stamina/events/")
-    assert any(path.endswith("00000.m4s") for path in kept)
-    assert not any(op == "delete_folder" for op, _ in destinations["storage0"].ops)
+    # Kept: what was uploaded is committed as the event's video; only its pending folder goes.
+    assert "00000.m4s" in joined(destinations["storage0"])
+    assert all("/pending/" in path for op, path in destinations["storage0"].ops if "delete" in op)
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -125,8 +124,9 @@ async def test_link_lost_for_two_minutes_orphans_and_keeps(
         "event": event_object(eid, end=time.time()),
         "segments": {"live": False, "next": 1},
     }
-    await until(lambda: bool(destinations["storage0"].under("scrypted-stamina/events/")))
-    # A vetoed subject, but no decision could be made: nothing is deleted.
-    assert not any(op == "delete_folder" for op, _ in destinations["storage0"].ops)
-    assert destinations["storage0"].under("scrypted-stamina/events/")
+    await until(lambda: bool(destinations["storage0"].videos()))
+    # A vetoed subject, but no decision could be made: nothing but the pending folder, joined
+    # into the video, is deleted.
+    assert all("/pending/" in path for op, path in destinations["storage0"].ops if "delete" in op)
+    assert "00000.m4s" in joined(destinations["storage0"])
     await hass.config_entries.async_unload(entry.entry_id)

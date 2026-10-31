@@ -1250,7 +1250,7 @@ class ScryptedStaminaPanel extends HTMLElement {
         verdict.text ? el("p", { class: "sentence", style: { marginTop: "0" }, text: verdict.text }) : null,
         notes.map((note) => el("p", { class: "note" }, icon("mdi:information-outline", "icon--sm"), note)),
         data.cloud_path
-          ? [el("div", { class: "item__sub", style: { marginTop: "10px" }, text: "Folder in each destination" }), el("code", { class: "path", text: data.cloud_path })]
+          ? [el("div", { class: "item__sub", style: { marginTop: "10px" }, text: "Path in each destination" }), el("code", { class: "path", text: data.cloud_path })]
           : null,
         copies.length ? el("div", { class: "items", style: { marginTop: "12px" } }, copies) : null,
         el("p", { class: "event-id", text: `Event ${data.id}` }),

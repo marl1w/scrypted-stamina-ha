@@ -14,7 +14,6 @@ importable for the great majority of users who do not have a Synology.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Awaitable
 import logging
 from typing import Any
@@ -25,7 +24,6 @@ from homeassistant.core import HomeAssistant
 from .base import (
     Destination,
     DestinationError,
-    MoveUnsupportedError,
     TransientError,
     async_attempt,
 )
@@ -36,19 +34,16 @@ _LOGGER = logging.getLogger(__name__)
 # be far longer than that, and a page it did not ask for is a file the quota forgets.
 PAGE = 500
 
-# A File Station copy/move runs as a background task on the NAS; this is how long it is
-# polled for. An event folder is a few megabytes on the same volume, so it is a rename.
-MOVE_POLL_SECONDS = 0.5
-MOVE_TIMEOUT_SECONDS = 120.0
-
-_COPY_MOVE = "SYNO.FileStation.CopyMove"
-_CREATE_FOLDER = "SYNO.FileStation.CreateFolder"
 _DELETE = "SYNO.FileStation.Delete"
 
 # What DSM answers when the thing being deleted is not there: a File Station error (900)
 # whose detail is "no such file or directory" (408).
 _NO_SUCH_FILE = 900
 _NO_SUCH_FILE_DETAIL = 408
+
+
+class _NoSessionError(DestinationError):
+    """The Synology integration exposes no DSM session for the APIs it does not wrap."""
 
 
 def _is_missing(err: Exception) -> bool:
@@ -76,13 +71,10 @@ class SynologyDestination(Destination):
     """Event folders in a File Station shared folder.
 
     The library the Synology integration uses wraps list, upload, download and a
-    non-recursive delete. Moving and recursive deletes are File Station APIs it does not
-    wrap (`SYNO.FileStation.CopyMove`, `SYNO.FileStation.Delete` with `recursive`), so those
-    go through the same logged-in session's generic request. A NAS that does not answer
-    them falls back to copy-then-delete and file-by-file deletes.
+    non-recursive delete. A recursive delete is a File Station API it does not wrap
+    (`SYNO.FileStation.Delete` with `recursive`), so that goes through the same logged-in
+    session's generic request; a NAS that does not answer it is emptied file by file.
     """
-
-    can_move = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Bind to a loaded Synology DSM config entry."""
@@ -204,7 +196,7 @@ class SynologyDestination(Destination):
         self._file_station  # noqa: B018 - raises the clear error when File Station is missing
         dsm = getattr(getattr(self._entry.runtime_data, "api", None), "dsm", None)
         if dsm is None:
-            raise MoveUnsupportedError(f"{self._entry.title} exposes no DSM session")
+            raise _NoSessionError(f"{self._entry.title} exposes no DSM session")
         return dsm
 
     async def async_read(self, path: str) -> bytes:
@@ -222,66 +214,13 @@ class SynologyDestination(Destination):
 
         return await async_attempt(f"Synology read of {path}", attempt)
 
-    async def _async_create_folder(self, folder: str) -> None:
-        """Create a folder and its parents (File Station `force_parent`)."""
-        parent, _, name = f"/{folder.strip('/')}".rpartition("/")
-        await self._dsm.get(
-            _CREATE_FOLDER,
-            "create",
-            {"folder_path": parent or "/", "name": name, "force_parent": "true"},
-        )
-
-    async def async_move(self, source: str, target: str) -> None:
-        """Move a folder with a File Station CopyMove task, and wait for it to finish.
-
-        CopyMove keeps the folder's own name and takes a destination *parent*, which is all
-        the commit needs: an event folder keeps its name from `pending/` to `events/`.
-        """
-        _, _, source_name = source.rpartition("/")
-        target_parent, _, target_name = target.rpartition("/")
-        if source_name != target_name or not target_parent:
-            raise MoveUnsupportedError("File Station moves keep the folder name")
-        try:
-            await self._async_create_folder(target_parent)
-            started = await self._dsm.get(
-                _COPY_MOVE,
-                "start",
-                {
-                    "path": f"/{source.strip('/')}",
-                    "dest_folder_path": f"/{target_parent.strip('/')}",
-                    "overwrite": "false",
-                    "remove_src": "true",
-                },
-            )
-        except DestinationError:
-            raise
-        except Exception as err:
-            if "NotExists" in type(err).__name__:
-                raise MoveUnsupportedError(f"File Station has no CopyMove: {err}") from err
-            raise DestinationError(f"Synology could not start moving {source}: {err}") from err
-        task = (started or {}).get("data", {}).get("taskid") if isinstance(started, dict) else None
-        if not task:
-            raise DestinationError(f"Synology did not start moving {source}")
-
-        waited = 0.0
-        while waited < MOVE_TIMEOUT_SECONDS:
-            status = await self._dsm.get(_COPY_MOVE, "status", {"taskid": task})
-            data = status.get("data", {}) if isinstance(status, dict) else {}
-            if data.get("finished"):
-                if data.get("errors") or data.get("error"):
-                    raise DestinationError(f"Synology could not move {source}: {data}")
-                return
-            await asyncio.sleep(MOVE_POLL_SECONDS)
-            waited += MOVE_POLL_SECONDS
-        raise DestinationError(f"Synology took too long moving {source}")
-
     async def async_delete_folder(self, folder: str) -> None:
         """Remove a folder with one recursive File Station delete."""
         try:
             await self._dsm.get(
                 _DELETE, "delete", {"path": f"/{folder.strip('/')}", "recursive": "true"}
             )
-        except MoveUnsupportedError:
+        except _NoSessionError:
             await super().async_delete_folder(folder)
         except Exception as err:
             if _is_missing(err):

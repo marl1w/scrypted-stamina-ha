@@ -11,6 +11,8 @@ from custom_components.scrypted_stamina.devices import resolve_camera
 from custom_components.scrypted_stamina.naming import (
     area_slug,
     camera_slug,
+    event_file_name,
+    event_file_path,
     event_folder_name,
     event_path,
     root_folder,
@@ -81,3 +83,17 @@ async def test_area_comes_from_the_camera_device(hass) -> None:
     assert not alone.shared
     assert alone.area_slug == "no-area"
     assert alone.slug == "porch"
+
+
+def test_a_committed_event_is_one_video_named_area_camera_time() -> None:
+    when = dt.datetime(2026, 10, 31, 21, 13, 49)
+    event = "ev_q2Jx8sK4mZb1VtR6yN0aLw"
+    folder = event_folder_name(when, "Front Door", event)
+    assert event_file_name("front-garden", folder, event) == (
+        "front-garden-front-door-261031_211349.mp4"
+    )
+    assert event_file_path("scrypted-stamina", "events", "no-area", folder, event) == (
+        "scrypted-stamina/events/no-area-front-door-261031_211349.mp4"
+    )
+    # A folder not of this shape still names a video, never a path outside its folder.
+    assert event_file_name("garden", "../odd", event) == "garden-odd.mp4"

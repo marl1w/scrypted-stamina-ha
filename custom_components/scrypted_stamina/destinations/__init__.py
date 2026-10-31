@@ -24,7 +24,6 @@ from homeassistant.core import HomeAssistant
 from .base import (
     Destination,
     DestinationError,
-    MoveUnsupportedError,
     UploadTooLargeError,
 )
 from .google_drive import GoogleDriveDestination
@@ -38,7 +37,6 @@ __all__ = [
     "Destination",
     "DestinationError",
     "GoogleDriveDestination",
-    "MoveUnsupportedError",
     "OneDriveDestination",
     "SftpDestination",
     "SynologyDestination",

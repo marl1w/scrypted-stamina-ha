@@ -108,11 +108,13 @@ class OAuthDestination(Destination):
         data: Any,
         headers: dict[str, str] | None,
         params: dict[str, str] | None,
+        authorize: bool = True,
     ) -> Any:
         """Make one call, classifying its failure as permanent or worth retrying."""
-        token = await self._async_token()
+        sent = dict(headers or {})
+        if authorize:
+            sent["Authorization"] = f"Bearer {await self._async_token()}"
         session = async_get_clientsession(self._hass)
-        sent = {"Authorization": f"Bearer {token}", **(headers or {})}
         try:
             async with session.request(
                 method, url, headers=sent, data=data, params=params
@@ -148,6 +150,7 @@ class OAuthDestination(Destination):
         headers: dict[str, str] | None = None,
         params: dict[str, str] | None = None,
         attempts: int = REQUEST_ATTEMPTS,
+        authorize: bool = True,
     ) -> Any:
         """Make one call, retrying the failures that are worth retrying.
 
@@ -160,6 +163,8 @@ class OAuthDestination(Destination):
 
         `attempts` is for the calls that are not safe to repeat blindly — one that creates
         something named rather than addressed can leave a twin behind.
+
+        `authorize` is off for a URL that is its own credential (an upload session's).
         """
         return await async_attempt(
             f"{self.service} {method}",
@@ -171,6 +176,7 @@ class OAuthDestination(Destination):
                 data=data,
                 headers=headers,
                 params=params,
+                authorize=authorize,
             ),
             attempts=attempts,
         )

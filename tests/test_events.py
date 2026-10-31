@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 
 from homeassistant.core import HomeAssistant
@@ -56,7 +55,7 @@ async def state_of(manager, eid: str) -> EventState:
     return record.state
 
 
-async def test_confirmed_event_commits_with_manifest_and_details(
+async def test_confirmed_event_commits_as_one_video(
     hass: HomeAssistant, stamina, destinations, setup
 ) -> None:
     entry = await setup(destinations=2)
@@ -69,17 +68,15 @@ async def test_confirmed_event_commits_with_manifest_and_details(
         lambda: eid in manager.records and manager.records[eid].state is EventState.COMMITTED
     )
 
+    record = manager.records[eid]
+    stamp = record.folder[:13]
     for fake in destinations.values():
-        files = fake.under("scrypted-stamina/events/no-area/")
-        names = [path.rsplit("/", 1)[1] for path in files]
-        assert names == ["00000.m4s", "00001.m4s", "event.json", "index.m3u8", "init.mp4"]
-        assert not fake.under("scrypted-stamina/pending/")
-        details = json.loads(next(fake.files[p] for p in files if p.endswith("event.json")))
-        assert details["state"] == "keeping"  # written before the move
-        assert details["keep_reason"] == "classes: person"
-        assert "camera_event_time" in details["latency"]
-        assert "first_upload" in details["latency"]
-        assert TOKEN_FREE(details)
+        # Nothing but the video: no folder, no playlist, no sidecar.
+        assert fake.under("scrypted-stamina/") == [
+            f"scrypted-stamina/events/no-area-front-door-{stamp}.mp4"
+        ]
+    assert record.keep_reason == "classes: person"
+    assert "first_upload" in record.latency and "committed" in record.latency
     assert ("ev_" + "0" * 20 + "10", 1) in stamina.acks
     state = hass.states.get("event.front_door_stamina")
     assert state.attributes["event_type"] == "normal"
@@ -87,12 +84,6 @@ async def test_confirmed_event_commits_with_manifest_and_details(
     # Entity updates are coalesced over a second.
     await until(lambda: hass.states.get("sensor.stamina_latency").state != "unknown")
     await hass.config_entries.async_unload(entry.entry_id)
-
-
-def TOKEN_FREE(details: dict) -> bool:
-    from .conftest import TOKEN
-
-    return TOKEN not in json.dumps(details)
 
 
 async def test_segments_upload_in_order(hass, stamina, destinations, setup) -> None:
@@ -169,14 +160,10 @@ async def test_late_door_open_makes_it_unusual_and_moves_it(
     record = await manager.index.async_get(eid)
     assert record.state is EventState.COMMITTED
     assert record.unusual_provisional is False and record.unusual_final is True
-    files = destinations["storage0"].under("scrypted-stamina/unusual-unconfirmed/no-area/")
-    assert any(path.endswith("index.m3u8") for path in files)
+    assert destinations["storage0"].videos("scrypted-stamina/unusual-unconfirmed/")
     assert not destinations["storage0"].under("scrypted-stamina/pending/")
-    details = json.loads(
-        next(destinations["storage0"].files[p] for p in files if p.endswith("event.json"))
-    )
-    assert details["late"][0]["entity"] == GATE
-    assert details["score"]["final"] == 0.95 and details["score"]["provisional"] == 0.2
+    assert record.late[0]["entity"] == GATE
+    assert record.final_score == 0.95 and record.provisional_score == 0.2
 
     last = events[-1]
     assert last.attributes["event_type"] == "unusual"
@@ -201,11 +188,9 @@ async def test_confirmed_event_is_rescored_after_the_window_without_moving(
     await hass.async_block_till_done()
     await clock.advance(hass, 11 * 60)
     await until(lambda: eid not in manager.records)
-    files = destinations["storage0"].under("scrypted-stamina/events/")
-    details = json.loads(
-        next(destinations["storage0"].files[p] for p in files if p.endswith("event.json"))
-    )
-    assert details["score"]["final"] == 0.95
+    record = await manager.index.async_get(eid)
+    assert record.final_score == 0.95
+    assert len(destinations["storage0"].videos()) == 1
     assert not destinations["storage0"].under("scrypted-stamina/unusual-unconfirmed/")
     await hass.config_entries.async_unload(entry.entry_id)
 

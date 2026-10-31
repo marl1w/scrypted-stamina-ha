@@ -338,7 +338,14 @@ async def test_event_detail(hass, hass_ws_client, stamina_entry) -> None:
     )
     await stamina_entry.index.async_save(rec)
     await stamina_entry.index.async_save_copy(
-        rec.id, "dest1", Copy(folder="events/garden/x", files={"index.m3u8": 9}, committed=True)
+        rec.id,
+        "dest1",
+        Copy(
+            folder="pending/garden/x",
+            files={"init.mp4": 9},
+            committed=True,
+            video="events/v.mp4",
+        ),
     )
     client = await hass_ws_client(hass)
     event = (await call(client, type=f"{DOMAIN}/event", event_id=rec.id))["event"]
@@ -543,7 +550,14 @@ async def test_a_slim_row_without_thumbnail_or_footage(hass, hass_ws_client, sta
     for rec in (gone, kept):
         await index.async_save(rec, features='{"kind": "person", "context": []}')
     await index.async_save_copy(
-        kept.id, "dest1", Copy(folder="events/x", files={"index.m3u8": 9}, committed=True)
+        kept.id,
+        "dest1",
+        Copy(
+            folder="pending/x",
+            files={"init.mp4": 9},
+            committed=True,
+            video="events/v.mp4",
+        ),
     )
     pruned = await index.async_prune(
         history_before=0,
