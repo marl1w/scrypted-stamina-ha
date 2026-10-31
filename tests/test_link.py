@@ -41,6 +41,21 @@ async def test_resume_from_the_last_seq_without_duplicates(hass, stamina, setup)
     await index.async_close()
 
 
+async def test_an_epoch_without_a_seq_replays_the_buffer(hass, stamina, setup) -> None:
+    entry = await setup()
+    manager = entry.runtime_data.manager
+    assert manager.link.seq is None and manager.link.epoch == EPOCH
+
+    # A message published while the link reconnects, before it ever had a seq.
+    stamina.drop_streams()
+    eid = event_id(2)
+    stamina.start(eid, subjects=[subject("s1")])
+    await until(lambda: len(stamina.stream_requests) >= 2 and manager.link_healthy)
+    assert stamina.stream_requests[-1] == {"since": "0", "epoch": EPOCH}
+    await until(lambda: eid in manager.records)
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
 async def test_a_new_epoch_orphans_open_events(hass, stamina, destinations, setup) -> None:
     entry = await setup()
     manager = entry.runtime_data.manager

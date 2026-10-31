@@ -218,9 +218,12 @@ class StaminaLink:
 
     async def _async_read_stream(self) -> None:
         """Read one connection's worth of messages."""
-        # Without a position the plugin replays nothing: caught up as soon as it says hello.
-        self._live_only = self.seq is None or self.epoch is None
-        response = await self._client.async_open_stream(self.seq, self.epoch)
+        # Without an epoch the plugin replays nothing: caught up as soon as it says hello. With
+        # an epoch but no seq yet (nothing received, or the index was wiped), it replays its
+        # buffer from the start, so a message sent while reconnecting is not lost.
+        self._live_only = self.epoch is None
+        since = self.seq if self.seq is not None or self.epoch is None else 0
+        response = await self._client.async_open_stream(since, self.epoch)
         try:
             self.connects += 1
             self._catch_up_to = None
