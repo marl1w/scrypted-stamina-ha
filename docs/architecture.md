@@ -40,7 +40,7 @@ Short version: **Scrypted provides the facts and the video; Home Assistant decid
                                        │ local HTTP (same host or LAN)
 ┌──────────────────────────────────────▼──────────── HOME ASSISTANT ──────────┐
 │                                                                             │
-│  scrypted_mqtt (separate repo): one device per camera                       │
+│  camera devices of another integration (e.g. scrypted-mqtt-ha)              │
 │     ▲ Stamina entities attach to these devices (matched by Scrypted id)     │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
 │  │ STAMINA INTEGRATION (scrypted_stamina)                                │  │
@@ -58,9 +58,9 @@ Short version: **Scrypted provides the facts and the video; Home Assistant decid
                                   CLOUD / NAS
 ```
 
-Stamina does not use MQTT. It attaches its entities to the `scrypted_mqtt` camera devices when that integration is present (one device per camera), and creates its own device per camera otherwise. `scrypted_mqtt` is optional, not a dependency.
+Stamina does not use MQTT. It attaches its entities to the camera devices of another integration when one is present (for example scrypted-mqtt-ha: one device per camera), and creates its own device per camera otherwise. That integration is optional, not a dependency.
 
-Why a direct HTTP link rather than MQTT: event facts carry observations, boxes and subjects (larger and richer than an MQTT entity state), and segments and playback are HTTP anyway. One channel, one token. The Scrypted MQTT bridge is not changed and knows nothing about Stamina.
+Why a direct HTTP link rather than MQTT: event facts carry observations, boxes and subjects (larger and richer than an MQTT entity state), and segments and playback are HTTP anyway. One channel, one token. No other integration needs to change for Stamina, and none needs to know about it.
 
 ## 2. Scrypted side
 
@@ -74,7 +74,12 @@ The mixin listens on its camera for:
 | `MotionSensor` | motion on/off (a classless trigger) |
 | `OccupancySensor` (camera and its child devices) | presence on/off, per class where a detector exposes it |
 
-Each event is attributed to a **source plugin**, from `EventDetails.mixinId`, or from `ObjectsDetected.sourceId`, or else the camera's own plugin. It is then normalised:
+Each event is attributed to a **source plugin**, from `EventDetails.mixinId`, or from `ObjectsDetected.sourceId`, or else the camera's own plugin. Spike S1 ([spikes.md](spikes.md)) found that a plain listener never gets `mixinId` on these events, so in practice:
+
+- `ObjectDetector` events are attributed by `ObjectsDetected.sourceId` (a plugin id, or a device id resolved to its plugin);
+- `MotionSensor`, `OccupancySensor` and `AudioSensor` are listened to **per mixin layer** (`listen({ event, mixinId: <layer> })`, the camera itself first, then each mixin), and attributed to that layer's plugin. A plain listener only sees the outermost value: a gating mixin (for example Coral Guard) can own MotionSensor and hide the camera's raw motion from it. The plain listener remains a deduplicated fallback.
+
+It is then normalised:
 
 ```json
 { "t": 1730370000123, "source": "scrypted-coral-guard", "role": "verifier",
@@ -91,6 +96,8 @@ Each event is attributed to a **source plugin**, from `EventDetails.mixinId`, or
 | enricher | classes `face`, `plate`, or detections with a `label` |
 | ignore | chosen by you |
 
+Each source has one role. Its classless signals (motion, occupancy, audio) follow it: always triggers (ignored when the source is), never verifiers by themselves; a source first seen through a signal gets its role from its first detection. Only a source flagged **gated** (a verifier whose motion and occupancy turn on only after its own verification, such as Coral Guard) can confirm with a classless signal.
+
 There is no per-camera override. A **class map** per source normalises names (`people`→person, `dog_cat`→animal, …); unknown classes pass through unchanged.
 
 ### 2.2 Events (episodes) and subjects
@@ -105,12 +112,20 @@ There is no per-camera override. A **class map** per source normalises names (`p
 - **Verdict per subject:**
   - `confirmed`: a verifier saw it;
   - `vetoed`: a verifier ran and did not see it within the verify window, default 5 s;
-  - `unverified`: no verifier is present on this camera.
+  - `unverified`: no verifier is present on this camera, or the verifier showed no sign of life on this camera (no detection, signal or empty liveness beat) for 3 min when the window ended: a silent or crashed verifier never vetoes. A verifier that is running sends an empty `ObjectsDetected` (a liveness beat) at least every 3 min while it watches the camera, so a quiet camera stays live.
+  - Only a verifier observation with a concrete class confirms; while a subject is pending, a same-family verifier observation within the whole verify window joins it.
+
+**Split cameras.** A camera whose stitched frame is split into views has VideoCamera children: crops show part of the frame, and the parent's own default stream is its own crop. Mirrors (a child whose native id contains `-mirror-`) repeat a crop for another Home. Such a camera, and each of its crops, is *split*. On a split camera the camera's own AI is ambiguous: it reports a class and a score with no box, for the whole stitched frame.
+- These box-less detections never open an event or create a subject. They join, as trigger evidence flagged `ambiguous`, a subject of the same family within ±2 s, in an event that a view-specific signal opened (the view's verifier detections, or gated motion/occupancy).
+- A crop listens to its parent's ObjectDetector for these detections only.
+- A mirror is never observed: its mixin stays passive, so a crop's events are not duplicated.
+- `GET /v1/cameras` reports `split`, `views` and `parent`.
 
 ### 2.3 Segmenter
 
-- At event start, the plugin calls `getVideoStream({ prebuffer: preRollMs, destination: 'low-resolution' })` through Rebroadcast. Then `ffmpeg -c copy` writes fMP4 (an `init.mp4` plus 2 s `.m4s` segments) into memory.
-- No transcoding. Memory holds about 60 KB/s per active event.
+- At event start, the plugin calls `getVideoStream({ prebuffer: preRollMs, destination: 'low-resolution' })` through Rebroadcast. Then `ffmpeg -c copy -f mp4 -movflags frag_keyframe+empty_moov+default_base_moof` writes fragmented MP4 to a pipe; the plugin splits it into an `init.mp4` and 2 s `.m4s` segments by media time, in memory (no files).
+- No transcoding. Memory holds about 50 KB/s per active event (measured on a 896x512 substream with AAC audio).
+- Spike S2: the prebuffer arrives as a burst; about 9 s of pre-roll (4 segments) is cut within ~0.25 s of the request.
 - Segments stay until the integration acknowledges them, or for 10 min (TTL), whichever comes first.
 - Without a prebuffer, segments start at the detection. The capability is reported.
 
@@ -122,16 +137,20 @@ There is no per-camera override. A **class map** per source normalises names (`p
 
 ### 2.5 HTTP API
 
-All routes are under `/endpoint/@marl1w/scrypted-stamina/` with `Authorization: Bearer <token>`.
+The exact message and route shapes are in [api.md](api.md). All routes are under `/endpoint/@marl1w/scrypted-stamina/public/` (the `public/` path: Scrypted's own login would otherwise refuse the request before it reaches the plugin) with `Authorization: Bearer <token>`.
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/cameras` | Cameras with the mixin, and their capabilities: detectors and roles, prebuffer, VideoRecorder, VideoClips |
-| `GET /v1/events/stream?since=<seq>` | SSE: `event.start`, `event.update`, `event.end`, `subject.verdict`. Every message has a monotonically increasing `seq`, and a reconnect resumes from it (a ring of the last 1000 messages) |
-| `GET /v1/events/<id>/init.mp4`, `/v1/events/<id>/<n>.m4s` | Segments. `404` once expired, `425` if not cut yet |
+| `GET /v1/health` | Liveness, epoch, counters |
+| `GET /v1/cameras` | Cameras with the mixin, and their capabilities: verifiers and roles, prebuffer, VideoRecorder, VideoClips, audio, context sensors |
+| `GET /v1/events/stream?since=<seq>&epoch=<epoch>` | SSE: `event.start`, `event.update`, `event.end`, `subject.verdict`, `event.segment`. Every message has a monotonically increasing `seq` within an `epoch`, and a reconnect resumes from it (a ring of the last 5000 messages and 8 MB) |
+| `GET /v1/events/poll?since=&epoch=&wait=` | Long-poll fallback with the same messages |
+| `GET /v1/events/<id>` | One event's facts and segment state |
+| `GET /v1/events/<id>/init.mp4`, `/v1/events/<id>/<n>.m4s` | Segments. `404` once acked, expired or evicted, `425` if not cut yet |
+| `GET /v1/events/<id>/thumbnail.jpg` | 320 px JPEG, at confirmation or else at event start |
 | `POST /v1/events/<id>/ack {upTo}` | Releases segments the integration holds |
 | `GET /v1/cameras/<cam>/clips?start&end` | VideoClips passthrough |
-| `GET /v1/cameras/<cam>/playback.m3u8?t=&d=` | Recording playback as HLS |
+| `GET /v1/cameras/<cam>/playback.m3u8?t=&d=` | Recording playback as HLS: a `302` to a session playlist (`playback/<sid>/index.m3u8`) whose files need no token |
 
 ## 3. Home Assistant side
 
@@ -150,7 +169,7 @@ All routes are under `/endpoint/@marl1w/scrypted-stamina/` with `Authorization: 
 
 ### 3.3 Scoring
 
-- The **relevance model** is ported from Reolink Stamina's `relevance/`. Its learned "normal" per camera uses hour of week, class, zone, duration and dwell, subject count, verdict mix, and context features. It outputs a rarity score from 0 to 1.
+- The **relevance model** is ported from the earlier prototype's `relevance/`. Its learned "normal" per camera uses hour of week, class, zone, duration and dwell, subject count, verdict mix, and context features. It outputs a rarity score from 0 to 1.
 - **No explicit rules:** an event is flagged `unusual` only by the learned model. Flagging starts once a camera has about a week and a few hundred events behind it; until then every event is `normal` and only the confirmed/vetoed decision applies.
 - **Source reliability:** precision per camera per source, learned from verifier outcomes and review labels, used as a weight in the model.
 
@@ -191,13 +210,13 @@ Some evidence comes after the camera has stopped seeing anything: a door opened 
 - `FOLLOW_UP` pending data has its own cap (default 1 GB per destination). Over it, the oldest vetoed-and-ordinary events are dropped first.
 - The window end time is persisted, so evaluation resumes after a restart.
 
-Sequences across cameras are already part of the ported relevance model: each event is paired with the camera that fired just before it in its pool, and that predecessor and the gap are learned like any other feature (reason: "90s after <camera>"). Pools are all cameras together (default), per HA area, or per camera. Per area replaces Reolink Stamina's per-recorder pool, so no NVR logic is involved.
+Sequences across cameras are already part of the ported relevance model: each event is paired with the camera that fired just before it in its pool, and that predecessor and the gap are learned like any other feature (reason: "90s after <camera>"). Pools are all cameras together (default), per HA area, or per camera. Per area replaces the earlier prototype's per-recorder pool, so no NVR logic is involved.
 
 ### 3.5 Uploader
 
-**Destinations** are subentries ("Add destination"), as in Reolink Stamina. Each one picks an account or server from the storage integrations already set up: Synology DSM, WebDAV, SFTP Storage, OneDrive, Google Drive. Each has its own folder, quota (default 15 GB), and retention (oldest evicted first). Every kept event goes to every destination.
+**Destinations** are subentries ("Add destination"), as in the earlier prototype. Each one picks an account or server from the storage integrations already set up: Synology DSM, WebDAV, SFTP Storage, OneDrive, Google Drive. Each has its own folder, quota (default 15 GB), and retention (oldest evicted first). Every kept event goes to every destination.
 
-- Destinations are ported from Reolink Stamina's `cloud/destinations`. Each must support writing a file per segment; append is not required.
+- Destinations are ported from the earlier prototype's `cloud/destinations`. Each must support writing a file per segment; append is not required.
 - Layout per event:
   ```
   <folder>/pending/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 00001.m4s, …
@@ -212,29 +231,32 @@ Sequences across cameras are already part of the ported relevance model: each ev
 ### 3.6 Index and review
 
 - SQLite in HA's config directory holds metadata only: event id, camera, times, subjects with sources and verdicts, context, score, reasons, decision state, and cloud path.
-- A **thumbnail** per event: a 320 px JPEG (about 15 KB) of the frame at confirmation, or at event start, served by the plugin. It is stored next to the index and kept as long as the index row. At about 300 events a day that is about 5 MB a day.
-- A **media source** ("Scrypted events") lists events by camera, then day. Playback resolves to the plugin's recording HLS, or else the cloud `index.m3u8`.
-- A timeline panel comes later, porting Reolink Stamina's frontend.
+- It is also the relevance model's history: rebuilt nightly from the last **25 months** of events, dropped ones included, with a **one-year half-life**, so recurring seasonal situations (snow, storms) are learned rather than flagged again each year.
+- **Two tiers per row.** *Fresh* (first 30 days): the full record. *Slim* (after that): id, camera, times, state, unusual, score, finalized, summary, area, duration, features, weight, and a compact record (decision, scores, reason and reasons, keep reason, path pieces, notes, subject classes and verdicts). Observations, per-subject detail, context snapshots and late-evidence detail go. A row is slimmed only once settled: final, features stored, no pending action, no copy still being written, and an orphan only once its upload is complete. Whether footage is still available is derived, not stored: *recording* while the recorder retention option covers the event's day, *offsite* while a committed copy with its `index.m3u8` is on some destination.
+- A **thumbnail** per event: a 320 px JPEG (about 15 KB) of the frame at confirmation, or at event start, served by the plugin. Kept 30 days for kept events (committed, unusual, orphaned) and 7 days for dropped ones. The panel and the media browser show a placeholder without one.
+- **Size cap** ("History size", default 200 MB), measured as the pages SQLite uses (`(page_count − freelist_count) × page_size`; the file itself keeps its high-water size). Over it, the nightly prune **thins** slim rows oldest first: per camera and common kind (500 or more dropped events), one row in four survives and its `weight` counts for the others; the rebuild multiplies its rates and counts by that weight, with the same decay. Never thinned: kept, committed or orphaned events, unusual ones, rare kinds, and rare contexts (tamper, alarm armed or triggered, snow, storm or exceptional weather, any late evidence). If the cap cannot be met, that is logged once and nothing protected goes. Rows past the 25 months are deleted, except while their files are still on a destination.
+- A **media source** ("Scrypted events") lists events by camera, then day. Playback resolves to the plugin's recording HLS, or else the cloud `index.m3u8`; only the sources still available are offered.
+- A timeline panel comes later, porting the earlier prototype's frontend.
 
 ### 3.7 Entities
 
-They attach to each camera's `scrypted_mqtt` device, matched by Scrypted device id.
+Since Home Assistant 2026.8 a device belongs to exactly one config entry, so Stamina cannot put its entities on the camera device of another integration. Instead it creates **one Stamina device per camera**, named after the camera, with `via_device` pointing at the camera's device in the other integration (matched by Scrypted device id), and placed in that device's area. The camera's page then lists the Stamina device under its connected devices. When that integration is not installed, or its device appears later, the Stamina device exists without the link and gets it as soon as the camera device shows up. Home Assistant prefixes entity ids with the area of a device in one, so in an area the ids read `event.<area>_<cam>_stamina` and so on.
 
 | Entity | Content |
 |---|---|
-| `event.<cam>_stamina` | Event types `normal` / `unusual`. Attributes: score, reasons, subjects (class, sources, verdict), decision, cloud path |
-| `binary_sensor.<cam>_unusual` | On while an unusual event is open |
+| `event.<cam>_stamina` | Event types `normal` / `unusual` (again, with `late: true`, when the follow-up window turns an event unusual). Attributes: score, reasons, subjects (class, sources, verdict), decision, cloud path, the camera's capabilities |
+| `binary_sensor.<cam>_unusual` | On while an unusual event is open; pulses on for a late unusual |
 | `sensor.<cam>_last_event_score` | Latest score, 0 to 1 |
 
-Integration-wide entities: `switch.stamina_uploads` (arms ordinary uploads; unusual events still upload if that setting is on), `sensor.stamina_queue`, and `sensor.stamina_quota_used`.
+Integration-wide entities, on a "Stamina" service device: `switch.stamina_uploads` (arms ordinary uploads; unusual events still upload if that setting is on), `sensor.stamina_queue`, `sensor.stamina_quota_used_<destination>`, `sensor.stamina_orphans` and `sensor.stamina_latency`.
 
 ## 4. Latency budget
 
-Reolink Stamina waits for the recorder to finish writing a clip (about a minute). Here the upload starts at the first detection.
+A recorder-based clip waits for the recorder to finish writing (about a minute). Here the upload starts at the first detection.
 
 | Hop | Target | How |
 |---|---|---|
-| Camera detection → plugin | < 0.5 s | Push events from the camera plugin (Baichuan for Reolink) |
+| Camera detection → plugin | < 0.5 s | Push events from the camera plugin (not polled) |
 | Plugin → integration (`event.start`) | < 50 ms | SSE push, never polled |
 | Pre-roll segments available | at event start | Cut from Rebroadcast's prebuffer, already in memory |
 | First segment uploaded | < 3 s from detection, plus uplink time | Fetched at once and uploaded in parallel; 1–2 s segments, copied without re-encoding |
@@ -265,11 +287,11 @@ Vetoed path: the same until the verdict. Then `DROPPING` deletes `pending/<id>/`
 
 ## 6. Extra signals
 
-- **Day/night (colour or IR):** taken from the camera plugin. scrypted-reolink gets the NVR's day/night push and exposes a child device per camera, "Night mode", with the standard **BinarySensor** interface (on means IR/black-and-white). The Scrypted MQTT bridge shows it as `binary_sensor.<cam>_night_mode`. Stamina reads every BinarySensor child of a camera as a scoring feature, so any camera plugin that exposes a similar child device works too. Cameras without one have no day/night feature.
-- **Tamper (covered, moved, blurred):** from Coral Guard, which already decodes the frames. It compares each frame to a rolling reference image and exposes a **BinarySensor** child, "Tamper". Stamina reads it like any other BinarySensor child; a tamper during an event is a strong feature.
+- **Day/night (colour or IR):** taken from the camera plugin. A camera plugin such as scrypted-reolink may expose a child device per camera, "Night mode", with the standard **BinarySensor** interface (on means IR/black-and-white). Stamina reads every BinarySensor child of a camera as a scoring feature, so any camera plugin that exposes a similar child device works too. Cameras without one have no day/night feature.
+- **Tamper (covered, moved, blurred):** from a verifier that already decodes the frames, such as Coral Guard. It exposes a **BinarySensor** child, "Tamper". Stamina reads it like any other BinarySensor child; a tamper during an event is a strong feature.
 - **Camera smart events** (line crossing, intrusion, loitering, forgotten or taken item): only those the installed cameras actually send. They come from the camera plugin as standard ObjectDetector detections with those classes (role trigger), or as BinarySensor children.
 - **Weather and sun:** read on the Home Assistant side, from the default `weather.*` entity and `sun.sun`, with no linking needed. They are scoring context: wind and rain explain motion-only events, and the sun's elevation separates dusk from night.
-- **Audio:** read through Scrypted's standard **AudioSensor** (`audioDetected`), with role trigger by default. It is produced by the separate audio-guard plugin (plan, parallel track), or by any plugin that implements AudioSensor.
+- **Audio:** read through Scrypted's standard **AudioSensor** (`audioDetected`), with role trigger by default. It can come from an audio detector such as scrypted-audio-guard, or from any plugin that implements AudioSensor.
 
 ## 6. Capabilities and fallbacks
 

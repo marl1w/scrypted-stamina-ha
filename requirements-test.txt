@@ -1,0 +1,8 @@
+# Test dependencies for the Home Assistant integration (custom_components/scrypted_stamina).
+#
+# pytest-homeassistant-custom-component pins the matching Home Assistant release, which is
+# what the integration is tested against (2026.10).
+pytest-homeassistant-custom-component
+# The sidebar panel depends on panel_custom, which needs the frontend package to set up.
+home-assistant-frontend
+ruff

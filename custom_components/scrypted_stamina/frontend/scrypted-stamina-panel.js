@@ -1,0 +1,1245 @@
+/**
+ * Scrypted Stamina: the review panel.
+ *
+ * Three screens, each one tap from the next, and the browser's Back between them:
+ *
+ *   /                 Events: newest first, unusual ones marked, three filters.
+ *   /event/<id>       One event: it plays at once; under it, one card saying why it scored
+ *                     as it did, and everything else folded into "Details".
+ *   /cameras          Each camera: is it working, what can it do, is it ready.
+ *
+ * Filters live in the query string (`?unusual=1&camera=11`), so Back, reload and links keep
+ * them. Registered through `panel_custom`, so it runs inside Home Assistant's frontend with
+ * the real `hass`. Plain ES modules, no build. `tools/panel-preview/` runs it on sample data.
+ */
+
+import { adoptStyles, el, icon, replace } from "./dom.js";
+import { STYLES } from "./styles.js";
+import {
+  DEFAULT_CLASSES,
+  NOTES,
+  className,
+  classIcon,
+  classList,
+  dayKey,
+  decision,
+  formatAfter,
+  formatAgo,
+  formatDay,
+  formatDuration,
+  formatTime,
+  joinWords,
+  notKept,
+  sensorsText,
+  sourceName,
+  termName,
+  verdictText,
+} from "./format.js";
+import { mountPlayer, playKey } from "./player.js";
+
+const DOMAIN = "scrypted_stamina";
+const PAGE = 50;
+// Live updates: at most one refresh per THROTTLE_MS, none while the tab is hidden.
+const THROTTLE_MS = 4000;
+const RETRY_MS = 15000;
+const SUBSCRIBE_RETRY_MS = 30000;
+// Thumbnail URLs are signed for 6 h; one older than this is replaced by a fresh one.
+const THUMB_TTL_MS = 5 * 3600 * 1000;
+const MAX_ITEMS = 1000;
+const NO_FILTERS = { unusual: false, cls: "", camera: "", area: "", dropped: false };
+
+function errorText(err) {
+  if (err?.code === "not_loaded") {
+    return "Scrypted Stamina is not running. Check it under Settings → Devices & services.";
+  }
+  if (err?.code === "unauthorized") return "Only administrators can review camera events.";
+  return err?.message || String(err || "Something went wrong.");
+}
+
+function empty(iconName, title, body, ...actions) {
+  return el(
+    "div",
+    { class: "empty" },
+    icon(iconName),
+    el("div", { class: "empty__title", text: title }),
+    body ? el("div", { class: "empty__body", text: body }) : null,
+    actions,
+  );
+}
+
+function badge(text, tone, ...extra) {
+  return el("span", { class: "badge", dataset: { tone } }, extra, text);
+}
+
+function filtersFromSearch(search) {
+  const params = new URLSearchParams(search || "");
+  return {
+    unusual: params.get("unusual") === "1",
+    cls: params.get("cls") || "",
+    camera: params.get("camera") || "",
+    area: params.get("area") || "",
+    dropped: params.get("dropped") === "1",
+  };
+}
+
+function searchFromFilters(filters) {
+  const params = new URLSearchParams();
+  if (filters.unusual) params.set("unusual", "1");
+  if (filters.cls) params.set("cls", filters.cls);
+  if (filters.camera) params.set("camera", filters.camera);
+  else if (filters.area) params.set("area", filters.area);
+  if (filters.dropped) params.set("dropped", "1");
+  const text = params.toString();
+  return text ? `?${text}` : "";
+}
+
+const sameFilters = (a, b) => searchFromFilters(a) === searchFromFilters(b);
+
+class ScryptedStaminaPanel extends HTMLElement {
+  constructor() {
+    super();
+    this._root = this.attachShadow({ mode: "open" });
+    adoptStyles(this._root, STYLES);
+    this._header = el("header", { class: "header" });
+    this._views = {
+      list: el("main", { class: "view" }),
+      event: el("main", { class: "view", hidden: true }),
+      cameras: el("main", { class: "view", hidden: true }),
+    };
+    this._root.append(this._header, ...Object.values(this._views));
+
+    this._filters = { ...NO_FILTERS };
+    this._list = this._freshList();
+    this._cams = { items: [], loaded: false, error: null, needs: null };
+    this._event = null;
+    this._link = true;
+    this._view = null;
+    this._listScroll = 0;
+    this._thumbs = new Map();
+    this._rows = new Map();
+    this._lastRefresh = 0;
+    this._onVisible = () => {
+      if (!document.hidden && this._dirty) this._nudge();
+    };
+
+    this._buildList();
+  }
+
+  _freshList() {
+    return {
+      items: [], cursor: null, loading: false, loaded: false, error: null, token: (this._list?.token || 0) + 1,
+      updatedAt: 0, stale: false, hidden: 0, hiddenMore: false, pending: null,
+    };
+  }
+
+  // ---------------------------------------------------------------- Home Assistant
+
+  set hass(hass) {
+    const first = !this._hass;
+    this._hass = hass;
+    if (first) this._start();
+  }
+
+  get hass() {
+    return this._hass;
+  }
+
+  set narrow(value) {
+    this._narrow = value;
+    if (this._view) this._renderHeader();
+  }
+
+  set panel(value) {
+    this._panel = value;
+  }
+
+  set route(value) {
+    this._route = value;
+    this._routeChanged();
+  }
+
+  connectedCallback() {
+    document.addEventListener("visibilitychange", this._onVisible);
+    this._start();
+  }
+
+  disconnectedCallback() {
+    document.removeEventListener("visibilitychange", this._onVisible);
+    this._started = false;
+    this._routeKey = null;
+    clearTimeout(this._nudgeTimer);
+    clearTimeout(this._retryTimer);
+    clearTimeout(this._subscribeTimer);
+    this._nudgeTimer = this._retryTimer = this._subscribeTimer = null;
+    const unsub = this._unsub;
+    this._unsub = null;
+    unsub?.then((stop) => stop?.()).catch(() => {});
+    this._stopVideo();
+  }
+
+  _start() {
+    if (this._started || !this._hass || !this.isConnected) return;
+    this._started = true;
+    this._subscribe();
+    this._loadCameras();
+    if (this._list.loaded) this._refreshList();
+    this._routeChanged();
+  }
+
+  _subscribe() {
+    if (!this._started) return;
+    this._unsub = this._hass.connection
+      .subscribeMessage(() => this._nudge(), { type: `${DOMAIN}/subscribe` })
+      .catch(() => {
+        // Not loaded yet, or a hiccup: try again in a while, as long as the panel is open.
+        this._unsub = null;
+        this._subscribeTimer = setTimeout(() => this._subscribe(), SUBSCRIBE_RETRY_MS);
+        return null;
+      });
+  }
+
+  _ws(message) {
+    return this._hass.callWS(message);
+  }
+
+  /** Something changed: refresh what is on screen, at most every THROTTLE_MS, never hidden. */
+  _nudge() {
+    this._dirty = true;
+    if (document.hidden || this._nudgeTimer || !this._started) return;
+    const wait = Math.max(0, this._lastRefresh + THROTTLE_MS - Date.now());
+    this._nudgeTimer = setTimeout(() => {
+      this._nudgeTimer = null;
+      if (document.hidden) return;
+      this._dirty = false;
+      this._lastRefresh = Date.now();
+      if (this._list.loaded) this._refreshList();
+      if (this._cams.loaded) this._loadCameras();
+      if (this._view === "event" && this._event?.data) this._loadEvent(this._event.id);
+    }, wait);
+  }
+
+  // ---------------------------------------------------------------- routing
+
+  _search() {
+    // Home Assistant's route has no query; the preview passes one in `route.search`.
+    return this._route?.search ?? window.location.search;
+  }
+
+  _routeChanged() {
+    if (!this._hass || !this._started) return;
+    const path = this._route?.path || "";
+    const search = this._search();
+    // Home Assistant may hand over the same route again; only a new one changes the screen.
+    if (`${path}${search}` === this._routeKey) return;
+    this._routeKey = `${path}${search}`;
+
+    const filters = filtersFromSearch(search);
+    if (!sameFilters(filters, this._filters)) {
+      this._filters = filters;
+      this._listScroll = 0;
+      this._list = this._freshList();
+    }
+    const match = path.match(/^\/event\/([A-Za-z0-9_.-]+)/);
+    if (match) this._show("event", match[1]);
+    else if (path.startsWith("/cameras")) this._show("cameras");
+    else this._show("list");
+  }
+
+  _url(path, filters = this._filters) {
+    const prefix = this._route?.prefix ?? "/scrypted-stamina";
+    return `${prefix}${path}${searchFromFilters(filters)}`;
+  }
+
+  _go(path, { filters = this._filters, replace: swap = false } = {}) {
+    const depth = (history.state?.staminaDepth || 0) + (swap ? 0 : 1);
+    history[swap ? "replaceState" : "pushState"]({ staminaDepth: depth }, "", this._url(path, filters));
+    window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: swap } }));
+    // Home Assistant does not always pass a new route when only the query changed.
+    if (this._route && this._route.search === undefined) {
+      this._route = { ...this._route, path: path || "" };
+    } else if (this._route) {
+      this._route = { ...this._route, path: path || "", search: searchFromFilters(filters) };
+    }
+    this._routeChanged();
+  }
+
+  /** Back to where the user came from, or to the list when they arrived from a link. */
+  _back() {
+    if ((history.state?.staminaDepth || 0) > 0) history.back();
+    else this._go("", { replace: true });
+  }
+
+  _show(view, id) {
+    if (this._view === "list" && view !== "list") this._listScroll = this._views.list.scrollTop;
+    if (this._view === "event" && (view !== "event" || id !== this._event?.id)) {
+      this._stopVideo();
+      if (view !== "event") this._event = null;
+    }
+    this._view = view;
+    for (const [name, node] of Object.entries(this._views)) node.hidden = name !== view;
+    if (view === "list") {
+      if (!this._list.loaded && !this._list.loading) this._loadList();
+      else this._renderList();
+      this._views.list.scrollTop = this._listScroll;
+    } else if (view === "cameras") {
+      this._renderCameras();
+      this._views.cameras.scrollTop = 0;
+    } else if (this._event?.id !== id) {
+      this._views.event.scrollTop = 0;
+      this._openEvent(id);
+    }
+    this._renderHeader();
+  }
+
+  // ---------------------------------------------------------------- header
+
+  _renderHeader() {
+    const button = (iconName, label, onclick, disabled = false) =>
+      el("button", { class: "icon-btn", title: label, "aria-label": label, onclick, disabled }, icon(iconName));
+    const title = (main, sub) =>
+      el(
+        "div",
+        { class: "header__title" },
+        el("h1", { class: "header__main", style: { margin: "0" }, text: main }),
+        sub ? el("div", { class: "header__sub", text: sub }) : null,
+      );
+
+    if (this._view === "list") {
+      replace(
+        this._header,
+        this._narrow
+          ? button("mdi:menu", "Menu", () =>
+              this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true })),
+            )
+          : null,
+        title(this._panel?.title || "Events"),
+        button("mdi:cctv", "Cameras", () => this._go("/cameras")),
+      );
+      return;
+    }
+    const back = button("mdi:arrow-left", "Back", () => this._back());
+    if (this._view === "cameras") {
+      replace(this._header, back, title("Cameras"));
+      return;
+    }
+    const data = this._event?.data;
+    const items = this._list.items;
+    const at = items.findIndex((item) => item.id === this._event?.id);
+    const newer = at > 0 ? items[at - 1] : null;
+    const older = at >= 0 ? items[at + 1] : null;
+    replace(
+      this._header,
+      back,
+      data
+        ? title(data.camera_name, `${formatDay(this._hass, data.started)}, ${formatTime(this._hass, data.started, true)}`)
+        : title("Event"),
+      at >= 0
+        ? [
+            button("mdi:chevron-up", "Newer event", () => this._go(`/event/${newer.id}`, { replace: true }), !newer),
+            button("mdi:chevron-down", "Older event", () => this._go(`/event/${older.id}`, { replace: true }), !older),
+          ]
+        : null,
+    );
+  }
+
+  /** At most one banner: the link, then a camera problem, then stale data. */
+  _banner() {
+    if (!this._link) {
+      return el(
+        "div",
+        { class: "banner", role: "status" },
+        icon("mdi:lan-disconnect"),
+        el("span", { class: "banner__text", text: "Not connected to Scrypted. New events appear once the link is back." }),
+      );
+    }
+    const problems = [];
+    for (const cam of this._cams.items) {
+      if (cam.online === false) problems.push(`${cam.name} is offline`);
+      else if (cam.verifier_present && cam.verifier_live === false) problems.push(`${cam.name}'s double-check is not responding`);
+    }
+    if (problems.length && this._view === "list") {
+      const text = problems.length > 1 ? `${problems[0]} (and ${problems.length - 1} more)` : problems[0];
+      return el(
+        "button",
+        { class: "banner", onclick: () => this._go("/cameras") },
+        icon("mdi:cctv-off"),
+        el("span", { class: "banner__text", text }),
+        el("span", { class: "banner__action", text: "View cameras" }),
+      );
+    }
+    if (this._list.stale && this._list.updatedAt) {
+      return el(
+        "div",
+        { class: "banner banner--quiet", role: "status" },
+        icon("mdi:cloud-refresh-outline"),
+        el("span", { class: "banner__text", text: `Last updated ${formatAgo(this._list.updatedAt / 1000)} · retrying` }),
+      );
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------- events list
+
+  _buildList() {
+    this._bannerSlot = el("div");
+    this._unusualChip = el(
+      "button",
+      { class: "chip chip--unusual", "aria-pressed": "false", onclick: () => this._setFilter({ unusual: !this._filters.unusual }) },
+      icon("mdi:alert-decagram-outline", "icon--sm"),
+      "Unusual",
+    );
+    this._classSelect = el("select", {
+      class: "chip",
+      "aria-label": "Kind",
+      onchange: (ev) => this._setFilter({ cls: ev.target.value }),
+    });
+    this._whereSelect = el("select", {
+      class: "chip",
+      "aria-label": "Camera or area",
+      onchange: (ev) => {
+        const [kind, ...rest] = ev.target.value.split(":");
+        const value = rest.join(":");
+        this._setFilter({ camera: kind === "camera" ? value : "", area: kind === "area" ? value : "" });
+      },
+    });
+    this._droppedChip = el(
+      "button",
+      { class: "chip is-set", "aria-label": "Stop including events that were not kept", onclick: () => this._setFilter({ dropped: false }) },
+      "Including not kept",
+      icon("mdi:close", "icon--sm"),
+    );
+    this._clearButton = el("button", { class: "link-btn", onclick: () => this._setFilter(NO_FILTERS) }, "Clear");
+    this._filterBar = el(
+      "div",
+      { class: "filters", role: "toolbar", "aria-label": "Filters" },
+      this._unusualChip,
+      this._classSelect,
+      this._whereSelect,
+      this._droppedChip,
+      this._clearButton,
+    );
+    this._pillSlot = el("div");
+    this._listBody = el("div");
+    this._sentinel = el("div", { class: "more" });
+    this._views.list.append(el("div", { class: "page" }, this._bannerSlot, this._filterBar, this._pillSlot, this._listBody));
+
+    this._observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) this._loadMore();
+      },
+      { root: this._views.list, rootMargin: "400px" },
+    );
+    this._observer.observe(this._sentinel);
+  }
+
+  _filtersSet() {
+    const f = this._filters;
+    return f.unusual || f.cls !== "" || f.camera !== "" || f.area !== "" || f.dropped;
+  }
+
+  _setFilter(change) {
+    this._go("", { filters: { ...this._filters, ...change }, replace: true });
+  }
+
+  _query() {
+    const f = this._filters;
+    const query = { type: `${DOMAIN}/events`, unusual: f.unusual, include_dropped: f.dropped, limit: PAGE };
+    if (f.cls) query.cls = f.cls;
+    if (f.camera) query.camera = f.camera;
+    else if (f.area) query.area = f.area;
+    return query;
+  }
+
+  /** One page with at least one event in it, unless the history ends first. */
+  async _fetchPage(cursor, token, query = this._query()) {
+    let events = [];
+    let next = cursor;
+    for (;;) {
+      const message = next ? { ...query, cursor: next } : query;
+      const result = await this._ws(message);
+      if (token !== this._list.token) break;
+      this._link = result.link_healthy;
+      events = events.concat(result.events);
+      next = result.cursor;
+      if (events.length || !next) break;
+    }
+    return { events, cursor: next };
+  }
+
+  async _loadList() {
+    this._list = this._freshList();
+    const list = this._list;
+    const token = list.token;
+    list.loading = true;
+    this._renderList();
+    try {
+      const result = await this._fetchPage(null, token);
+      if (token !== list.token) return;
+      Object.assign(list, { items: result.events, cursor: result.cursor, loaded: true, updatedAt: Date.now() });
+      if (!result.events.length && !this._filtersSet()) {
+        // Nothing kept: say whether anything was seen at all.
+        const seen = await this._ws({ ...this._query(), include_dropped: true, limit: 100 });
+        if (token !== list.token) return;
+        list.hidden = seen.events.length;
+        list.hiddenMore = Boolean(seen.cursor);
+      }
+    } catch (err) {
+      if (token !== list.token) return;
+      list.error = err;
+    }
+    list.loading = false;
+    this._renderList();
+  }
+
+  async _loadMore() {
+    const list = this._list;
+    if (!list.loaded || list.loading || list.error || !list.cursor || this._view !== "list") return;
+    if (list.items.length >= MAX_ITEMS) return;
+    const token = list.token;
+    list.loading = true;
+    this._renderList();
+    try {
+      const result = await this._fetchPage(list.cursor, token);
+      if (token !== list.token) return;
+      const seen = new Set(list.items.map((item) => item.id));
+      list.items = list.items.concat(result.events.filter((item) => !seen.has(item.id)));
+      list.cursor = result.cursor;
+    } catch (err) {
+      if (token !== list.token) return;
+      list.error = err;
+    }
+    list.loading = false;
+    this._renderList();
+  }
+
+  /** Fold the newest page into what is loaded, keeping everything below it. */
+  async _refreshList() {
+    const list = this._list;
+    if (!list.loaded || list.loading) return;
+    const token = list.token;
+    let result;
+    try {
+      result = await this._fetchPage(null, token);
+    } catch {
+      if (token !== list.token) return;
+      list.stale = true;
+      clearTimeout(this._retryTimer);
+      this._retryTimer = setTimeout(() => this._nudge(), RETRY_MS);
+      if (this._view === "list") this._renderList();
+      return;
+    }
+    if (token !== list.token || list.loading) return;
+    list.stale = false;
+    list.updatedAt = Date.now();
+    const fresh = result.events;
+    if (!fresh.length && !result.cursor) {
+      list.items = [];
+      list.cursor = null;
+    } else {
+      const known = new Set(list.items.map((item) => item.id));
+      const top = list.items[0];
+      const arrived = top
+        ? fresh.filter((item) => !known.has(item.id) && (item.started > top.started || (item.started === top.started && item.id > top.id)))
+        : fresh;
+      const scrolled = this._view === "list" && this._views.list.scrollTop > 80;
+      if (scrolled && arrived.length && list.items.length) {
+        // Reading further down: update in place, and offer the new ones rather than pushing
+        // the rows away under the finger.
+        const byId = new Map(fresh.map((item) => [item.id, item]));
+        list.items = list.items.map((item) => byId.get(item.id) || item);
+        list.pending = result;
+      } else {
+        this._merge(result);
+      }
+    }
+    if (this._view === "list") this._renderList();
+  }
+
+  _merge(result) {
+    const list = this._list;
+    const fresh = result.events;
+    list.pending = null;
+    if (!result.cursor) {
+      list.items = fresh;
+      list.cursor = null;
+      return;
+    }
+    const last = fresh.at(-1);
+    const older = list.items.filter(
+      (item) => item.started < last.started || (item.started === last.started && item.id < last.id),
+    );
+    list.items = fresh.concat(older);
+    if (!older.length) list.cursor = result.cursor;
+  }
+
+  _showPending() {
+    if (this._list.pending) this._merge(this._list.pending);
+    this._views.list.scrollTop = 0;
+    this._renderList();
+  }
+
+  _syncFilters() {
+    const f = this._filters;
+    this._unusualChip.setAttribute("aria-pressed", String(f.unusual));
+
+    const classes = new Set(DEFAULT_CLASSES);
+    for (const item of this._list.items) for (const cls of item.classes) classes.add(cls);
+    if (f.cls) classes.add(f.cls);
+    const sorted = [...classes].sort();
+    if (this._classKey !== sorted.join(",")) {
+      this._classKey = sorted.join(",");
+      replace(
+        this._classSelect,
+        el("option", { value: "", text: "All kinds" }),
+        sorted.map((cls) => el("option", { value: cls, text: className(cls) })),
+      );
+    }
+    this._classSelect.value = f.cls;
+    this._classSelect.classList.toggle("is-set", f.cls !== "");
+
+    const cams = this._cams.items;
+    const areas = [...new Set(cams.map((cam) => cam.area).filter(Boolean))].sort();
+    const whereKey = JSON.stringify([areas, cams.map((cam) => [cam.id, cam.name])]);
+    if (this._whereKey !== whereKey) {
+      this._whereKey = whereKey;
+      const cameraOptions = cams.map((cam) => el("option", { value: `camera:${cam.id}`, text: cam.name }));
+      replace(
+        this._whereSelect,
+        el("option", { value: "", text: "All cameras" }),
+        areas.length > 1
+          ? [
+              el("optgroup", { label: "Areas" }, areas.map((area) => el("option", { value: `area:${area}`, text: area }))),
+              el("optgroup", { label: "Cameras" }, cameraOptions),
+            ]
+          : cameraOptions,
+      );
+    }
+    const where = f.camera ? `camera:${f.camera}` : f.area ? `area:${f.area}` : "";
+    // A camera the list has not heard of yet (opened from a link) still shows as chosen.
+    if (where && ![...this._whereSelect.options].some((option) => option.value === where)) {
+      this._whereSelect.append(el("option", { value: where, text: f.camera || f.area }));
+    }
+    this._whereSelect.value = where;
+    this._whereSelect.classList.toggle("is-set", where !== "");
+    this._whereSelect.hidden = cams.length < 2 && !where;
+    this._droppedChip.hidden = !f.dropped;
+    this._clearButton.hidden = !this._filtersSet();
+  }
+
+  _renderList() {
+    const list = this._list;
+    replace(this._bannerSlot, this._banner());
+    this._syncFilters();
+    const arrived = list.pending
+      ? list.pending.events.filter((item) => !list.items.some((known) => known.id === item.id)).length
+      : 0;
+    replace(
+      this._pillSlot,
+      arrived
+        ? el("button", { class: "pill", onclick: () => this._showPending() }, icon("mdi:arrow-up", "icon--sm"), `${arrived} new event${arrived === 1 ? "" : "s"}`)
+        : null,
+    );
+
+    if (!list.items.length) {
+      if (list.loading) {
+        replace(this._listBody, this._skeletonRows());
+      } else if (list.error) {
+        replace(
+          this._listBody,
+          empty(
+            "mdi:alert-circle-outline",
+            "Events could not be loaded",
+            errorText(list.error),
+            el("button", { class: "btn", onclick: () => this._loadList() }, "Try again"),
+          ),
+        );
+      } else {
+        replace(this._listBody, this._emptyList());
+      }
+      return;
+    }
+
+    const groups = [];
+    for (const item of list.items) {
+      const key = dayKey(this._hass, item.started);
+      if (groups.at(-1)?.key !== key) groups.push({ key, started: item.started, items: [] });
+      groups.at(-1).items.push(item);
+    }
+    const keep = new Set(list.items.map((item) => item.id));
+    for (const id of this._rows.keys()) if (!keep.has(id)) this._rows.delete(id);
+    for (const id of this._thumbs.keys()) if (!keep.has(id) && id !== this._event?.id) this._thumbs.delete(id);
+
+    replace(
+      this._listBody,
+      groups.map((group) => [
+        el("h2", { class: "day", text: formatDay(this._hass, group.started) }),
+        el("div", { class: "rows" }, group.items.map((item) => this._row(item))),
+      ]),
+      this._listFooter(),
+    );
+    // The observer only speaks when visibility changes: a short page leaves the footer in
+    // view, so look again once this render is on screen.
+    requestAnimationFrame(() => {
+      const box = this._views.list.getBoundingClientRect();
+      const at = this._sentinel.getBoundingClientRect();
+      if (this._sentinel.isConnected && at.top < box.bottom + 400) this._loadMore();
+    });
+  }
+
+  _listFooter() {
+    const list = this._list;
+    if (list.loading) return replace(this._sentinel, el("div", { class: "spinner", role: "status", "aria-label": "Loading" }));
+    if (list.error) {
+      return replace(
+        this._sentinel,
+        el("button", { class: "link-btn", onclick: () => ((list.error = null), this._loadMore()) }, "Could not load more. Try again"),
+      );
+    }
+    if (list.cursor && list.items.length >= MAX_ITEMS) {
+      return replace(this._sentinel, `Showing the latest ${MAX_ITEMS} events. Use the filters to find older ones.`);
+    }
+    if (list.cursor) {
+      return replace(this._sentinel, el("button", { class: "link-btn", onclick: () => this._loadMore() }, "Load more"));
+    }
+    return replace(this._sentinel);
+  }
+
+  _emptyList() {
+    const f = this._filters;
+    const list = this._list;
+    const learning = this._cams.items.length > 0 && this._cams.items.every((cam) => !cam.learning.active);
+    if (this._filtersSet()) {
+      const body =
+        f.unusual && learning
+          ? "The cameras are still learning what is normal. Nothing is marked unusual until a camera has about a week of events."
+          : "Nothing in the history matches these filters.";
+      return empty(
+        "mdi:filter-variant-remove",
+        f.unusual ? "No unusual events" : "Nothing matches",
+        body,
+        el("button", { class: "btn", onclick: () => this._setFilter(NO_FILTERS) }, "Show all events"),
+      );
+    }
+    if (list.hidden) {
+      const count = list.hiddenMore ? `More than ${list.hidden}` : String(list.hidden);
+      return empty(
+        "mdi:check-circle-outline",
+        `${count} event${list.hidden === 1 && !list.hiddenMore ? " was" : "s were"} seen, but none needed keeping`,
+        "Nothing was confirmed and nothing was unusual.",
+        el("button", { class: "btn", onclick: () => this._setFilter({ dropped: true }) }, "Show them"),
+      );
+    }
+    return empty(
+      "mdi:cctv",
+      "No events yet",
+      "Events appear here as soon as a camera with the Stamina extension in Scrypted sees something.",
+      el("button", { class: "btn", onclick: () => this._go("/cameras") }, "Check the cameras"),
+    );
+  }
+
+  _skeletonRows() {
+    const rows = Array.from({ length: 6 }, () =>
+      el(
+        "div",
+        { class: "row" },
+        el("div", { class: "thumb skeleton" }),
+        el(
+          "div",
+          { class: "row__body" },
+          el("div", { class: "skeleton", style: { width: "40%", height: "14px" } }),
+          el("div", { class: "skeleton", style: { width: "65%", height: "12px", marginTop: "6px" } }),
+        ),
+      ),
+    );
+    return [el("div", { class: "day" }, " "), el("div", { class: "rows", "aria-busy": "true", "aria-label": "Loading events" }, rows)];
+  }
+
+  /** The first signed thumbnail URL for an event, replaced before it expires. */
+  _thumbnail(item) {
+    if (!item.thumbnail) return null;
+    const known = this._thumbs.get(item.id);
+    if (!known || Date.now() - known.at > THUMB_TTL_MS) {
+      this._thumbs.set(item.id, { url: item.thumbnail, at: Date.now() });
+    }
+    return this._thumbs.get(item.id).url;
+  }
+
+  _row(item) {
+    const thumb = this._thumbnail(item);
+    const signature = JSON.stringify([
+      item.state, item.unusual, item.classes, item.reason, item.duration, item.ended, item.camera_name, thumb,
+    ]);
+    const cached = this._rows.get(item.id);
+    if (cached?.signature === signature) return cached.node;
+
+    const dropped = notKept(item.state);
+    const live = item.ended === null || item.ended === undefined;
+    let picture = icon(classIcon(item.classes[0]));
+    if (thumb) {
+      picture = el("img", { src: thumb, alt: "", loading: "lazy", decoding: "async" });
+      const img = picture;
+      img.addEventListener("error", () => img.replaceWith(icon(classIcon(item.classes[0]))), { once: true });
+    }
+    const node = el(
+      "a",
+      {
+        class: `row${item.unusual ? " row--unusual" : ""}${dropped ? " row--dropped" : ""}`,
+        href: this._url(`/event/${item.id}`),
+        onclick: (ev) => {
+          if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+          ev.preventDefault();
+          this._go(`/event/${item.id}`);
+        },
+      },
+      el("div", { class: "thumb" }, picture, live ? null : el("span", { class: "thumb__len", text: formatDuration(item.duration) })),
+      el(
+        "div",
+        { class: "row__body" },
+        el(
+          "div",
+          { class: "row__top" },
+          el("span", { class: "row__time", text: formatTime(this._hass, item.started) }),
+          el("span", { class: "row__camera", text: item.camera_name }),
+        ),
+        el(
+          "div",
+          { class: "row__what" },
+          el("span", { text: classList(item.classes) }),
+          item.unusual ? badge("Unusual", "unusual") : null,
+          live ? badge("Live", "error", el("span", { class: "live-dot" })) : null,
+          dropped ? badge("Not kept", "neutral") : null,
+        ),
+        item.unusual && item.reason ? el("div", { class: "row__why", text: item.reason }) : null,
+      ),
+    );
+    this._rows.set(item.id, { signature, node });
+    return node;
+  }
+
+  // ---------------------------------------------------------------- one event
+
+  _stopVideo() {
+    this._stopPlayer?.();
+    this._stopPlayer = null;
+  }
+
+  _openEvent(id) {
+    this._stopVideo();
+    this._event = { id, data: null, error: null, playingKey: undefined, media: null, choice: "auto", open: false };
+    this._renderEvent();
+    this._loadEvent(id);
+  }
+
+  async _loadEvent(id) {
+    try {
+      const result = await this._ws({ type: `${DOMAIN}/event`, event_id: id });
+      if (this._event?.id !== id) return;
+      this._event.data = result.event;
+      this._event.error = null;
+    } catch (err) {
+      if (this._event?.id !== id) return;
+      if (!this._event.data) this._event.error = err;
+    }
+    this._renderHeader();
+    this._renderEvent();
+  }
+
+  _renderEvent() {
+    const state = this._event;
+    const view = this._views.event;
+    if (!state) return;
+    if (!state.data) {
+      const missing = state.error?.code === "not_found";
+      replace(
+        view,
+        state.error
+          ? empty(
+              missing ? "mdi:calendar-remove-outline" : "mdi:alert-circle-outline",
+              missing ? "This event is no longer here" : "The event could not be loaded",
+              missing ? "Old events are removed from the history after a while." : errorText(state.error),
+              el("button", { class: "btn", onclick: () => this._go("", { replace: true }) }, "See the latest events"),
+            )
+          : el(
+              "div",
+              { class: "page" },
+              el(
+                "div",
+                { class: "event" },
+                el("div", { class: "event__media" }, el("div", { class: "player" }, el("div", { class: "spinner", role: "status", "aria-label": "Loading" }))),
+                el("div", { class: "event__details" }, el("div", { class: "card skeleton", style: { height: "140px" } })),
+              ),
+            ),
+      );
+      return;
+    }
+
+    const data = state.data;
+    if (!state.media) {
+      state.box = el("div", { class: "player" });
+      state.switch = el("div", { class: "source-switch" });
+      state.media = el("div", { class: "event__media" }, state.box, state.switch);
+      state.details = el("div", { class: "event__details" });
+      replace(view, el("div", { class: "page" }, el("div", { class: "event" }, state.media, state.details)));
+    }
+    const url = state.choice === "cloud" ? data.play.cloud : data.play.url;
+    // Compared without the signature: a refresh re-signs the URL, which is no reason to
+    // restart the video.
+    if (state.playingKey !== playKey(url)) this._play(url);
+    this._renderSourceSwitch();
+    replace(state.details, this._summaryCard(data), this._detailsCard(data));
+  }
+
+  _play(url) {
+    const state = this._event;
+    const data = state.data;
+    this._stopVideo();
+    state.playingKey = playKey(url);
+    this._stopPlayer = mountPlayer(state.box, {
+      hass: this._hass,
+      url,
+      posterUrl: this._thumbs.get(data.id)?.url || data.thumbnail,
+      unavailable: this._unavailable(data),
+      onError: () => {
+        // The recording failed: the cloud copy, when there is one, plays instead.
+        if (state.choice === "cloud" || !state.data.play.cloud || this._event !== state) return false;
+        state.choice = "cloud";
+        queueMicrotask(() => this._renderEvent());
+        return true;
+      },
+    });
+  }
+
+  _unavailable(data) {
+    if (notKept(data.state)) {
+      return { title: "No video: this event was not kept", body: "The camera's recorder does not have it either." };
+    }
+    if (data.ended === null || data.ended === undefined) {
+      return {
+        title: "Not available yet",
+        body: "This camera has no recorder. The cloud copy plays once the event is kept and uploaded.",
+      };
+    }
+    return { title: "No video for this event", body: "The recorder has nothing this old, and there is no finished cloud copy." };
+  }
+
+  _renderSourceSwitch() {
+    const state = this._event;
+    const play = state.data.play;
+    if (!(play.url && play.cloud)) {
+      replace(state.switch);
+      return;
+    }
+    const toCloud = state.choice !== "cloud";
+    replace(
+      state.switch,
+      el(
+        "button",
+        {
+          class: "link-btn link-btn--small",
+          onclick: () => {
+            state.choice = toCloud ? "cloud" : "auto";
+            this._renderEvent();
+          },
+        },
+        toCloud ? "Play the cloud copy" : "Play the recording",
+      ),
+    );
+  }
+
+  /** The one card under the player: the verdict, and why. */
+  _summaryCard(data) {
+    const now = Date.now() / 1000;
+    const word = data.unusual ? "Unusual" : typeof data.score === "number" ? "Ordinary" : "Not scored yet";
+    const reasons = data.unusual ? (data.reasons || []).filter((reason) => reason.label) : [];
+    const top = Math.max(...reasons.map((reason) => reason.weight || 0), 0.01);
+    return el(
+      "section",
+      { class: "card", "aria-label": "Verdict" },
+      el(
+        "div",
+        { class: "verdict" },
+        el("span", { class: `verdict__word${data.unusual ? " verdict__word--unusual" : ""}`, text: word }),
+        el("span", { class: "dim", text: classList(data.classes) }),
+      ),
+      data.reason ? el("p", { class: "sentence", text: data.reason }) : null,
+      reasons.length
+        ? el(
+            "div",
+            { class: "reasons" },
+            reasons.map((reason) =>
+              el(
+                "div",
+                { class: "reason" },
+                el("span", { class: "reason__term", text: termName(reason) }),
+                el("span", { class: "reason__label", text: reason.label }),
+                reason.weight
+                  ? el("div", { class: "reason__bar", "aria-hidden": "true", style: { width: `${Math.max(4, (reason.weight / top) * 100)}%` } })
+                  : null,
+              ),
+            ),
+          )
+        : null,
+      data.state === "follow_up" ? el("p", { class: "note" }, icon("mdi:timer-sand", "icon--sm"), decision(data).text) : null,
+      !data.finalized && data.follow_up_until && data.follow_up_until > now
+        ? el(
+            "p",
+            { class: "note" },
+            icon("mdi:eye-outline", "icon--sm"),
+            `Still watching ${sensorsText(data.watching)} until ${formatTime(this._hass, data.follow_up_until)}.`,
+          )
+        : null,
+      data.learning
+        ? el(
+            "p",
+            { class: "note" },
+            icon("mdi:school-outline", "icon--sm"),
+            "This camera is still learning what is normal, so nothing on it is marked unusual yet.",
+          )
+        : null,
+    );
+  }
+
+  /** Everything else, folded: what was seen, what came after, the decision, the copy. */
+  _detailsCard(data) {
+    const state = this._event;
+    const verdict = decision(data);
+    const subjects = data.subjects || [];
+    const late = data.late_evidence || [];
+    const notes = (data.notes || []).map((note) => NOTES[note]).filter(Boolean);
+    if (data.gaps) notes.push(`${data.gaps} segment${data.gaps === 1 ? " is" : "s are"} missing from the copy.`);
+
+    const seen = subjects.length
+      ? el(
+          "div",
+          { class: "items" },
+          subjects.map((subject) => {
+            const check = verdictText(subject);
+            const by = joinWords((subject.seen_by || []).map(sourceName));
+            const sub = [by ? `Seen by ${by}` : null, subject.dwell ? `for ${formatDuration(subject.dwell)}` : null]
+              .filter(Boolean)
+              .join(" ");
+            return el(
+              "div",
+              { class: "item" },
+              icon(classIcon(subject.class)),
+              el(
+                "div",
+                { class: "item__body" },
+                el(
+                  "div",
+                  { class: "item__head" },
+                  el("span", { class: "item__name", text: subject.label || className(subject.class) }),
+                  badge(check.text, check.tone),
+                ),
+                sub ? el("div", { class: "item__sub", text: sub }) : null,
+              ),
+            );
+          }),
+        )
+      : el("p", { class: "note", text: "Motion only: nothing was recognised." });
+
+    const after = late.length
+      ? [
+          el("h3", { class: "card__title", text: "After the event" }),
+          el(
+            "div",
+            { class: "items" },
+            late.map((item) =>
+              el(
+                "div",
+                { class: "item" },
+                icon("mdi:timer-sand"),
+                el(
+                  "div",
+                  { class: "item__body" },
+                  el("div", { class: "item__name", text: item.name }),
+                  el("div", {
+                    class: "item__sub",
+                    text: [`${item.from ?? "?"} → ${item.to}`, formatAfter(item.t_rel_s)].filter(Boolean).join(" · "),
+                  }),
+                ),
+              ),
+            ),
+          ),
+        ]
+      : null;
+
+    const copies = (data.copies || []).map((copy) => {
+      const status = copy.deleted ? "Removed to free space" : copy.committed ? "Stored" : `Uploading, ${copy.files} files so far`;
+      return el(
+        "div",
+        { class: "item" },
+        icon(copy.deleted ? "mdi:cloud-off-outline" : copy.committed ? "mdi:cloud-check-outline" : "mdi:cloud-upload-outline"),
+        el("div", { class: "item__body" }, el("div", { class: "item__name", text: copy.destination }), el("div", { class: "item__sub", text: status })),
+      );
+    });
+
+    const details = el(
+      "details",
+      { class: "card", ontoggle: (ev) => (state.open = ev.target.open) },
+      el("summary", {}, "Details", badge(verdict.label, verdict.tone)),
+      el(
+        "div",
+        { class: "details__body" },
+        el("h3", { class: "card__title", text: "What was seen" }),
+        seen,
+        after,
+        el("h3", { class: "card__title", text: "Decision" }),
+        verdict.text ? el("p", { class: "sentence", style: { marginTop: "0" }, text: verdict.text }) : null,
+        notes.map((note) => el("p", { class: "note" }, icon("mdi:information-outline", "icon--sm"), note)),
+        data.cloud_path
+          ? [el("div", { class: "item__sub", style: { marginTop: "10px" }, text: "Folder in each destination" }), el("code", { class: "path", text: data.cloud_path })]
+          : null,
+        copies.length ? el("div", { class: "items", style: { marginTop: "12px" } }, copies) : null,
+        el("p", { class: "event-id", text: `Event ${data.id}` }),
+      ),
+    );
+    details.open = state.open;
+    return details;
+  }
+
+  // ---------------------------------------------------------------- cameras
+
+  async _loadCameras() {
+    const cams = this._cams;
+    try {
+      const result = await this._ws({ type: `${DOMAIN}/cameras` });
+      Object.assign(cams, { items: result.cameras, needs: result.learning_needs, loaded: true, error: null });
+      this._link = result.link_healthy;
+    } catch (err) {
+      cams.error = err;
+    }
+    if (this._view === "cameras") this._renderCameras();
+    if (this._view === "list") {
+      this._syncFilters();
+      replace(this._bannerSlot, this._banner());
+    }
+  }
+
+  _renderCameras() {
+    const cams = this._cams;
+    const view = this._views.cameras;
+    if (!cams.loaded) {
+      replace(
+        view,
+        cams.error
+          ? empty(
+              "mdi:alert-circle-outline",
+              "The cameras could not be loaded",
+              errorText(cams.error),
+              el("button", { class: "btn", onclick: () => ((cams.error = null), this._renderCameras(), this._loadCameras()) }, "Try again"),
+            )
+          : el(
+              "div",
+              { class: "page cams", "aria-busy": "true" },
+              Array.from({ length: 3 }, () => el("div", { class: "card skeleton", style: { height: "150px" } })),
+            ),
+      );
+      return;
+    }
+    if (!cams.items.length) {
+      replace(
+        view,
+        this._banner(),
+        empty("mdi:cctv-off", "No cameras yet", "Enable the Stamina extension on a camera in Scrypted. It shows up here within a minute."),
+      );
+      return;
+    }
+    replace(view, el("div", { class: "page" }, this._banner(), el("div", { class: "cams" }, cams.items.map((cam) => this._camera(cam)))));
+  }
+
+  _camera(cam) {
+    const needs = this._cams.needs || { days: 7, events: 200 };
+    const online = cam.online === true ? "Online" : cam.online === false ? "Offline" : "Status unknown";
+    const dot = cam.online === true ? "dot dot--ok" : cam.online === false ? "dot dot--bad" : "dot";
+    const cap = (on, onLabel, offLabel, iconName, warn = false) => {
+      if (on === null || on === undefined) return null;
+      const cls = warn ? "cap cap--warn" : on ? "cap cap--on" : "cap cap--off";
+      return el("span", { class: cls }, icon(on && !warn ? iconName : warn ? "mdi:alert-outline" : "mdi:minus", "icon--sm"), on ? onLabel : offLabel);
+    };
+    const verifier =
+      cam.verifier_live === true
+        ? cap(true, "Double-check on", "", "mdi:shield-check-outline")
+        : cam.verifier_present
+          ? cap(true, "Double-check not responding", "", "", true)
+          : cap(false, "", "No double-check", "");
+    const learning = cam.learning;
+    const progress = Math.min(1, learning.days / needs.days, learning.events / needs.events);
+    const last = cam.last_event;
+    const open = () => this._go("", { filters: { ...NO_FILTERS, camera: cam.id } });
+    return el(
+      "section",
+      {
+        class: "card cam",
+        role: "link",
+        tabindex: "0",
+        "aria-label": `${cam.name}: show its events`,
+        onclick: open,
+        onkeydown: (ev) => {
+          if (ev.target === ev.currentTarget && (ev.key === "Enter" || ev.key === " ")) {
+            ev.preventDefault();
+            open();
+          }
+        },
+      },
+      el(
+        "div",
+        { class: "cam__head" },
+        el("span", { class: dot, "aria-hidden": "true" }),
+        el(
+          "div",
+          { class: "item__body" },
+          el("div", { class: "cam__name", text: cam.name }),
+          el("div", { class: "cam__sub", text: [cam.area, online].filter(Boolean).join(" · ") }),
+        ),
+        learning.active ? badge("Ready", "ok") : badge("Learning", "accent"),
+      ),
+      el(
+        "div",
+        { class: "caps" },
+        verifier,
+        cap(
+          cam.prebuffer,
+          cam.prebuffer_s ? `${cam.prebuffer_s} s before each event` : "Video before each event",
+          "No video before events",
+          "mdi:history",
+        ),
+        cap(cam.recorder, "Recorder", "No recorder", "mdi:record-rec"),
+        cap(cam.audio, "Audio", "No audio", "mdi:microphone-outline"),
+        cap(cam.night_mode, "Night mode sensor", "No night mode sensor", "mdi:weather-night"),
+        cap(cam.tamper, "Tamper sensor", "No tamper sensor", "mdi:hand-back-left-outline"),
+      ),
+      learning.active
+        ? null
+        : el(
+            "div",
+            { class: "cam__learning" },
+            el("span", {
+              text: `Learning what is normal: ${Math.floor(learning.days)} of ${needs.days} days, ${learning.events} of ${needs.events} events.`,
+            }),
+            el("div", { class: "progress", "aria-hidden": "true" }, el("div", { class: "progress__fill", style: { width: `${progress * 100}%` } })),
+          ),
+      el(
+        "div",
+        { class: "cam__actions" },
+        last
+          ? el(
+              "button",
+              {
+                class: "link-btn",
+                onclick: (ev) => {
+                  ev.stopPropagation();
+                  this._go(`/event/${last.id}`);
+                },
+              },
+              `Last event ${formatAgo(last.started)}${last.unusual ? " (unusual)" : ""}`,
+            )
+          : el("span", { class: "cam__sub", style: { padding: "12px 10px" }, text: "No events yet" }),
+      ),
+    );
+  }
+}
+
+if (!customElements.get("scrypted-stamina-panel")) {
+  customElements.define("scrypted-stamina-panel", ScryptedStaminaPanel);
+}

@@ -1,6 +1,6 @@
 # Stamina plugin HTTP API (v1)
 
-The contract between the Scrypted plugin (`@marl1w/scrypted-stamina`) and the Home Assistant integration (`scrypted_stamina`). Plugin version 0.1.2, API version 1.
+The contract between the Scrypted plugin (`@marl1w/scrypted-stamina`) and the Home Assistant integration (`scrypted_stamina`). Plugin version 0.1.3, API version 1.
 
 ## Changes after review (still 0.1.0, API v1)
 
@@ -19,6 +19,11 @@ Integration code written against the first draft must align with these:
 11. **Token regeneration** ends SSE streams, pending polls (they answer `401`) and playback sessions.
 12. **Playback**: a session with `d` lives at least `d` + 5 min; when its memory is full of segments not fetched yet, reading pauses (nothing unfetched is dropped).
 13. `GET /v1/health` has `ring_bytes`; `segmenters` includes segmenters waiting to hand over to a continuation.
+
+## Changes in 0.1.3 (API v1)
+
+28. **`verifier_live` uses a 3 min window** (was 10 min), and an empty `ObjectsDetected` (`detections: []`) from a verifier source counts as activity on that camera. Coral Guard 0.3.50+ sends one about every 60 s (±10 s per camera) while it verifies the camera (Gate mode, service up, frames arriving), and nothing otherwise. A quiet camera therefore stays live, and the first false event after a quiet period is `vetoed` instead of `unverified`; a verifier that stops beating is not live after 3 min. An empty payload never creates an observation, a subject, an event or a source row, and is not counted in `capabilities.detections`. It keeps a verifier that is already in `verifiers` present, but never makes a source present.
+29. The camera's Stamina page shows "not responding" per verifier, only when it showed no activity or liveness beat on the camera within 3 min (also for a verifier mixin that has not detected anything there yet: one that beats is shown as responding, though it does not count for verdicts until its first detection). The API fields are unchanged.
 
 ## Changes in 0.1.2 (API v1)
 
@@ -104,7 +109,7 @@ Times are Unix epoch **milliseconds** unless the field name says otherwise (`*_s
 {
   "ok": true,
   "api": 1,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "epoch": "ep_Xb3kQ9vT0aLm",
   "last_seq": 1234,
   "uptime_s": 3600,
@@ -163,7 +168,7 @@ Times are Unix epoch **milliseconds** unless the field name says otherwise (`*_s
 ```
 
 - `prebuffer`: a stream of the camera is prebuffered by Rebroadcast; `prebuffer_ms` is the longest one. Without it, segments start at the detection. `prebuffer`, `prebuffer_ms` and `audio` are `null` until the plugin has read the camera's stream options (in the background on the first request or event, then every 5 min).
-- `verifiers`: verifier sources that have emitted a detection on this camera in the last 7 days (classless signals do not count) and are still among its mixins. `verifier_present` is `verifiers.length > 0`. `verifier_live`: one of them showed activity (any detection or signal) on this camera within 10 min; when it is `false`, subjects the verifier does not confirm end `unverified` instead of `vetoed`. A verifier mixin that is enabled on the camera but has never emitted (for example Coral Guard in Shadow mode, which publishes nothing) is listed in `silent_verifiers` and does **not** count: otherwise every subject would be vetoed.
+- `verifiers`: verifier sources that have emitted a detection on this camera in the last 7 days (classless signals do not count; an empty `ObjectsDetected` keeps one already listed but never adds one) and are still among its mixins. `verifier_present` is `verifiers.length > 0`. `verifier_live`: one of them showed activity (any detection, signal, or empty `ObjectsDetected` liveness beat) on this camera within 3 min; when it is `false`, subjects the verifier does not confirm end `unverified` instead of `vetoed`. A verifier mixin that is enabled on the camera but has never emitted (for example Coral Guard in Shadow mode, which publishes nothing) is listed in `silent_verifiers` and does **not** count: otherwise every subject would be vetoed.
 - `sources`: the plugin's roles table rows for the sources seen on this camera (`last_seen` on this camera). Roles are global (no per-camera override).
 - `context_sensors`: BinarySensor and OccupancySensor child devices of the camera. `feature` is `night_mode` (name contains "night"), `tamper` (name contains "tamper"), or `null`.
 
@@ -307,9 +312,9 @@ Order guarantees: `event.start` comes before any other message of that event, an
 - `family`: what fuses with what: `person`, `vehicle`, `animal`, `package`, `any` (motion, presence, audio, smart events), or the class itself. A subject that starts as `any` takes the class of the first concrete observation; the earlier class goes to `tags`.
 - `verdict`:
   - `pending`: a verifier is present and the verify window (default 5 s from the subject's first observation) is open;
-  - `confirmed`: a verifier observation joined the subject (`verdict_source`). Only an observation with a concrete class confirms (not motion, occupancy, audio or a smart event), except a classless signal from a source flagged **gated** (Coral Guard: its motion and occupancy turn on only after its own verification), and that one confirms only the single `pending` subject (otherwise its own motion/presence subject; never a `vetoed` one). While a subject is `pending`, a verifier observation of the same family within the verify window joins it, even beyond the ±2 s rule;
+  - `confirmed`: a verifier observation joined the subject (`verdict_source`). Only an observation with a concrete class confirms (not motion, occupancy, audio or a smart event), except a classless signal from a source flagged **gated** (for example Coral Guard: its motion and occupancy turn on only after its own verification), and that one confirms only the single `pending` subject (otherwise its own motion/presence subject; never a `vetoed` one). While a subject is `pending`, a verifier observation of the same family within the verify window joins it, even beyond the ±2 s rule;
   - `vetoed`: the window passed (or the event ended) without one, while the verifier was live;
-  - `unverified`: no verifier is present on the camera, or it showed no sign of life for 10 min when the window ended.
+  - `unverified`: no verifier is present on the camera, or it showed no sign of life on it for 3 min when the window ended.
 - A `vetoed` subject can still become `confirmed` if a verifier sees it later in the same event (a new `subject.verdict`). A `confirmed` subject never changes.
 - `box`: the latest box, `null` when no source sent one (the camera's own AI usually sends none).
 

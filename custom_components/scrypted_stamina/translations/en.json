@@ -1,0 +1,189 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Scrypted Stamina",
+        "description": "The Stamina plugin's endpoint in Scrypted, and the token from the plugin's settings.",
+        "data": {
+          "url": "Plugin URL",
+          "token": "Token",
+          "verify_ssl": "Verify the TLS certificate"
+        },
+        "data_description": {
+          "url": "The Integration URL from the plugin's settings. When Scrypted runs on this host, http://127.0.0.1:11080/endpoint/@marl1w/scrypted-stamina/public needs no certificate. For another host use its https URL; the certificate is then shown for you to accept.",
+          "verify_ssl": "Scrypted uses a self-signed certificate, so leave this off unless you gave it a real one."
+        }
+      },
+      "reauth_confirm": {
+        "title": "New token",
+        "description": "The Stamina plugin refused the token, or presented a different certificate (changed: {changed}). Paste the current token from the plugin's settings. Certificate SHA-256: {fingerprint}.",
+        "data": {
+          "token": "Token",
+          "accept_certificate": "Accept the new certificate"
+        }
+      },
+      "reconfigure": {
+        "title": "Change the connection",
+        "data": {
+          "url": "Plugin URL",
+          "token": "Token",
+          "verify_ssl": "Verify the TLS certificate"
+        }
+      },
+      "certificate": {
+        "title": "Accept the plugin's certificate",
+        "description": "Scrypted uses a self-signed certificate. Check that this SHA-256 fingerprint is the one Scrypted shows, then accept it; it is pinned, and a different certificate will be refused.\n\n{fingerprint}",
+        "data": {
+          "accept_certificate": "Accept this certificate"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "The plugin did not answer at that URL.",
+      "insecure_url": "Plain http is only allowed to this machine (127.0.0.1). Use the plugin's https URL.",
+      "invalid_auth": "The plugin refused the token.",
+      "not_accepted": "Accept the certificate to continue.",
+      "certificate_changed": "The plugin now presents a different certificate. Check the new fingerprint below before accepting it."
+    },
+    "abort": {
+      "already_configured": "Scrypted Stamina is already set up.",
+      "reauth_successful": "The token was updated.",
+      "reconfigure_successful": "The connection was updated."
+    }
+  },
+  "config_subentries": {
+    "destination": {
+      "title": "Destination",
+      "entry_type": "Destination",
+      "initiate_flow": {
+        "user": "Add destination"
+      },
+      "step": {
+        "user": {
+          "title": "Add a destination",
+          "description": "Every kept event goes to every destination. Choose from the storage integrations already set up.",
+          "data": {
+            "destination_entry": "Storage",
+            "folder": "Folder",
+            "quota_gb": "Quota",
+            "retention_days": "Retention",
+            "follow_up_cap_gb": "Follow-up hold limit",
+            "orphan_retention_days": "Orphan retention"
+          },
+          "data_description": {
+            "orphan_retention_days": "Orphaned events (kept because no decision could be made) are never removed for room, only after this many days.",
+            "folder": "Events go to pending/, events/ and unusual-unconfirmed/ under this folder, one subfolder per area.",
+            "quota_gb": "When full, the oldest committed events are removed first. Pending and orphaned events are never removed.",
+            "retention_days": "Remove committed events older than this. 0 keeps them until the quota needs the room.",
+            "follow_up_cap_gb": "Vetoed events wait in pending/ during the follow-up window. Above this, the oldest of them are dropped early."
+          }
+        },
+        "reconfigure": {
+          "title": "Change a destination",
+          "data": {
+            "folder": "Folder",
+            "quota_gb": "Quota",
+            "retention_days": "Retention",
+            "follow_up_cap_gb": "Follow-up hold limit",
+            "orphan_retention_days": "Orphan retention"
+          }
+        }
+      },
+      "abort": {
+        "no_destination": "No storage integration is set up, or each is already a destination. Set up Synology DSM, WebDAV, SFTP Storage, OneDrive or Google Drive first.",
+        "reconfigure_successful": "The destination was updated."
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Scoring",
+        "data": {
+          "relevance_scope": "Compare each camera with",
+          "relevance_sensitivity": "How much to flag as unusual",
+          "unusual_uploads_when_off": "Upload unusual events while uploads are off",
+          "recorder_retention_days": "Recorder keeps footage for",
+          "history_size_mb": "History size",
+          "unverified_min_seconds": "Without a verifier, keep subjects seen for at least",
+          "unverified_min_score": "Without a verifier, keep subjects scoring at least"
+        },
+        "data_description": {
+          "history_size_mb": "Room for the event history the model learns from. When it is full, routine dropped events are thinned out; kept and unusual events are never removed."
+        }
+      },
+      "camera": {
+        "title": "{camera}",
+        "description": "Entities whose state is recorded with every event of this camera, and whose changes after an event count as late evidence. Suggested from the camera's area.",
+        "data": {
+          "linked_entities": "Linked entities",
+          "follow_up_minutes": "Follow-up window"
+        }
+      }
+    }
+  },
+  "selector": {
+    "relevance_scope": {
+      "options": {
+        "together": "All cameras together",
+        "area": "Cameras in the same area",
+        "camera": "Only itself"
+      }
+    },
+    "relevance_sensitivity": {
+      "options": {
+        "few": "Few",
+        "balanced": "Balanced",
+        "many": "Many"
+      }
+    }
+  },
+  "entity": {
+    "event": {
+      "stamina": {
+        "name": "Stamina",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "normal": "Normal",
+              "unusual": "Unusual"
+            }
+          }
+        }
+      }
+    },
+    "binary_sensor": {
+      "unusual": {
+        "name": "Unusual"
+      }
+    },
+    "sensor": {
+      "last_event_score": {
+        "name": "Last event score"
+      },
+      "queue": {
+        "name": "Queue"
+      },
+      "latency": {
+        "name": "Latency"
+      },
+      "quota_used": {
+        "name": "Quota used {destination}"
+      },
+      "orphans": {
+        "name": "Orphans"
+      }
+    },
+    "switch": {
+      "uploads": {
+        "name": "Uploads"
+      }
+    }
+  },
+  "issues": {
+    "over_quota": {
+      "title": "{destination} is over its quota",
+      "description": "Pending footage could not fit inside the quota of {destination}, and no committed event was left to remove for room. The footage was uploaded anyway, over the quota. Raise the quota, or free space on the destination."
+    }
+  }
+}

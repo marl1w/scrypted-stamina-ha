@@ -1,0 +1,192 @@
+<!doctype html>
+<!--
+  The real review panel against invented data, no Home Assistant needed. From the repo root:
+
+    python3 -m http.server 8765
+    open http://127.0.0.1:8765/tools/panel-preview/preview.html
+
+  The panel talks to Home Assistant through `hass.callWS` and
+  `hass.connection.subscribeMessage` only, so stand-ins for those are all it takes.
+  `?empty` gives a fresh install, `?dark` the dark theme, `?quiet` a house where nothing
+  was kept. The panel's own routes and filters live after the `#` here (Home Assistant
+  gives it the path instead). Video does not play (nothing signs URLs here); the player
+  shows its "no video" and "could not be played" states.
+
+  Not shipped: it lives outside custom_components/.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scrypted Stamina panel preview</title>
+<style>
+  html, body { margin: 0; height: 100%; }
+  body { font-family: Roboto, system-ui, sans-serif; }
+  body.light {
+    --primary-background-color: #fafafa; --card-background-color: #fff; --secondary-background-color: #e5e5e5;
+    --primary-text-color: #212121; --secondary-text-color: #616161; --divider-color: rgba(0, 0, 0, 0.12);
+    --primary-color: #03a9f4; --app-header-background-color: #03a9f4; --app-header-text-color: #fff;
+  }
+  body.dark {
+    color-scheme: dark;
+    --primary-background-color: #111111; --card-background-color: #1c1c1c; --secondary-background-color: #282828;
+    --primary-text-color: #e1e1e1; --secondary-text-color: #a0a0a0; --divider-color: rgba(225, 225, 225, 0.12);
+    --primary-color: #03a9f4; --app-header-background-color: #101e24; --app-header-text-color: #e1e1e1;
+  }
+  .switcher { position: fixed; right: 8px; bottom: 8px; z-index: 99; font: 12px system-ui; min-height: 32px; }
+</style>
+</head>
+<body>
+<button class="switcher" id="theme">Theme</button>
+<script type="module">
+import "../../custom_components/scrypted_stamina/frontend/scrypted-stamina-panel.js";
+
+const params = new URLSearchParams(location.search);
+document.body.className = params.has("dark") ? "dark" : "light";
+document.getElementById("theme").onclick = () => {
+  document.body.className = document.body.className === "dark" ? "light" : "dark";
+};
+
+// ------------------------------------------------------------------ sample household
+
+const NOW = Date.now() / 1000;
+const CAMERAS = params.has("empty") ? [] : [
+  { id: "11", name: "Front door", area: "Entrance", online: true, verifier: true, live: true, recorder: true, learn: [12, 640] },
+  { id: "12", name: "Driveway", area: "Outside", online: true, verifier: true, live: true, recorder: true, learn: [12, 410] },
+  { id: "13", name: "Garden", area: "Outside", online: true, verifier: true, live: false, recorder: false, learn: [3.4, 96] },
+  { id: "14", name: "Garage", area: "Garage", online: false, verifier: true, live: false, recorder: true, learn: [9, 230] },
+];
+const CLASSES = ["person", "person", "vehicle", "animal", "person", "motion"];
+const COLORS = ["#4f7cff", "#2eaa6e", "#f0a020", "#8b93a7", "#e5484d"];
+const PLUGIN = "@example/scrypted-camera-plugin";
+const VERIFIER = "scrypted-coral-guard";
+
+function thumb(n) {
+  const c = COLORS[n % COLORS.length];
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='320' height='180'><defs><linearGradient id='g' x2='1' y2='1'><stop offset='0' stop-color='${c}'/><stop offset='1' stop-color='#222'/></linearGradient></defs><rect width='320' height='180' fill='url(#g)'/><circle cx='${80 + (n * 37) % 160}' cy='100' r='26' fill='rgba(255,255,255,.55)'/></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+const EVENTS = [];
+let t = NOW - 40;
+for (let n = 0; n < (CAMERAS.length ? 140 : 0); n++) {
+  const cam = CAMERAS[n % 7 === 3 ? 2 : n % CAMERAS.length];
+  const cls = CLASSES[(n * 5) % CLASSES.length];
+  const unusual = !params.has("quiet") && (n === 1 || n === 9 || n === 33 || n === 70);
+  const dropped = params.has("quiet") || (!unusual && n % 4 === 2);
+  const live = n === 0 && !params.has("quiet");
+  const state = live ? "pending" : dropped ? "dropped" : n === 17 ? "orphaned" : n === 5 ? "follow_up" : "committed";
+  const duration = live ? null : 6 + ((n * 13) % 50);
+  EVENTS.push({
+    id: `ev_${String(n).padStart(4, "0")}previewAbCdEfGhIjKl`.slice(0, 25),
+    camera: cam.id, camera_name: cam.name, area: cam.area,
+    started: t, ended: live ? null : t + duration, duration,
+    classes: cls === "motion" ? ["motion"] : n % 11 === 0 ? [cls, "vehicle"] : [cls],
+    unusual, score: unusual ? 0.6 + (n % 4) / 10 : 0.1 + ((n * 7) % 35) / 100,
+    state, reason: unusual ? `Person at 03:1${n % 10} on ${cam.name}: first time in 2 weeks.` : "",
+    late: unusual && n === 9 ? 1 : 0, thumbnail: n % 13 === 12 ? null : thumb(n),
+  });
+  t -= 600 + ((n * 977) % 5400);
+}
+
+function detail(row) {
+  const cam = CAMERAS.find((c) => c.id === row.camera);
+  const subjects = row.classes.filter((c) => c !== "motion").map((cls) => ({
+    class: cls, label: null,
+    verdict: row.state === "dropped" ? "vetoed" : cam.live ? "confirmed" : "unverified",
+    verified_by: cam.live ? [VERIFIER] : [], seen_by: [PLUGIN],
+    score: 0.82, dwell: Math.min(row.duration || 4, 14),
+  }));
+  const reasons = row.unusual ? [
+    { term: "clock", subject: null, label: "03:12", weight: 1.84 },
+    { term: "predecessor", subject: null, label: "90s after Driveway", weight: 1.12 },
+    { term: "signal", subject: "night mode", label: "on", weight: 0.41 },
+  ] : [{ term: "duration", subject: null, label: "48 s", weight: 0.22 }];
+  const kept = !["dropped", "pending"].includes(row.state);
+  return {
+    ...row, subjects, reasons,
+    scores: { live: null, provisional: row.score, final: row.score },
+    finalized: row.state !== "follow_up" && row.state !== "pending",
+    follow_up_until: row.state === "follow_up" ? NOW + 420 : null,
+    watching: ["door", "presence"],
+    late_evidence: row.late ? [{ entity: "binary_sensor.side_gate", name: "Side gate", kind: "door", from: "off", to: "on", t_rel_s: 40 }] : [],
+    learning: cam.learn[0] < 7, keep_reason: row.unusual ? "unusual" : "confirmed", target: "events",
+    cloud_path: kept ? `events/${cam.area.toLowerCase()}/${row.id}` : null,
+    copies: kept ? [{ destination: "WebDAV: NAS", committed: row.state === "committed", deleted: false, files: 12 }] : [],
+    notes: row.state === "orphaned" ? ["camera_offline"] : [], gaps: 0,
+    play: {
+      url: cam.recorder || kept ? `/no-video.m3u8?mode=auto&exp=${Date.now()}&sig=x` : null,
+      recorder: cam.recorder,
+      cloud: row.state === "committed" ? `/no-video.m3u8?mode=cloud&exp=${Date.now()}&sig=x` : null,
+    },
+  };
+}
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const hass = {
+  language: "en",
+  locale: { language: "en", time_zone: "local" },
+  config: { time_zone: "UTC" },
+  async callWS(msg) {
+    await wait(200);
+    if (msg.type === "scrypted_stamina/cameras") {
+      return {
+        link_healthy: true, learning_needs: { days: 7, events: 200 },
+        cameras: CAMERAS.map((c) => ({
+          id: c.id, name: c.name, area: c.area, online: c.online,
+          verifier_live: c.live, verifier_present: c.verifier, verifiers: [VERIFIER],
+          prebuffer: c.id !== "13", prebuffer_s: c.id !== "13" ? 10 : null, recorder: c.recorder,
+          audio: c.id !== "14", night_mode: true, tamper: c.id === "11" ? true : null,
+          learning: { active: c.learn[0] >= 7 && c.learn[1] >= 200, days: c.learn[0], events: c.learn[1] },
+          last_event: (() => { const e = EVENTS.find((x) => x.camera === c.id); return e ? { id: e.id, started: e.started, unusual: e.unusual } : null; })(),
+        })),
+      };
+    }
+    if (msg.type === "scrypted_stamina/event") {
+      const row = EVENTS.find((e) => e.id === msg.event_id);
+      if (!row) throw { code: "not_found", message: "No such event" };
+      return { event: detail(row) };
+    }
+    if (msg.type === "scrypted_stamina/events") {
+      const rows = EVENTS.filter((e) =>
+        (msg.include_dropped || e.state !== "dropped") &&
+        (!msg.unusual || e.unusual) &&
+        (!msg.cls || e.classes.includes(msg.cls)) &&
+        (!msg.camera || e.camera === msg.camera) &&
+        (!msg.area || e.area === msg.area));
+      const start = msg.cursor ? rows.findIndex((e) => e.id === msg.cursor) + 1 : 0;
+      const page = rows.slice(start, start + (msg.limit || 50));
+      const more = start + page.length < rows.length;
+      return { events: page, cursor: more ? page[page.length - 1].id : null, link_healthy: true };
+    }
+    throw { code: "unknown_command", message: msg.type };
+  },
+  connection: {
+    async subscribeMessage(callback) {
+      const timer = setInterval(() => callback({ changed: true }), 20000);
+      return () => clearInterval(timer);
+    },
+  },
+};
+
+// ------------------------------------------------------------------ routing, after the `#`
+
+const panel = document.createElement("scrypted-stamina-panel");
+const prefix = `${location.pathname}${location.search}#`;
+function route() {
+  const hash = location.hash.slice(1);
+  const at = hash.indexOf("?");
+  return { prefix, path: at < 0 ? hash : hash.slice(0, at), search: at < 0 ? "" : hash.slice(at) };
+}
+panel.panel = { title: "Scrypted Stamina", config: { entry_id: "preview" } };
+panel.narrow = innerWidth < 870;
+panel.route = route();
+document.body.append(panel);
+panel.hass = hass;
+addEventListener("location-changed", () => (panel.route = route()));
+addEventListener("popstate", () => (panel.route = route()));
+addEventListener("resize", () => (panel.narrow = innerWidth < 870));
+</script>
+</body>
+</html>
