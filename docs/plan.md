@@ -50,7 +50,7 @@ Phase 0 answers decide the details of phases 2–4. S3 is done in the scrypted-r
 
 - Linked entities per camera (options flow), and the context snapshot at start and end.
 - Port `relevance/` from Reolink Stamina: features, learned normal, score.
-- A rules engine: rules defined in options, each hit with a reason.
+- Day/night: the camera's BinarySensor children (e.g. scrypted-reolink's "Night mode") as features.
 - Source reliability learned from verdicts.
 - `binary_sensor.<cam>_unusual`, and `unusual` events on `event.<cam>_stamina`.
 
@@ -92,9 +92,12 @@ A Coral Guard-like mixin. It decodes the camera's audio from the prebuffered sub
 - Roles: per source plugin, in the Stamina plugin's settings. No per-camera override.
 - No MQTT for Stamina; `scrypted_mqtt` is optional (its camera devices are reused when present).
 
-## Open questions
+- No explicit rules: unusual comes only from the learned model, after about a week of learning.
+- Day/night comes from the camera plugin as a standard BinarySensor child device (scrypted-reolink: "Night mode", from the NVR's day/night push), not from the image.
 
-1. **Day-one rules:** which of these? Person while the alarm is armed; person while nobody is home; person at night; loitering longer than N s; camera offline during an event (always on); a sound spike plus a person.
+## Parallel track: scrypted-reolink "Night mode"
+
+Add a BinarySensor child device per camera, driven by the NVR's day/night push that the plugin already receives (it uses it today to ignore the motion spike at the switch).
 
 ## Conventions
 

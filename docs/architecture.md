@@ -46,7 +46,7 @@ Short version: **Scrypted provides the facts and the video; Home Assistant decid
 │  │ STAMINA INTEGRATION (scrypted_stamina)                                │  │
 │  │  link: SSE client (resume by event id), segment fetcher               │  │
 │  │  context: linked HA entities per camera, state at event time          │  │
-│  │  scoring: relevance model (learned normal) + rules ─► score, unusual  │  │
+│  │  scoring: relevance model (learned normal) ─► score, unusual          │  │
 │  │  decider: per-event state machine (keep / delete / orphan-keep)       │  │
 │  │  uploader: pending/ ─► events/ through HA storage integrations        │  │
 │  │  index: SQLite, metadata only                                         │  │
@@ -151,7 +151,7 @@ All routes are under `/endpoint/@marl1w/scrypted-stamina/` with `Authorization: 
 ### 3.3 Scoring
 
 - The **relevance model** is ported from Reolink Stamina's `relevance/`. Its learned "normal" per camera uses hour of week, class, zone, duration and dwell, subject count, verdict mix, and context features. It outputs a rarity score from 0 to 1.
-- **Rules** are explicit conditions, for example a person while the alarm is armed, loitering longer than N s, a vehicle where none normally parks, or the camera going offline during an event. A rule hit sets `unusual` with a reason.
+- **No explicit rules:** an event is flagged `unusual` only by the learned model. Flagging starts once a camera has about a week and a few hundred events behind it; until then every event is `normal` and only the confirmed/vetoed decision applies.
 - **Source reliability:** precision per camera per source, learned from verifier outcomes and review labels, used as a weight in the model.
 
 ### 3.4 Decider: one state machine per event
@@ -251,7 +251,7 @@ Vetoed path: the same until the verdict. Then `DROPPING` deletes `pending/<id>/`
 
 ## 6. Extra signals
 
-- **Day/night (colour or IR):** no standard Scrypted interface exists, so it is measured from the image. The plugin checks the colour saturation of one snapshot at each event start, plus one every few minutes for `sensor.<cam>_light_mode` (`day` / `night`). It is a scoring feature and works with any camera.
+- **Day/night (colour or IR):** taken from the camera plugin. scrypted-reolink gets the NVR's day/night push and exposes a child device per camera, "Night mode", with the standard **BinarySensor** interface (on means IR/black-and-white). The Scrypted MQTT bridge shows it as `binary_sensor.<cam>_night_mode`. Stamina reads every BinarySensor child of a camera as a scoring feature, so any camera plugin that exposes a similar child device works too. Cameras without one have no day/night feature.
 - **Audio:** read through Scrypted's standard **AudioSensor** (`audioDetected`), with role trigger by default. It is produced by the separate audio-guard plugin (plan, parallel track), or by any plugin that implements AudioSensor.
 
 ## 6. Capabilities and fallbacks
@@ -270,7 +270,7 @@ Each camera's capabilities are shown as attributes on `event.<cam>_stamina` and 
 ## 7. Failure and safety rules
 
 - Nothing pending is deleted without an explicit `DROPPING` decision made while the link is healthy.
-- A camera going offline during an event is a rule hit (`unusual`, reason `camera_offline`), and the event is kept.
+- A camera going offline during an event keeps the event (safety behaviour, not a rule), with `camera_offline` noted in `event.json`.
 - Segments are uploaded in order. A missing segment is retried until its TTL expires, then marked as a gap in `event.json`. Playback tolerates gaps.
 - Restarts:
   - **The integration** resumes SSE from its stored `seq`, and events still pending in the index are re-evaluated (an expired event becomes `orphaned`, so it is kept).
