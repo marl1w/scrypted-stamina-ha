@@ -58,6 +58,8 @@ Short version: **Scrypted provides the facts and the video; Home Assistant decid
                                   CLOUD / NAS
 ```
 
+Stamina does not use MQTT. It attaches its entities to the `scrypted_mqtt` camera devices when that integration is present (one device per camera), and creates its own device per camera otherwise. `scrypted_mqtt` is optional, not a dependency.
+
 Why a direct HTTP link rather than MQTT: event facts carry observations, boxes and subjects (larger and richer than an MQTT entity state), and segments and playback are HTTP anyway. One channel, one token. The Scrypted MQTT bridge is not changed and knows nothing about Stamina.
 
 ## 2. Scrypted side
@@ -141,6 +143,8 @@ All routes are under `/endpoint/@marl1w/scrypted-stamina/` with `Authorization: 
 
 ### 3.2 Context
 
+**Configuration:** the integration's options have one page per camera with an entity picker. It is pre-filled with suggestions from the camera device's area (contacts, alarm panel, presence, lights), and you add or remove entities. Each entity's kind (door, alarm, presence, light, other) comes from its domain and device class, and tells scoring and rules how to read it.
+
 - Per camera device, an options picker of **linked entities** (contacts, alarm panel, presence, lights…).
 - At `event.start` and `event.end`, the integration records each linked entity's state and its last change relative to the event (e.g. "door opened 5 s before"). These features feed scoring and are stored with the event.
 
@@ -173,15 +177,18 @@ All routes are under `/endpoint/@marl1w/scrypted-stamina/` with `Authorization: 
  └───────────┘
 ```
 
-No-verifier cameras follow the fallback policy: `unverified` subjects count as confirmed once they last at least N s (default 2) with a score of at least T. Whether an event that is vetoed but unusual is kept is a setting (see the plan's open questions).
+No-verifier cameras follow the fallback policy: `unverified` subjects count as confirmed once they last at least N s (default 2) with a score of at least T. An event that is vetoed but unusual is **kept**, in `unusual-unconfirmed/` rather than `events/`.
 
 ### 3.5 Uploader
+
+**Destinations** are subentries ("Add destination"), as in Reolink Stamina. Each one picks an account or server from the storage integrations already set up: Synology DSM, WebDAV, SFTP Storage, OneDrive, Google Drive. Each has its own folder, quota (default 15 GB), and retention (oldest evicted first). Every kept event goes to every destination.
 
 - Destinations are ported from Reolink Stamina's `cloud/destinations`. Each must support writing a file per segment; append is not required.
 - Layout per event:
   ```
   pending/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 00001.m4s, …
   events/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 0000N.m4s, index.m3u8, event.json
+  unusual-unconfirmed/<YYMMDD_HHMMSS>_<camera>_<id>/…   (vetoed but unusual: kept, apart)
   ```
   `index.m3u8` (HLS with fMP4) plays straight from the folder. `event.json` holds the event facts, the context, the score and the reasons.
 - Commit is a folder rename, where the provider supports it; otherwise copy then delete.
@@ -191,7 +198,7 @@ No-verifier cameras follow the fallback policy: `unverified` subjects count as c
 ### 3.6 Index and review
 
 - SQLite in HA's config directory holds metadata only: event id, camera, times, subjects with sources and verdicts, context, score, reasons, decision state, and cloud path.
-- A **thumbnail** per event is optional (setting; it reuses the plugin's frame at confirmation).
+- A **thumbnail** per event: a 320 px JPEG (about 15 KB) of the frame at confirmation, or at event start, served by the plugin. It is stored next to the index and kept as long as the index row. At about 300 events a day that is about 5 MB a day.
 - A **media source** ("Scrypted events") lists events by camera, then day. Playback resolves to the plugin's recording HLS, or else the cloud `index.m3u8`.
 - A timeline panel comes later, porting Reolink Stamina's frontend.
 
@@ -207,7 +214,21 @@ They attach to each camera's `scrypted_mqtt` device, matched by Scrypted device 
 
 Integration-wide entities: `switch.stamina_uploads` (arms ordinary uploads; unusual events still upload if that setting is on), `sensor.stamina_queue`, and `sensor.stamina_quota_used`.
 
-## 4. Data flow of one event
+## 4. Latency budget
+
+Reolink Stamina waits for the recorder to finish writing a clip (about a minute). Here the upload starts at the first detection.
+
+| Hop | Target | How |
+|---|---|---|
+| Camera detection → plugin | < 0.5 s | Push events from the camera plugin (Baichuan for Reolink) |
+| Plugin → integration (`event.start`) | < 50 ms | SSE push, never polled |
+| Pre-roll segments available | at event start | Cut from Rebroadcast's prebuffer, already in memory |
+| First segment uploaded | < 3 s from detection, plus uplink time | Fetched at once and uploaded in parallel; 1–2 s segments, copied without re-encoding |
+| Verifier verdict | 1–3 s | Doesn't block anything: uploads start before it |
+
+Every hop is timestamped into `event.json`: camera event time, plugin receive, segment cut, HA fetch, upload done. `sensor.stamina_latency` reports p50/p95 time-to-first-segment-uploaded, so the target is measured continuously.
+
+## 5. Data flow of one event
 
 ```
 t      SCRYPTED (stamina plugin)              HA (stamina integration)             CLOUD
@@ -228,7 +249,12 @@ later                                         optional full-res upgrade via play
 
 Vetoed path: the same until the verdict. Then `DROPPING` deletes `pending/<id>/` and the index keeps a metadata row (`dropped`).
 
-## 5. Capabilities and fallbacks
+## 6. Extra signals
+
+- **Day/night (colour or IR):** no standard Scrypted interface exists, so it is measured from the image. The plugin checks the colour saturation of one snapshot at each event start, plus one every few minutes for `sensor.<cam>_light_mode` (`day` / `night`). It is a scoring feature and works with any camera.
+- **Audio:** read through Scrypted's standard **AudioSensor** (`audioDetected`), with role trigger by default. It is produced by the separate audio-guard plugin (plan, parallel track), or by any plugin that implements AudioSensor.
+
+## 6. Capabilities and fallbacks
 
 | Missing | Behaviour |
 |---|---|
@@ -241,7 +267,7 @@ Vetoed path: the same until the verdict. Then `DROPPING` deletes `pending/<id>/`
 
 Each camera's capabilities are shown as attributes on `event.<cam>_stamina` and in `GET /v1/cameras`.
 
-## 6. Failure and safety rules
+## 7. Failure and safety rules
 
 - Nothing pending is deleted without an explicit `DROPPING` decision made while the link is healthy.
 - A camera going offline during an event is a rule hit (`unusual`, reason `camera_offline`), and the event is kept.

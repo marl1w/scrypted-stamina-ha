@@ -79,13 +79,22 @@ This is independent of Stamina but follows the same principle:
 
 It can run alongside phases 0–1.
 
-## Open questions (needed before phase 2–3)
+## Parallel track: audio guard (new Scrypted plugin)
 
-1. **Destinations:** which ones first (Synology, WebDAV, SFTP, OneDrive, Google Drive)?
-2. **Vetoed but unusual:** keep it or drop it?
-3. **Day-one rules:** which ones?
-4. **Thumbnails** in the index: yes or no?
-5. **Quota and retention** defaults per destination.
+A Coral Guard-like mixin. It decodes the camera's audio from the prebuffered substream and keeps a rolling noise floor. It sets the standard **AudioSensor** `audioDetected` on a spike well above that floor (silence means no spike). Measure the CPU per camera before rolling it out to all cameras. The Scrypted MQTT bridge shows it as a sound sensor; Stamina uses it as a trigger. Classifying sounds (glass breaking, barking, shouting) comes later.
+
+## Decisions taken
+
+- Destinations: all those Reolink Stamina supports (Synology DSM, WebDAV, SFTP, OneDrive, Google Drive).
+- Vetoed but unusual events: kept, in `unusual-unconfirmed/`.
+- Thumbnails: yes, 320 px JPEG, about 15 KB each.
+- Quota and retention: as in Reolink Stamina (15 GB per destination, oldest first).
+- Roles: per source plugin, in the Stamina plugin's settings. No per-camera override.
+- No MQTT for Stamina; `scrypted_mqtt` is optional (its camera devices are reused when present).
+
+## Open questions
+
+1. **Day-one rules:** which of these? Person while the alarm is armed; person while nobody is home; person at night; loitering longer than N s; camera offline during an event (always on); a sound spike plus a person.
 
 ## Conventions
 
