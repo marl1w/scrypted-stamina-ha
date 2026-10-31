@@ -12,8 +12,10 @@ committed video of several hours) goes up through an upload session, in chunks.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from urllib.parse import quote
 
 from .base import DestinationError, content_type
@@ -138,3 +140,52 @@ class OneDriveDestination(OAuthDestination):
         if isinstance(data, (bytes, bytearray)):
             return bytes(data)
         return json.dumps(data).encode()
+
+    async def async_read_range(self, path: str, start: int, end: int) -> bytes:
+        """Return bytes `start..end` (inclusive), from the file's pre-authenticated URL.
+
+        The URL is asked of Graph once (`$select`) and kept for 50 minutes (Graph's last
+        about an hour), so each segment a player asks for costs one ranged GET. The lookup
+        runs as a task of its own that concurrent readers share: one of them giving up does
+        not cancel it for the others. A URL that stopped working is asked for once more.
+        """
+        urls: dict[str, tuple[float, asyncio.Task[object]]] = self.__dict__.setdefault(
+            "_download_urls", {}
+        )
+        for attempt in (1, 2):
+            now = time.monotonic()
+            held = urls.get(path)
+            if held is None or held[0] < now:
+                for key in [key for key, (until, _) in urls.items() if until < now]:
+                    del urls[key]
+                task = self._hass.async_create_task(
+                    self._async_request(
+                        "GET",
+                        self._item(path),
+                        params={"$select": "id,@microsoft.graph.downloadUrl"},
+                    ),
+                    f"OneDrive download URL of {path}",
+                )
+                held = urls[path] = (now + 50 * 60, task)
+            try:
+                item = await asyncio.shield(held[1])
+            except DestinationError:
+                urls.pop(path, None)  # not kept: the next read asks again
+                raise
+            url = item.get("@microsoft.graph.downloadUrl") if isinstance(item, dict) else None
+            if not url:
+                urls.pop(path, None)
+                raise DestinationError(f"OneDrive gave no download URL for {path}")
+            try:
+                data = await self._async_request(
+                    "GET", str(url), headers={"Range": f"bytes={start}-{end}"}, authorize=False
+                )
+            except DestinationError:
+                urls.pop(path, None)
+                if attempt == 2:
+                    raise
+                continue
+            if isinstance(data, (bytes, bytearray)):
+                return bytes(data)
+            return json.dumps(data).encode()
+        raise DestinationError(f"OneDrive read of {path} failed")

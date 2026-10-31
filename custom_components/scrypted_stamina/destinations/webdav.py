@@ -184,3 +184,22 @@ class WebDavDestination(Destination):
     async def async_delete_folder(self, folder: str) -> None:
         """Remove a folder with one recursive `DELETE`."""
         await self.async_delete(folder)
+
+    async def async_read_range(self, path: str, start: int, end: int) -> bytes:
+        """Return bytes `start..end` (inclusive) of one file, streaming it only that far."""
+
+        async def attempt() -> bytes:
+            client = self._client
+            chunks = await self._async_call(f"download of {path}", client.download_iter(path))
+            data = bytearray()
+            offset = 0
+            async for chunk in chunks:
+                view = memoryview(chunk)
+                if offset + len(view) > start:
+                    data += view[max(0, start - offset) : end + 1 - offset]
+                offset += len(view)
+                if offset > end:
+                    break
+            return bytes(data)
+
+        return await async_attempt(f"WebDAV read of {path}", attempt)

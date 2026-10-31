@@ -12,8 +12,8 @@ Views, all answering only URLs this module signed:
   every URI points back here with a fresh signature; media is streamed through.
 * **Cloud copy** — the play view answers with a playlist of byte ranges of the committed
   video (`hls.py`); `/api/scrypted_stamina/cloud/<entry>/<destination>/<event>/video.mp4`
-  serves those ranges, reading the video from the destination once and keeping the last
-  few in memory, since a player asks for one range per segment.
+  serves those ranges, each read from the destination as that range only (in chunks of
+  `VIDEO_CHUNK`), so neither a long video nor several players are ever held in memory.
 * **Thumbnail** — the event's 320 px JPEG from the index.
 
 Why signatures rather than Home Assistant auth: a media player fetches segments itself and
@@ -28,7 +28,6 @@ response says `nosniff` and `sandbox`; playlists and cloud reads have size limit
 
 from __future__ import annotations
 
-import asyncio
 from collections import OrderedDict
 from collections.abc import Callable
 import hashlib
@@ -66,11 +65,10 @@ PLAY_URL_LIFETIME = 3600
 # A signed thumbnail URL is itself the capability, so the picture may be cached privately.
 THUMBNAIL_CACHE = "private, max-age=3600"
 MAX_PLAYLIST_BYTES = 1024 * 1024
-# A committed video is read whole to serve its ranges (about 70 MB an hour), and the last few
-# are kept: a player asks for each segment's range in turn.
+# A committed video (about 70 MB an hour) is never read whole: each range a player asks for
+# is read from the destination as that range, at most this much at a time.
 VIDEO_NAME = "video.mp4"
-MAX_VIDEO_BYTES = 512 * 1024 * 1024
-VIDEO_CACHE = 2
+VIDEO_CHUNK = 4 * 1024 * 1024
 # Seconds of recording either side of an event, for in-place playback.
 PLAYBACK_LEAD = 5.0
 PLAYBACK_TAIL = 5.0
@@ -373,37 +371,6 @@ async def _async_cloud_playlist(
     return None
 
 
-class _Videos:
-    """The last few committed videos read, so each range of one is not a download of it."""
-
-    def __init__(self, size: int = VIDEO_CACHE) -> None:
-        self._items: OrderedDict[tuple[str, str, int], asyncio.Future[bytes]] = OrderedDict()
-        self._size = size
-
-    async def get(self, subentry: str, destination: Destination, path: str, size: int) -> bytes:
-        key = (subentry, path, size)
-        future = self._items.get(key)
-        if future is None:
-            future = asyncio.get_running_loop().create_future()
-            self._items[key] = future
-            while len(self._items) > self._size:
-                self._items.popitem(last=False)
-            try:
-                body = await destination.async_read(path)
-            except BaseException as err:
-                self._items.pop(key, None)
-                future.set_exception(err)
-                future.exception()  # retrieved: a waiter may not exist
-                raise
-            future.set_result(body[:size])
-        else:
-            self._items.move_to_end(key)
-        return await asyncio.shield(future)
-
-
-_VIDEOS = _Videos()
-
-
 def _byte_range(header: str | None, size: int) -> tuple[int, int] | None:
     """Return `(start, end)` (inclusive) of a single `bytes=` range, or None to send it all.
 
@@ -581,30 +548,53 @@ class CloudView(HomeAssistantView):
             return _response(404)
         target = data.manager.uploader.targets.get(subentry)
         copy = (await _LOOKUPS.get(data, event_id)).get(subentry)
-        if target is None or copy is None or not copy.playable or copy.video is None:
+        if target is None or copy is None or not copy.playable:
             return _response(404)
         size = copy.video_size
-        if size > MAX_VIDEO_BYTES:
-            return _response(502)
-        try:
-            body = await _VIDEOS.get(subentry, target.destination, copy.video, size)
-        except DestinationError:
-            return _response(502)
-        if len(body) != size:
-            return _response(502)
-        headers = {**SECURITY_HEADERS, "Accept-Ranges": "bytes"}
+        headers = {**SECURITY_HEADERS, "Accept-Ranges": "bytes", "Content-Type": "video/mp4"}
         span = _byte_range(request.headers.get("Range"), size)
         if span is None:
-            return web.Response(body=body, content_type="video/mp4", headers=headers)
-        start, end = span
-        if start >= size:
-            return web.Response(status=416, headers={**headers, "Content-Range": f"bytes */{size}"})
-        return web.Response(
-            status=206,
-            body=body[start : end + 1],
-            content_type="video/mp4",
-            headers={**headers, "Content-Range": f"bytes {start}-{end}/{size}"},
-        )
+            start, end, status = 0, size - 1, 200
+        else:
+            start, end = span
+            if start >= size:
+                return web.Response(
+                    status=416, headers={**headers, "Content-Range": f"bytes */{size}"}
+                )
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        destination, path = target.destination, str(copy.video)  # playable: not None
+        # The first chunk is read before anything is sent, so a destination that fails
+        # outright is a clean 502 rather than a cut response.
+        try:
+            first = await _async_chunk(destination, path, start, end)
+        except DestinationError:
+            return _response(502)
+        out = web.StreamResponse(status=status, headers=headers)
+        out.content_length = end - start + 1
+        await out.prepare(request)
+        try:
+            await out.write(first)
+            offset = start + len(first)
+            while offset <= end:
+                chunk = await _async_chunk(destination, path, offset, end)
+                await out.write(chunk)
+                offset += len(chunk)
+            await out.write_eof()
+        except (DestinationError, ConnectionResetError):
+            # Headers are out already: a cut body must not end as a complete response.
+            if request.transport is not None:
+                request.transport.abort()
+        return out
+
+
+async def _async_chunk(destination: Destination, path: str, start: int, end: int) -> memoryview:
+    """Read the next `VIDEO_CHUNK` at most of `start..end` (inclusive), exactly as asked."""
+    last = min(end, start + VIDEO_CHUNK - 1)
+    body = memoryview(await destination.async_read_range(path, start, last))
+    if len(body) != last - start + 1:
+        raise DestinationError(f"{path}: {len(body)} bytes for {start}-{last}")
+    return body
 
 
 class ThumbnailView(HomeAssistantView):

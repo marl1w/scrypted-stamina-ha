@@ -177,3 +177,12 @@ class Destination(ABC):
 
     async def async_close(self) -> None:  # noqa: B027 - deliberately optional
         """Let go of anything held open. Called when the integration unloads."""
+
+    async def async_read_range(self, path: str, start: int, end: int) -> bytes:
+        """Return bytes `start..end` (inclusive) of one file, to play it by range.
+
+        The default reads the file and slices it, which every provider can do; the ones that
+        can ask for a range (or stream and stop) override it, so playback never fetches a
+        whole video for one segment.
+        """
+        return bytes(memoryview(await self.async_read(path))[start : end + 1])

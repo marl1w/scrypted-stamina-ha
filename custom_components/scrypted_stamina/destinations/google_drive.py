@@ -250,3 +250,19 @@ class GoogleDriveDestination(OAuthDestination):
         if folder_id is None:
             return
         await self._async_request("DELETE", f"{DRIVE}/files/{folder_id}", allow_missing=True)
+
+    async def async_read_range(self, path: str, start: int, end: int) -> bytes:
+        """Return bytes `start..end` (inclusive) of one file, with a `Range` request."""
+        folder, name = self._split(path)
+        file_id = await self._async_file_id(folder, name, create=False)
+        if file_id is None:
+            raise DestinationError(f"Google Drive has no {path}")
+        data = await self._async_request(
+            "GET",
+            f"{DRIVE}/files/{file_id}",
+            params={"alt": "media"},
+            headers={"Range": f"bytes={start}-{end}"},
+        )
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        return json.dumps(data).encode()

@@ -232,3 +232,20 @@ class SftpDestination(Destination):
             await self._async_call(f"removal of {remote}", sftp.rmtree(remote))
 
         await async_attempt(f"SFTP folder delete of {folder}", attempt)
+
+    async def async_read_range(self, path: str, start: int, end: int) -> bytes:
+        """Return bytes `start..end` (inclusive) of one file, read at that offset."""
+        remote = self._remote(path)
+
+        async def attempt() -> bytes:
+            sftp = await self._async_sftp()
+            handle = await self._async_call(f"open of {remote}", sftp.open(remote, "rb"))
+            try:
+                return bytes(
+                    await self._async_call(f"read of {remote}", handle.read(end - start + 1, start))
+                )
+            finally:
+                with suppress(Exception):
+                    await handle.close()
+
+        return await async_attempt(f"SFTP read of {path}", attempt)

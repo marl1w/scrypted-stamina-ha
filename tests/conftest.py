@@ -470,6 +470,12 @@ class FakeDestination(Destination):
             raise DestinationError(f"no {path}")
         return self.files[path]
 
+    async def async_read_range(self, path: str, start: int, end: int) -> bytes:
+        self.ops.append(("read_range", path))
+        if path not in self.files:
+            raise DestinationError(f"no {path}")
+        return self.files[path][start : end + 1]
+
     async def async_delete_folder(self, folder: str) -> None:
         self.ops.append(("delete_folder", folder))
         for path in [p for p in self.files if p.startswith(f"{folder}/")]:
