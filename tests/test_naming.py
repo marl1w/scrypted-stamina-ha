@@ -18,6 +18,7 @@ from custom_components.scrypted_stamina.naming import (
     root_folder,
     safe_part,
     segment_name,
+    video_part_path,
 )
 
 
@@ -87,13 +88,19 @@ async def test_area_comes_from_the_camera_device(hass) -> None:
 
 def test_a_committed_event_is_one_video_named_area_camera_time() -> None:
     when = dt.datetime(2026, 10, 31, 21, 13, 49)
-    event = "ev_q2Jx8sK4mZb1VtR6yN0aLw"
-    folder = event_folder_name(when, "Front Door", event)
-    assert event_file_name("front-garden", folder, event) == (
-        "front-garden-front-door-261031_211349.mp4"
+    name = event_file_name(when, "front-garden", "Front Door")
+    assert name == "front-garden-front-door-261031_211349.mp4"
+    assert event_file_path("scrypted-stamina", "events", name) == (
+        "scrypted-stamina/events/front-garden-front-door-261031_211349.mp4"
     )
-    assert event_file_path("scrypted-stamina", "events", "no-area", folder, event) == (
-        "scrypted-stamina/events/no-area-front-door-261031_211349.mp4"
+    # Whatever the pieces, a name never reaches outside its folder.
+    assert event_file_name(when, "../odd", "a/b") == "odd-a-b-261031_211349.mp4"
+    assert "/" not in event_file_path("x", "events", "../../etc").removeprefix("x/events/")
+
+
+def test_what_a_video_receives_later_is_a_file_of_its_own() -> None:
+    video = "scrypted-stamina/events/garden-front-door-261031_211349.mp4"
+    assert video_part_path(video, 1) == video
+    assert video_part_path(video, 2) == (
+        "scrypted-stamina/events/garden-front-door-261031_211349-part2.mp4"
     )
-    # A folder not of this shape still names a video, never a path outside its folder.
-    assert event_file_name("garden", "../odd", event) == "garden-odd.mp4"

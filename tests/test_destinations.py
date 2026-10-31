@@ -18,7 +18,7 @@ from custom_components.scrypted_stamina.destinations import (
     async_create_destination,
     onedrive,
 )
-from custom_components.scrypted_stamina.destinations.base import content_type
+from custom_components.scrypted_stamina.destinations.base import content_type, streamed
 
 from .conftest import FakeDestination
 
@@ -55,7 +55,7 @@ def test_content_types() -> None:
 
 async def test_a_video_is_stored_and_its_size_confirmed() -> None:
     fake = FakeDestination()
-    await fake.async_store_video(VIDEO, b"video")
+    await fake.async_store_video(VIDEO, 5, streamed(b"video"))
     assert fake.files[VIDEO] == b"video"
 
     class Lossy(FakeDestination):
@@ -63,7 +63,7 @@ async def test_a_video_is_stored_and_its_size_confirmed() -> None:
             await super().async_store(path, data[:2])
 
     with pytest.raises(DestinationError, match="2 bytes"):
-        await Lossy().async_store_video(VIDEO, b"video")
+        await Lossy().async_store_video(VIDEO, 5, streamed(b"video"))
 
 
 async def test_webdav_deletes_a_folder_with_one_request() -> None:
@@ -108,7 +108,7 @@ async def test_onedrive_stores_a_small_video_in_one_request_and_asks_its_size() 
         return {"size": 5}
 
     destination._async_request = request
-    await destination.async_store_video(VIDEO, b"video")
+    await destination.async_store_video(VIDEO, 5, streamed(b"video"))
     assert [c[0] for c in calls] == ["PUT", "GET"]
     assert calls[0][1].endswith(f"{VIDEO}:/content")
     assert calls[1][2]["params"] == {"$select": "size"}

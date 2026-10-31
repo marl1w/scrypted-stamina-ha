@@ -1,8 +1,9 @@
 """The playlist a committed event's video plays through.
 
 HLS with fMP4 segments (RFC 8216 §4.3.2.5 `EXT-X-MAP`), every init and segment a byte range
-(`EXT-X-BYTERANGE`, §4.3.2.2) of the one video file, so a player starts on the first segment
-instead of downloading the whole event, in Safari, VLC, hls.js and Home Assistant's player.
+(`EXT-X-BYTERANGE`, §4.3.2.2) of the video's files (one, or more once it grew), so a player
+starts on the first segment instead of downloading the whole event, in Safari, VLC, hls.js
+and Home Assistant's player.
 
 Only segments the destination actually holds are listed. One that never arrived (expired
 in the plugin, refused by the destination) is left out and the next one is preceded by
@@ -26,7 +27,7 @@ def playlist(
     durations: Mapping[int, float] | None = None,
     discontinuities: Iterable[int] = (),
     init_of: Mapping[int, int] | None = None,
-    ranges: Mapping[str, Sequence[int]] | None = None,
+    ranges: Mapping[str, Sequence[int | str]] | None = None,
     uri: str | None = None,
 ) -> str:
     """Return a VOD playlist over the given segment numbers, in order.
@@ -36,8 +37,9 @@ def playlist(
     init a segment needs where it is not `init.mp4` (`init-<k>.mp4`), and a new
     `EXT-X-MAP` goes before the first segment that needs a different one.
 
-    With `ranges` (file name to `[offset, length]`) and `uri`, every file is that range of
-    `uri` rather than a file of its own.
+    With `ranges` (file name to `[offset, length]`, or `[offset, length, uri]` for a video
+    of several files) and `uri`, every file is that range of `uri` rather than a file of
+    its own.
     """
     init_of = init_of or {}
     breaks = set(discontinuities)
@@ -63,16 +65,18 @@ def playlist(
         if needed != current_init:
             name = "init.mp4" if needed == 0 else f"init-{needed}.mp4"
             if ranges is not None and uri is not None:
-                offset, length = ranges[name]
-                lines.append(f'#EXT-X-MAP:URI="{uri}",BYTERANGE="{length}@{offset}"')
+                offset, length, *at = ranges[name]
+                lines.append(
+                    f'#EXT-X-MAP:URI="{at[0] if at else uri}",BYTERANGE="{length}@{offset}"'
+                )
             else:
                 lines.append(f'#EXT-X-MAP:URI="{name}"')
             current_init = needed
         lines.append(f"#EXTINF:{lengths[number]:.3f},")
         if ranges is not None and uri is not None:
-            offset, length = ranges[segment_name(number)]
+            offset, length, *at = ranges[segment_name(number)]
             lines.append(f"#EXT-X-BYTERANGE:{length}@{offset}")
-            lines.append(uri)
+            lines.append(str(at[0] if at else uri))
         else:
             lines.append(segment_name(number))
         previous = number

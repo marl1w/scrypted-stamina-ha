@@ -11,13 +11,14 @@ cannot see, list or delete a single file the user put in their own Drive.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterable
 import json
 import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .base import DestinationError, UploadTooLargeError, content_type
+from .base import STREAM_CHUNK, DestinationError, content_type, gather, rechunk, streamed
 from .oauth import OAuthDestination
 
 _LOGGER = logging.getLogger(__name__)
@@ -27,10 +28,10 @@ UPLOAD = "https://www.googleapis.com/upload/drive/v3"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
-# A simple (non-resumable) upload is documented up to 5 MB, but the endpoint accepts more.
-# Segments are a few dozen kilobytes and a committed video about 70 MB an hour, so only an
-# event of well over an hour meets this, and is refused with a clear error.
-SIMPLE_UPLOAD_LIMIT = 100 * 1024 * 1024
+# A simple upload is documented up to 5 MB. Segments are a few dozen kilobytes; a committed
+# video (about 70 MB an hour) past this goes up through a resumable session, in chunks of
+# `STREAM_CHUNK` (Drive wants multiples of 256 KiB).
+SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024
 
 _JSON = {"Content-Type": "application/json"}
 
@@ -43,6 +44,15 @@ def _quoted(value: str) -> str:
     """
     escaped = value.replace("\\", "\\\\").replace("'", "\\'")
     return f"'{escaped}'"
+
+
+def _confirm(item: object, path: str, size: int) -> None:
+    """Check Drive's answer to an upload: the file it stored, and its length."""
+    if not isinstance(item, dict) or not item.get("id"):
+        raise DestinationError(f"Google Drive did not confirm storing {path}")
+    stored = item.get("size")
+    if stored is not None and int(stored) != size:
+        raise DestinationError(f"Google Drive stored {stored} bytes of {path}, not the {size} sent")
 
 
 class GoogleDriveDestination(OAuthDestination):
@@ -151,17 +161,9 @@ class GoogleDriveDestination(OAuthDestination):
         never reclaims.
         """
         if len(data) > SIMPLE_UPLOAD_LIMIT:
-            raise UploadTooLargeError(
-                f"{len(data)} bytes exceeds the {SIMPLE_UPLOAD_LIMIT} byte single-request limit"
-            )
-        folder, name = self._split(path)
-        file_id = await self._async_file_id(folder, name, create=True)
-        if file_id is None:
-            parent = await self._async_folder_id(folder)
-            file_id = await self._async_create(
-                str(parent), {"name": name, "parents": [parent], "mimeType": content_type(path)}
-            )
-
+            await self.async_store_stream(path, len(data), streamed(data))
+            return
+        file_id = await self._async_target(path)
         item = await self._async_request(
             "PATCH",
             f"{UPLOAD}/files/{file_id}",
@@ -169,14 +171,61 @@ class GoogleDriveDestination(OAuthDestination):
             data=data,
             headers={"Content-Type": content_type(path)},
         )
-        if not isinstance(item, dict) or not item.get("id"):
-            raise DestinationError(f"Google Drive did not confirm storing {path}")
-        stored = item.get("size")
-        if stored is not None and int(stored) != len(data):
-            raise DestinationError(
-                f"Google Drive stored {stored} bytes of {path}, not the {len(data)} sent"
-            )
+        _confirm(item, path, len(data))
         _LOGGER.debug("Uploaded %s (%s bytes) to %s", path, len(data), self.label)
+
+    async def _async_target(self, path: str) -> str:
+        """Return the id of the file at `path`, creating it (empty) when it is not there."""
+        folder, name = self._split(path)
+        file_id = await self._async_file_id(folder, name, create=True)
+        if file_id is None:
+            parent = await self._async_folder_id(folder)
+            file_id = await self._async_create(
+                str(parent), {"name": name, "parents": [parent], "mimeType": content_type(path)}
+            )
+        return file_id
+
+    async def async_store_stream(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
+        """Upload one file from a stream: one request when small, else a resumable session.
+
+        The session replaces the content of a file created first (as `async_store` does), so
+        a retried commit never leaves a twin. One chunk is held in memory at a time; each is
+        retried on its own, and Drive answers the last with the file.
+        """
+        if size <= SIMPLE_UPLOAD_LIMIT:
+            await self.async_store(path, await gather(chunks, size))
+            return
+        file_id = await self._async_target(path)
+        session = await self._async_request(
+            "PATCH",
+            f"{UPLOAD}/files/{file_id}",
+            params={"uploadType": "resumable", "fields": "id,size"},
+            headers={
+                **_JSON,
+                "X-Upload-Content-Type": content_type(path),
+                "X-Upload-Content-Length": str(size),
+            },
+            data="{}",
+            location=True,
+        )
+        if not session:
+            raise DestinationError(f"Google Drive did not open an upload session for {path}")
+        item: object = None
+        start = 0
+        async for chunk in rechunk(chunks, STREAM_CHUNK):
+            if start + len(chunk) > size:
+                raise DestinationError(f"the stream for {path} is longer than {size} bytes")
+            item = await self._async_request(
+                "PUT",
+                str(session),
+                data=chunk,
+                headers={"Content-Range": f"bytes {start}-{start + len(chunk) - 1}/{size}"},
+            )
+            start += len(chunk)
+        if start != size:
+            raise DestinationError(f"the stream for {path} gave {start} of {size} bytes")
+        _confirm(item, path, size)
+        _LOGGER.debug("Uploaded %s (%s bytes) to %s in a session", path, size, self.label)
 
     async def async_size(self, path: str) -> int | None:
         """Return one file's size, asking for that file alone."""

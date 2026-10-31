@@ -151,7 +151,7 @@ from .protocol import (
     ProtocolError,
 )
 from .relevance import Analysis
-from .uploader import Uploader
+from .uploader import Uploader, video_file_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -535,8 +535,9 @@ class StaminaManager:
     async def _async_reopen_orphan(self, event_id: str) -> EventRecord | None:
         """Take back an orphan that was committed, because more of it has arrived.
 
-        Its upload resumes into the folder it was committed to, and it is committed again
-        (rewriting `index.m3u8`) once the plugin says there is nothing more.
+        Its upload resumes into its pending folder, and it is committed again once the plugin
+        says there is nothing more: what arrived since goes into a file of its own
+        (`-part2.mp4`, …), so the video already committed is never rewritten.
         """
         record = await self.index.async_get(event_id)
         if record is None or record.state is not EventState.ORPHANED:
@@ -604,6 +605,7 @@ class StaminaManager:
             area_key=area_key(device),
             camera_name=device.name,
             folder=event_folder_name(local, device.name, facts.id),
+            file_name=event_file_name(local, device.area_slug, device.name),
         )
         if note:
             record.note(note)
@@ -1173,6 +1175,8 @@ class StaminaManager:
         for record in await self.index.async_unfinished():
             self.records[record.id] = record
         actions = await self.index.async_actions()
+        # The spool holds segments for commits to come: only these events can still have one.
+        await self.uploader.async_clean_spool({*self.records, *(eid for eid, _ in actions)})
 
         for record in list(self.records.values()):
             try:
@@ -1434,13 +1438,14 @@ class StaminaManager:
     def cloud_path(self, record: EventRecord) -> str | None:
         """Return the event's path inside each destination's folder, for attributes.
 
-        A settled event is its video; one still uploading is its pending folder.
+        A settled event is its video (as committed, `-2` and all); one still uploading is its
+        pending folder.
         """
         if record.state is EventState.DROPPED or not record.folder:
             return None
         if record.state is EventState.COMMITTED or ORPHAN_COMPLETE in record.notes:
             kind = record.target or FOLDER_EVENTS
-            return f"{kind}/{event_file_name(record.area, record.folder, record.id)}"
+            return record.video_path or f"{kind}/{video_file_name(record)}"
         return f"pending/{record.area}/{record.folder}"
 
     def attributes(self, record: EventRecord) -> dict[str, Any]:

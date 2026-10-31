@@ -15,7 +15,7 @@ server Home Assistant has already proved it can write to.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import AsyncIterable, Awaitable
 from contextlib import suppress
 from importlib import import_module
 import logging
@@ -172,6 +172,38 @@ class SftpDestination(Destination):
 
         await async_attempt(f"SFTP write of {path}", attempt)
         _LOGGER.debug("Uploaded %s (%s bytes) to %s", path, len(data), self.label)
+
+    async def async_store_stream(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
+        """Write one file chunk by chunk, and confirm its size from the server.
+
+        One attempt: a stream cannot be replayed, so the commit retries the whole file.
+        """
+        remote = self._remote(path)
+        folder, _, _ = remote.rpartition("/")
+
+        async def attempt() -> None:
+            sftp = await self._async_sftp()
+            if folder:
+                await self._async_call(
+                    f"creation of {folder}", sftp.makedirs(folder, exist_ok=True)
+                )
+            handle = await self._async_call(f"open of {remote}", sftp.open(remote, "wb"))
+            written = 0
+            try:
+                async for chunk in chunks:
+                    await self._async_call(f"write of {remote}", handle.write(chunk, written))
+                    written += len(chunk)
+            finally:
+                with suppress(Exception):
+                    await handle.close()
+            attrs = await self._async_call(f"check of {remote}", sftp.stat(remote))
+            if written != size or (attrs.size is not None and int(attrs.size) != size):
+                raise DestinationError(
+                    f"SFTP stored {attrs.size} bytes of {path} ({written} streamed), not {size}"
+                )
+
+        await async_attempt(f"SFTP write of {path}", attempt, attempts=1)
+        _LOGGER.debug("Uploaded %s (%s bytes) to %s, streamed", path, size, self.label)
 
     async def async_delete(self, path: str) -> None:
         """Remove one file, treating an already-missing file as success."""

@@ -28,30 +28,42 @@ The pump runs while the event is PENDING, KEEPING, FOLLOW_UP — or ORPHANED: an
 be closed and a plugin unreachable for the segment TTL, nothing more can be had and it ends;
 for an event not known closed, it never ends on silence alone.
 
-Commit turns the pending folder into one video, `<kind>/<area>-<camera>-<YYMMDD_HHMMSS>.mp4`:
-the files the folder holds — listed, so one the index does not know about is not deleted
-unjoined — are read back and joined in play order (init, then segments: a fragmented MP4,
-no re-encoding), stored, its size confirmed, recorded in the index with where each file lies
-in it, and only then is the pending folder deleted. The plugin no longer holds the segments
-by then (they are acked as each destination confirms them), so the destination's own copy is
-the source. It is idempotent: a file already joined is not joined again, and a video stored
-before a crash is read back only up to the length the index recorded. An orphan that
-receives more after its commit uploads them into the pending folder again, and its next
-commit appends them to the video. Drop deletes the pending folder; the uploader never
-deletes `pending/` on its own initiative, only for an event the manager hands it in DROPPING.
+Every segment fetched is also written to the box's **spool** (`spool.py`), and commit turns
+the pending folder into one video, `<kind>/<area>-<camera>-<YYMMDD_HHMMSS>.mp4`, streamed
+from there in play order (init, then segments: a fragmented MP4, no re-encoding) — never
+read back from the destination, never held whole in memory. Only a segment the spool lost
+is read back, one at a time. A file joins only when its size is the one the index recorded;
+one the index does not know (listed in the folder) joins with a warning, so it is not
+deleted unjoined. Per destination:
+
+1. the name is chosen and reserved in the index (`copy.video`), under the destination's
+   commit lock — the only step that holds it;
+2. the video is uploaded and its size confirmed;
+3. where each file lies in it is recorded (under the lock again, refused if an eviction
+   deleted the copy meanwhile, and the upload then removed); then the pending folder goes.
+
+A crash at any point repeats only step 2 for the file not yet recorded: a file already
+recorded is never written again. An orphan that receives more after its commit uploads them
+into the pending folder again, and its next commit puts them into a file of their own
+(`-part2.mp4`, `-part3.mp4`, …) — the playlist spans the files. Each destination commits on
+its own: one failing does not hold back the others, and a file it can never take
+(`UploadTooLargeError`) is recorded on the copy and not retried. Drop deletes the pending
+folder; the uploader never deletes `pending/` on its own initiative, only for an event the
+manager hands it in DROPPING.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 import logging
 import time
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .api import (
     SegmentExpiredError,
@@ -69,13 +81,14 @@ from .const import (
     SEGMENT_TTL_SECONDS,
 )
 from .decider import EventRecord, EventState
-from .destinations import Destination, DestinationError
-from .destinations.base import attempts_limited
+from .destinations import Destination, DestinationError, UploadTooLargeError
+from .destinations.base import STREAM_CHUNK, attempts_limited
 from .hls import playlist
-from .index import Copy, EventIndex
-from .naming import event_file_path, event_path, segment_name
+from .index import Copy, EventIndex, span
+from .naming import event_file_name, event_file_path, event_path, root_folder, segment_name
 from .quota import DestinationUsage
 from .redact import scrub_credentials
+from .spool import Spool
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -130,7 +143,8 @@ class Target:
     over_quota: bool = False
     slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(2))
     evicting: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # One commit at a time: choosing a free video name and recording it is one step.
+    # Held to reserve a video's name, to record what a commit stored, and to evict: never
+    # for an upload. So two commits never pick one name, and an eviction never races one.
     committing: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -166,6 +180,11 @@ class Target:
         """Record one failed operation."""
         self.last_error = scrub_credentials(str(err))
         self.errors += 1
+
+    def refused(self, err: Exception) -> None:
+        """Record a failure that will not go away by retrying: health reads `failing`."""
+        self.last_error = scrub_credentials(str(err))
+        self.errors = max(self.errors + 1, HEALTH_FAILURES)
 
     def failed(self, err: Exception, admission: str | None, now: float) -> bool:
         """Record a failure; return whether it counted (breaker closed, or the probe)."""
@@ -300,12 +319,41 @@ def play_order(record: EventRecord, names: list[str]) -> list[str]:
     return [name for key, name in sorted(keyed, key=lambda item: position(item[0]))]
 
 
-def video_playlist(record: EventRecord, copy: Copy, uri: str) -> str:
-    """Return a playlist over a committed video: each segment a byte range of `uri`.
+def video_file_name(record: EventRecord) -> str:
+    """Return an event's video file name, as chosen when it started.
 
-    Only segments joined into the video *with their init* are listed, so a player is never
-    sent to a range that does not decode.
+    A record from before the name was stored gets it from the same facts (start, area,
+    camera), never parsed back out of its folder name.
     """
+    if record.file_name:
+        return record.file_name
+    started = dt_util.as_local(dt_util.utc_from_timestamp(record.facts.started))
+    return event_file_name(started, record.area, record.camera_name or record.camera)
+
+
+def cloud_name(part: int) -> str:
+    """Return the name playback serves one file of a committed video under."""
+    return "video.mp4" if part <= 1 else f"video-part{part}.mp4"
+
+
+def cloud_part(name: str) -> int | None:
+    """Return the part a name from `cloud_name` stands for, or None for any other name."""
+    if name == "video.mp4":
+        return 1
+    number = name.removeprefix("video-part").removesuffix(".mp4")
+    if name.startswith("video-part") and number.isdigit() and int(number) >= 2:
+        return int(number)
+    return None
+
+
+def video_playlist(record: EventRecord, copy: Copy, uri: str | Callable[[int], str]) -> str:
+    """Return a playlist over a committed video: each segment a byte range of its file.
+
+    `uri` is the one file's URL, or gives the URL of each part. Only segments joined into
+    the video *with their init* are listed, so a player is never sent to a range that does
+    not decode.
+    """
+    where = uri if callable(uri) else (lambda part: uri)
     init_of = record.facts.init_of
     held = sorted(
         number
@@ -318,8 +366,11 @@ def video_playlist(record: EventRecord, copy: Copy, uri: str) -> str:
         durations=record.facts.durations,
         discontinuities=record.facts.discontinuities,
         init_of=init_of,
-        ranges=copy.ranges,
-        uri=uri,
+        ranges={
+            name: (offset, length, where(part))
+            for name, (offset, length, part) in ((n, span(v)) for n, v in copy.ranges.items())
+        },
+        uri=where(1),
     )
 
 
@@ -352,6 +403,7 @@ class Uploader:
         self._on_over_quota = on_over_quota or (lambda target, over: None)
         self._before_release_hook = before_release
         self._pumps: dict[str, Pump] = {}
+        self.spool = Spool(hass)
         self._sizes: deque[int] = deque(maxlen=50)
         self.capacity = "not yet measured"
         self.enabled = True
@@ -563,6 +615,7 @@ class Uploader:
                 if data is not None:
                     pump.ring[key] = data
                     self._sizes.append(len(data))
+                    await self.spool.async_write(record.id, _name(key), data)
                 self._trim(pump)
                 pump.poke()
         except asyncio.CancelledError:
@@ -684,6 +737,7 @@ class Uploader:
                 await asyncio.sleep(_FETCH_BACKOFF[0])
             return None
         pump.last_heard = self.monotonic()
+        await self.spool.async_write(pump.record.id, _name(key), data)
         return data
 
     async def _async_lane_failed(self, pump: Pump, lane: Lane, key: int) -> None:
@@ -840,15 +894,21 @@ class Uploader:
                     return
 
     async def _async_evict(self, target: Target, event_id: str) -> None:
-        """Delete one event's video, and any pending folder, from one destination."""
-        copies = await self._index.async_copies(event_id)
-        copy = copies.get(target.subentry_id)
-        if copy is not None and not copy.deleted:
-            if copy.video is not None:
-                await target.destination.async_delete(copy.video)
-            await target.destination.async_delete_folder(copy.folder)
-            copy.deleted = True
-            await self._index.async_save_copy(event_id, target.subentry_id, copy)
+        """Delete one event's video, and any pending folder, from one destination.
+
+        Under the commit lock, with the copy read afresh: a commit of the same event either
+        recorded its file before (and it is deleted here) or finds the copy deleted after
+        (and removes its upload itself) — never a file left behind or a copy brought back.
+        """
+        async with target.committing:
+            copy = (await self._index.async_copies(event_id)).get(target.subentry_id)
+            if copy is not None and not copy.deleted:
+                for part in sorted({1, *copy.parts}):
+                    if (path := copy.part_path(part)) is not None:
+                        await target.destination.async_delete(path)
+                await target.destination.async_delete_folder(copy.folder)
+                copy.deleted = True
+                await self._index.async_save_copy(event_id, target.subentry_id, copy)
         target.usage.remove(event_id)
         self._on_quota()
         _LOGGER.debug("Evicted %s from %s", event_id, target.label)
@@ -881,6 +941,11 @@ class Uploader:
                     await self._async_evict(target, held.event_id)
                 except DestinationError as err:
                     target.error(err)
+        await self.spool.async_clean()
+
+    async def async_clean_spool(self, keep: set[str]) -> None:
+        """Remove the spool of every event but those in `keep` (the ones still unfinished)."""
+        await self.spool.async_clean(keep)
 
     # ------------------------------------------------------------------ acks
 
@@ -937,118 +1002,195 @@ class Uploader:
         ]
 
     async def async_commit(self, record: EventRecord) -> None:
-        """Join each destination's pending folder into the event's video, then delete it.
+        """Commit each destination's pending folder into the event's video, then delete it.
 
-        A copy already committed (an orphan that received more segments after its first
-        commit) has what arrived since appended to its video.
+        Each destination on its own: the failures are collected and raised together at the
+        end, so one destination that is down does not keep the event from the others. One
+        that can never take the video is recorded on its copy and not tried again. A copy
+        already committed (an orphan that received more after its first commit) gets what
+        arrived since as a file of its own.
         """
         await self.async_halt(record.id)
         copies = await self._async_copies(record)
-        kind = record.target or FOLDER_EVENTS
+        failures: list[str] = []
         for subentry_id, copy in copies.items():
             target = self.targets.get(subentry_id)
-            if target is None or copy.deleted:
-                continue
-            if not copy.files:
-                # Nothing reached this destination: no video to make.
-                copy.committed = True
-                await self._index.async_save_copy_header(record.id, subentry_id, copy)
+            if target is None or copy.deleted or copy.refused:
                 continue
             try:
-                async with target.committing:
-                    path = await self._async_video_path(
-                        subentry_id,
-                        record,
-                        copy,
-                        event_file_path(target.folder, kind, record.area, record.folder, record.id),
-                    )
-                    await self._async_commit_copy(
-                        target.destination, record, subentry_id, copy, path
-                    )
+                await self._async_commit_copy(target, record, copy)
+            except UploadTooLargeError as err:
+                target.refused(err)
+                copy.refused = target.last_error
+                await self._index.async_save_copy_header(record.id, subentry_id, copy)
+                _LOGGER.error(
+                    "%s cannot take the video of %s, so its segments stay in the pending "
+                    "folder: %s",
+                    target.label,
+                    record.id,
+                    target.last_error,
+                )
+                continue
             except DestinationError as err:
                 target.error(err)
+                failures.append(f"{target.label}: {target.last_error}")
                 _LOGGER.warning(
                     "%s could not commit %s: %s", target.label, record.id, target.last_error
                 )
-                raise
+                continue
             target.errors = 0
             target.usage.set(record.id, record.facts.started, record.state, copy.size)
-        record.latency["committed"] = time.time()
+            if not record.video_path and copy.playable and copy.video is not None:
+                record.video_path = copy.video.removeprefix(f"{root_folder(target.folder)}/")
         self._on_quota()
+        if failures:
+            raise DestinationError("; ".join(failures))
+        await self.spool.async_discard(record.id)
+        record.latency["committed"] = time.time()
 
-    async def _async_video_path(
-        self, subentry_id: str, record: EventRecord, copy: Copy, path: str
-    ) -> str:
-        """Return the path for an event's video: `path`, or `-2`, `-3`… if another has it.
+    async def _async_video_path(self, target: Target, record: EventRecord) -> str:
+        """Return a free path for an event's video: its name, or `-2`, `-3`… if taken.
 
         Two events of one camera starting in the same second would otherwise share a name,
-        and the second commit would overwrite the first's footage. The index decides, so a
-        commit repeated after a crash picks the same path again; a copy keeps the path it
-        was committed to.
+        and the second commit would overwrite the first's footage. The index decides; the
+        caller holds the commit lock and reserves the path before releasing it.
         """
+        kind = record.target or FOLDER_EVENTS
+        path = event_file_path(target.folder, kind, video_file_name(record))
         stem = path.removesuffix(".mp4")
-        candidates = [path, *(f"{stem}-{n}.mp4" for n in range(2, 100))]
-        if copy.video in candidates:
-            return copy.video
-        for candidate in candidates:
-            if not await self._index.async_video_taken(subentry_id, candidate, record.id):
+        for candidate in [path, *(f"{stem}-{n}.mp4" for n in range(2, 100))]:
+            if not await self._index.async_video_taken(target.subentry_id, candidate, record.id):
                 return candidate
         raise DestinationError(f"no free name for the video of {record.id} at {path}")
 
-    async def _async_commit_copy(
-        self, destination: Destination, record: EventRecord, subentry_id: str, copy: Copy, path: str
-    ) -> None:
+    async def _async_commit_copy(self, target: Target, record: EventRecord, copy: Copy) -> None:
         """Commit one copy, safely repeatable after a crash at any point."""
+        destination, subentry_id = target.destination, target.subentry_id
+        if copy.video is None:
+            async with target.committing:
+                copy.video = await self._async_video_path(target, record)
+                if not await self._index.async_save_copy_header(record.id, subentry_id, copy):
+                    copy.deleted = True  # evicted meanwhile: nothing more to do here
+                    return
         prefix = f"{copy.folder}/"
-        held = {
-            source[len(prefix) :]: size
-            for source, size in (await destination.async_list(copy.folder)).items()
-            if source.startswith(prefix)
+        listed = {
+            path[len(prefix) :]: size
+            for path, size in (await destination.async_list(copy.folder)).items()
+            if path.startswith(prefix)
         }
-        new = [name for name in play_order(record, list(held)) if name not in copy.ranges]
-        if new or (copy.video is not None and copy.video != path):
-            ranges = {name: list(span) for name, span in copy.ranges.items()}
-            parts: list[bytes] = []
-            if copy.video is not None and ranges:
-                # Only as much as the index recorded: a store that crashed before being
-                # recorded may have left a longer file, whose tail is joined again below.
-                length = copy.video_size
-                parts.append((await destination.async_read(copy.video))[:length])
-                if len(parts[0]) != length:
-                    raise DestinationError(
-                        f"{destination.label} holds {len(parts[0])} bytes of {copy.video}, "
-                        f"not the {length} recorded"
-                    )
-            offset = sum(len(part) for part in parts)
-            for name in new:
-                data = await destination.async_read(f"{prefix}{name}")
-                ranges[name] = [offset, len(data)]
-                parts.append(data)
-                offset += len(data)
-                copy.files.setdefault(name, len(data))
-            await destination.async_store_video(path, b"".join(parts))
-            previous = copy.video
-            copy.video, copy.ranges, copy.committed = path, ranges, True
-            # Recorded before anything is deleted: the video is what holds the footage now.
-            await self._index.async_save_copy(record.id, subentry_id, copy)
-            if previous is not None and previous != path:
-                await destination.async_delete(previous)
+        sources = await self._async_sources(target, record, copy, listed)
+        if sources:
+            # A new file every time: what is recorded is never written again. A part
+            # uploaded but not recorded (a crash) is simply written again, under its name.
+            part = max(copy.parts, default=0) + 1
+            path = str(copy.part_path(part))
+            size = sum(length for _, length, _ in sources)
+            await destination.async_store_video(
+                path, size, self._async_chunks(target, record, copy, sources)
+            )
+            ranges = dict(copy.ranges)
+            offset = 0
+            for name, length, _ in sources:
+                ranges[name] = [offset, length, part]
+                offset += length
+                copy.files.setdefault(name, length)
+            async with target.committing:
+                copy.ranges, copy.committed = ranges, True
+                if not await self._index.async_save_copy(record.id, subentry_id, copy):
+                    # Evicted while uploading: the file was never recorded, so it goes too.
+                    copy.deleted = True
+                    await destination.async_delete(path)
+                    return
         elif not copy.committed:
             copy.committed = True
-            await self._index.async_save_copy(record.id, subentry_id, copy)
+            if not await self._index.async_save_copy_header(record.id, subentry_id, copy):
+                copy.deleted = True
+                return
         unjoined = [
-            name for name in copy.files if file_key(name) is not None and name not in copy.ranges
+            name
+            for name in copy.files
+            if (key := file_key(name)) is not None
+            and key not in copy.failed
+            and name not in copy.ranges
         ]
         if unjoined:
-            # Uploaded, yet not in the listing: never delete footage that was not joined.
+            # Uploaded, yet not joined: never delete footage that is in no video.
             _LOGGER.warning(
-                "%s did not list %s of %s; its pending folder is kept",
+                "%s: %s of %s not joined; its pending folder is kept",
                 destination.label,
                 ", ".join(sorted(unjoined)),
                 record.id,
             )
             return
         await destination.async_delete_folder(copy.folder)
+
+    async def _async_sources(
+        self, target: Target, record: EventRecord, copy: Copy, listed: dict[str, int]
+    ) -> list[tuple[str, int, bool]]:
+        """Return the files to join next, in play order: `(name, size, from the spool)`.
+
+        Only good files: one the index knows joins when the spool or the destination holds
+        it at exactly the size recorded; a segment this destination gave up on is left out;
+        one the index does not know (stored, but not recorded before a crash) joins at its
+        listed size, with a warning.
+        """
+        spooled = await self.spool.async_sizes(record.id)
+        sources: list[tuple[str, int, bool]] = []
+        for name in play_order(record, sorted({*copy.files, *listed})):
+            if name in copy.ranges or file_key(name) in copy.failed:
+                continue
+            expected = copy.files.get(name)
+            if expected is None:
+                _LOGGER.warning(
+                    "%s holds %s of %s, which the index does not know; joining it",
+                    target.label,
+                    name,
+                    record.id,
+                )
+                sources.append((name, listed[name], spooled.get(name) == listed[name]))
+            elif spooled.get(name) == expected:
+                sources.append((name, expected, True))
+            elif listed.get(name) == expected:
+                sources.append((name, expected, False))
+            elif name in listed or name in spooled:
+                _LOGGER.warning(
+                    "%s: %s of %s is %s bytes, not the %s uploaded; it is not joined",
+                    target.label,
+                    name,
+                    record.id,
+                    listed.get(name, spooled.get(name)),
+                    expected,
+                )
+        return sources
+
+    async def _async_chunks(
+        self,
+        target: Target,
+        record: EventRecord,
+        copy: Copy,
+        sources: list[tuple[str, int, bool]],
+    ) -> AsyncIterator[bytes]:
+        """Yield the files to join as one stream, `STREAM_CHUNK` at a time.
+
+        From the spool; a file it lost since is read back from the destination. Either way
+        one file and one chunk at most are in memory.
+        """
+        buffer = bytearray()
+        for name, size, local in sources:
+            data: bytes | None = None
+            if local:
+                with suppress(OSError):
+                    data = await self.spool.async_read(record.id, name)
+            if data is None or len(data) != size:
+                data = await target.destination.async_read(f"{copy.folder}/{name}")
+            if len(data) != size:
+                raise DestinationError(f"{name} of {record.id} is {len(data)} bytes, not {size}")
+            buffer += data
+            while len(buffer) >= STREAM_CHUNK:
+                yield bytes(buffer[:STREAM_CHUNK])
+                del buffer[:STREAM_CHUNK]
+        if buffer:
+            yield bytes(buffer)
 
     async def async_drop(self, record: EventRecord) -> None:
         """Delete an event's pending folder everywhere. Only for an event in DROPPING."""
@@ -1064,5 +1206,6 @@ class Uploader:
             copy.deleted = True
             target.usage.remove(record.id)
             await self._index.async_save_copy(record.id, subentry_id, copy)
+        await self.spool.async_discard(record.id)
         self._on_quota()
         await self.async_release(record)

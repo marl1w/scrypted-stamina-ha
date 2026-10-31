@@ -47,11 +47,12 @@ from homeassistant.core import HomeAssistant
 
 from .const import UPLOADS_CLASSES, UPLOADS_UNUSUAL
 from .decider import EventRecord, EventState
+from .naming import video_part_path
 from .protocol import EventFacts
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Columns added after the first schema, for databases created before them.
 _ADDED_COLUMNS = (
@@ -64,10 +65,15 @@ _ADDED_COLUMNS = (
     ("thin_kind", "TEXT"),
 )
 
+# The same for `copies`: the live video's path, so a commit asks whether a name is taken
+# through an index rather than by reading every copy's JSON. Filled from the JSON when added.
+_ADDED_COPY_COLUMNS = (("video", "TEXT"),)
+
 # Indexes on added columns: created after the columns exist, on old databases too.
 _ADDED_INDEXES = """
 CREATE INDEX IF NOT EXISTS events_fresh ON events (started) WHERE slim = 0;
 CREATE INDEX IF NOT EXISTS events_thin ON events (started, id) WHERE thin_kind IS NOT NULL;
+CREATE INDEX IF NOT EXISTS copies_video ON copies (destination, video);
 """
 
 _SCHEMA = """
@@ -100,6 +106,8 @@ CREATE TABLE IF NOT EXISTS copies (
     event_id TEXT NOT NULL,
     destination TEXT NOT NULL,
     copy TEXT NOT NULL,
+    -- The committed video's path while the copy is live (NULL once deleted): names taken.
+    video TEXT,
     PRIMARY KEY (event_id, destination)
 );
 CREATE TABLE IF NOT EXISTS files (
@@ -150,9 +158,14 @@ class Copy:
     deleted: bool = False
     # Segments this destination could not take (quota full, provider refused); -1 is init.
     failed: list[int] = field(default_factory=list)
-    # The committed video's path, and where each file joined into it lies: `[offset, length]`.
+    # The committed video's path, reserved before anything is uploaded, and where each file
+    # joined into it lies: `[offset, length, part]`. Part 1 is `video` itself; what arrives
+    # after a commit goes into part 2, 3, … (`part_path`), never into a file already written.
     video: str | None = None
     ranges: dict[str, list[int]] = field(default_factory=dict)
+    # Why this destination will never take the video (it is too large for it): the commit
+    # stops trying, and the pending folder stays.
+    refused: str | None = None
 
     @property
     def size(self) -> int:
@@ -160,9 +173,29 @@ class Copy:
         return 0 if self.deleted else sum(self.files.values())
 
     @property
+    def parts(self) -> list[int]:
+        """Return the committed video's files that hold something, by part number."""
+        return sorted({span(value)[2] for value in self.ranges.values()})
+
+    def part_path(self, part: int) -> str | None:
+        """Return the path of one file of the committed video."""
+        return None if self.video is None else video_part_path(self.video, part)
+
+    def part_size(self, part: int) -> int:
+        """Return the length of one file of the committed video, as recorded."""
+        return max(
+            (
+                offset + length
+                for offset, length, at in map(span, self.ranges.values())
+                if at == part
+            ),
+            default=0,
+        )
+
+    @property
     def video_size(self) -> int:
-        """Return the length of the committed video, as recorded."""
-        return max((offset + length for offset, length in self.ranges.values()), default=0)
+        """Return the length of the committed video's first file, as recorded."""
+        return self.part_size(1)
 
     @property
     def playable(self) -> bool:
@@ -178,12 +211,13 @@ class Copy:
             "failed": self.failed,
             "video": self.video,
             "ranges": self.ranges,
+            "refused": self.refused,
         }
 
     @classmethod
     def from_header(cls, data: dict[str, Any], files: dict[str, int]) -> Copy:
         """Read back what `header` wrote, with the file rows."""
-        video = data.get("video")
+        video, refused = data.get("video"), data.get("refused")
         return cls(
             folder=str(data["folder"]),
             files=files,
@@ -192,10 +226,16 @@ class Copy:
             failed=[int(n) for n in data.get("failed") or ()],
             video=str(video) if video else None,
             ranges={
-                str(name): [int(offset), int(length)]
-                for name, (offset, length) in (data.get("ranges") or {}).items()
+                str(name): list(span(value)) for name, value in (data.get("ranges") or {}).items()
             },
+            refused=str(refused) if refused else None,
         )
+
+
+def span(value: list[int] | tuple[int, ...]) -> tuple[int, int, int]:
+    """Return one range as `(offset, length, part)`; a range without a part is in part 1."""
+    offset, length, *part = value
+    return int(offset), int(length), int(part[0]) if part else 1
 
 
 _RECORD_FIELDS = (
@@ -206,6 +246,8 @@ _RECORD_FIELDS = (
     "area_key",
     "camera_name",
     "folder",
+    "file_name",
+    "video_path",
     "live_score",
     "provisional_score",
     "final_score",
@@ -258,6 +300,8 @@ _SLIM_FIELDS = (
     "area_key",
     "camera_name",
     "folder",
+    "file_name",
+    "video_path",
     "live_score",
     "provisional_score",
     "final_score",
@@ -482,6 +526,15 @@ class EventIndex:
         for column, definition in _ADDED_COLUMNS:
             if column not in present:
                 db.execute(f"ALTER TABLE events ADD COLUMN {column} {definition}")
+        present = {row[1] for row in db.execute("PRAGMA table_info(copies)")}
+        for column, definition in _ADDED_COPY_COLUMNS:
+            if column not in present:
+                db.execute(f"ALTER TABLE copies ADD COLUMN {column} {definition}")
+                if column == "video":
+                    db.execute(
+                        "UPDATE copies SET video = json_extract(copy, '$.video') "
+                        "WHERE NOT COALESCE(json_extract(copy, '$.deleted'), 0)"
+                    )
         db.executescript(_ADDED_INDEXES)
         db.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)", (str(SCHEMA_VERSION),)
@@ -795,15 +848,17 @@ class EventIndex:
 
     # ---------------------------------------------------------------- copies
 
-    async def async_save_copy(self, event_id: str, destination: str, copy: Copy) -> None:
-        """Write one copy's header; files are rows of their own (`async_add_file`)."""
+    async def async_save_copy(self, event_id: str, destination: str, copy: Copy) -> bool:
+        """Write one copy's header and files; return False if it was deleted meanwhile.
+
+        A copy the index holds as deleted (evicted) stays deleted: an upload that finished
+        after the eviction must not bring it back, so its write is refused here.
+        """
         payload = json.dumps(copy.header())
 
-        def _save(db: sqlite3.Connection) -> None:
-            db.execute(
-                "INSERT OR REPLACE INTO copies (event_id, destination, copy) VALUES (?, ?, ?)",
-                (event_id, destination, payload),
-            )
+        def _save(db: sqlite3.Connection) -> bool:
+            if not _upsert_copy(db, event_id, destination, copy, payload):
+                return False
             if copy.deleted:
                 db.execute(
                     "DELETE FROM files WHERE event_id = ? AND destination = ?",
@@ -815,18 +870,14 @@ class EventIndex:
                     "VALUES (?, ?, ?, ?)",
                     [(event_id, destination, name, size) for name, size in copy.files.items()],
                 )
+            return True
 
-        await self._run(_save)
+        return await self._run(_save)
 
-    async def async_save_copy_header(self, event_id: str, destination: str, copy: Copy) -> None:
-        """Write one copy's header only: its files are rows already."""
+    async def async_save_copy_header(self, event_id: str, destination: str, copy: Copy) -> bool:
+        """Write one copy's header only (its files are rows already); False if deleted."""
         payload = json.dumps(copy.header())
-        await self._run(
-            lambda db: db.execute(
-                "INSERT OR REPLACE INTO copies (event_id, destination, copy) VALUES (?, ?, ?)",
-                (event_id, destination, payload),
-            )
-        )
+        return await self._run(lambda db: _upsert_copy(db, event_id, destination, copy, payload))
 
     async def async_add_file(self, event_id: str, destination: str, name: str, size: int) -> None:
         """Record one uploaded file: an append, not a rewrite of the copy."""
@@ -861,10 +912,9 @@ class EventIndex:
         return await self._run(
             lambda db: (
                 db.execute(
-                    "SELECT 1 FROM copies WHERE destination = ? AND event_id != ? "
-                    "AND json_extract(copy, '$.video') = ? "
-                    "AND NOT COALESCE(json_extract(copy, '$.deleted'), 0) LIMIT 1",
-                    (destination, event_id, path),
+                    "SELECT 1 FROM copies WHERE destination = ? AND video = ? AND event_id != ? "
+                    "LIMIT 1",
+                    (destination, path, event_id),
                 ).fetchone()
                 is not None
             )
@@ -1160,6 +1210,20 @@ class EventIndex:
 # length, so SQLite's statement cache is not churned by every chunk. (Churning it made the
 # system SQLite on macOS spin in its page cache while finalizing; seen in the tests.)
 _IDS = "(SELECT value FROM json_each(?))"
+
+
+def _upsert_copy(
+    db: sqlite3.Connection, event_id: str, destination: str, copy: Copy, payload: str
+) -> bool:
+    """Write a copy's header unless the index already holds it as deleted; return whether."""
+    cursor = db.execute(
+        "INSERT INTO copies (event_id, destination, copy, video) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (event_id, destination) DO UPDATE "
+        "SET copy = excluded.copy, video = excluded.video "
+        "WHERE NOT COALESCE(json_extract(copies.copy, '$.deleted'), 0)",
+        (event_id, destination, payload, None if copy.deleted else copy.video),
+    )
+    return cursor.rowcount > 0
 
 
 def _chunks(ids: list[str]) -> list[list[str]]:

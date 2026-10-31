@@ -26,6 +26,7 @@ from .base import (
     Destination,
     DestinationError,
     TransientError,
+    UploadTooLargeError,
     async_attempt,
 )
 
@@ -109,6 +110,7 @@ class OAuthDestination(Destination):
         headers: dict[str, str] | None,
         params: dict[str, str] | None,
         authorize: bool = True,
+        location: bool = False,
     ) -> Any:
         """Make one call, classifying its failure as permanent or worth retrying."""
         sent = dict(headers or {})
@@ -117,7 +119,7 @@ class OAuthDestination(Destination):
         session = async_get_clientsession(self._hass)
         try:
             async with session.request(
-                method, url, headers=sent, data=data, params=params
+                method, url, headers=sent, data=data, params=params, allow_redirects=not location
             ) as response:
                 if response.status == 404:
                     if allow_missing:
@@ -127,11 +129,15 @@ class OAuthDestination(Destination):
                     return None
                 if response.status in _RETRY_STATUS:
                     raise TransientError(f"HTTP {response.status}", _retry_after(response))
+                if response.status == 413:
+                    raise UploadTooLargeError(f"{self.service} refused it as too large (HTTP 413)")
                 if response.status >= 400:
                     detail = (await response.text())[:300]
                     raise DestinationError(
                         f"{self.service} answered HTTP {response.status}: {detail}"
                     )
+                if location:
+                    return response.headers.get("Location")
                 if response.content_type == "application/json":
                     return await response.json()
                 return await response.read()
@@ -151,6 +157,7 @@ class OAuthDestination(Destination):
         params: dict[str, str] | None = None,
         attempts: int = REQUEST_ATTEMPTS,
         authorize: bool = True,
+        location: bool = False,
     ) -> Any:
         """Make one call, retrying the failures that are worth retrying.
 
@@ -165,6 +172,9 @@ class OAuthDestination(Destination):
         something named rather than addressed can leave a twin behind.
 
         `authorize` is off for a URL that is its own credential (an upload session's).
+
+        `location` returns the answer's `Location` header instead of its body, redirects not
+        followed: where a resumable upload session was opened.
         """
         return await async_attempt(
             f"{self.service} {method}",
@@ -177,6 +187,7 @@ class OAuthDestination(Destination):
                 headers=headers,
                 params=params,
                 authorize=authorize,
+                location=location,
             ),
             attempts=attempts,
         )

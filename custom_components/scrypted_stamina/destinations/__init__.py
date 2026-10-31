@@ -1,8 +1,9 @@
 """Where event folders go, and how they get there. Ported from Reolink Stamina.
 
-One class per provider, all of them satisfying the same three-method interface in `base`, so
-the uploader never learns which one it has. Adding another is a file here and a line in the
-table below.
+One class per provider, all of them satisfying the interface in `base` (five members of
+their own, plus the streamed store, size and folder delete they override when they can do
+better), so the uploader never learns which one it has. Adding another is a file here and
+a line in the table below.
 
 Every provider rides on an integration Home Assistant already has: the account, address or
 key is entered once, in the place that owns it, and this borrows the session. That is why

@@ -1,7 +1,7 @@
 """Where an event lands in a destination (architecture §3.5).
 
     <folder>/pending/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 00000.m4s, …
-    <folder>/events/<area>-<camera>-<YYMMDD_HHMMSS>.mp4
+    <folder>/events/<area>-<camera>-<YYMMDD_HHMMSS>.mp4   (and -part2.mp4, … if it grew)
     <folder>/unusual-unconfirmed/<area>-<camera>-<YYMMDD_HHMMSS>.mp4
 
 Segments stream into the pending folder while the event lasts; a committed event is one
@@ -63,22 +63,22 @@ def event_folder_name(started: dt.datetime, camera: str, event_id: str) -> str:
     return f"{stamp}_{camera_slug(camera)}_{safe_part(event_id, fallback='event')}"
 
 
-_FOLDER_NAME = re.compile(r"^(\d{6}_\d{6})_(.+)$")
-
-
-def event_file_name(area: str, folder: str, event_id: str) -> str:
+def event_file_name(started: dt.datetime, area: str, camera: str) -> str:
     """Name a committed event's video: `<area>-<camera>-<YYMMDD_HHMMSS>.mp4`.
 
-    The camera and the start are read back from the event's folder name, which fixed them
-    (in local time) when the event began.
+    Computed once, when the event begins (local time), next to its folder name.
     """
-    match = _FOLDER_NAME.match(folder)
-    if match is None:
-        return f"{safe_part(area, fallback=NO_AREA)}-{safe_part(folder, fallback='event')}.mp4"
-    stamp, rest = match.groups()
-    suffix = f"_{safe_part(event_id, fallback='event')}"
-    camera = rest[: -len(suffix)] if rest.endswith(suffix) and rest != suffix else rest
-    return f"{safe_part(area, fallback=NO_AREA)}-{safe_part(camera, fallback='camera')}-{stamp}.mp4"
+    stamp = started.strftime("%y%m%d_%H%M%S")
+    return f"{safe_part(area, fallback=NO_AREA)}-{camera_slug(camera)}-{stamp}.mp4"
+
+
+def video_part_path(video: str, part: int) -> str:
+    """Return the path of one file of a committed video: part 1 is the video itself.
+
+    What an event receives after its commit (an orphan that kept going) is a file of its
+    own, `<video>-part<n>.mp4`, so a committed file is never rewritten.
+    """
+    return video if part <= 1 else f"{video.removesuffix('.mp4')}-part{part}.mp4"
 
 
 def root_folder(folder: str) -> str:
@@ -92,9 +92,9 @@ def event_path(folder: str, kind: str, area: str, name: str) -> str:
     return "/".join([root_folder(folder), kind, safe_part(area, fallback=NO_AREA), name])
 
 
-def event_file_path(folder: str, kind: str, area: str, name: str, event_id: str) -> str:
+def event_file_path(folder: str, kind: str, name: str) -> str:
     """Return the path of a committed event's video (`events`, `unusual-unconfirmed`)."""
-    return "/".join([root_folder(folder), kind, event_file_name(area, name, event_id)])
+    return "/".join([root_folder(folder), kind, safe_part(name, fallback="event.mp4")])
 
 
 def segment_name(number: int) -> str:

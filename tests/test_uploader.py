@@ -35,15 +35,16 @@ async def test_a_commit_joins_the_segments_into_one_video_and_deletes_pending(
     assert VIDEO.match(path)
     init, first, second = (stamina.files[(eid, name)] for name in ("init.mp4", "0.m4s", "1.m4s"))
     assert fake.files[path] == init + first + second  # joined in play order, as uploaded
-    assert [op for op, _ in fake.ops].count("read") == 3
+    assert [op for op, _ in fake.ops].count("read") == 0  # streamed from the spool
     assert not fake.under("scrypted-stamina/pending/")
     [copy] = (await manager.index.async_copies(eid)).values()
     assert copy.playable and copy.video == path
     assert copy.ranges == {
-        "init.mp4": [0, len(init)],
-        "00000.m4s": [len(init), len(first)],
-        "00001.m4s": [len(init) + len(first), len(second)],
+        "init.mp4": [0, len(init), 1],
+        "00000.m4s": [len(init), len(first), 1],
+        "00001.m4s": [len(init) + len(first), len(second), 1],
     }
+    assert not manager.uploader.spool.folder(eid).exists()  # gone with the commit
     assert copy.size == len(fake.files[path])  # the quota counts the video
     await hass.config_entries.async_unload(entry.entry_id)
 

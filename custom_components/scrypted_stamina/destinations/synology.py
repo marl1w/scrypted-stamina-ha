@@ -14,7 +14,7 @@ importable for the great majority of users who do not have a Synology.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import AsyncIterable, Awaitable
 import logging
 from typing import Any
 
@@ -144,6 +144,27 @@ class SynologyDestination(Destination):
 
         await async_attempt(f"Synology upload of {path}", attempt)
         _LOGGER.debug("Uploaded %s (%s bytes) to %s", path, len(data), self.label)
+
+    async def async_store_stream(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
+        """Upload one file from a stream (File Station takes an async iterator as source).
+
+        One attempt: a stream cannot be replayed, so the commit retries the whole file; the
+        size is confirmed after (`async_store_video`).
+        """
+        folder, name = self._split(path)
+
+        async def attempt() -> None:
+            stored = await self._async_call(
+                f"upload of {path}",
+                self._file_station.upload_file(
+                    path=folder, filename=name, source=chunks, create_parents=True
+                ),
+            )
+            if not stored:
+                raise DestinationError(f"Synology did not confirm storing {path}")
+
+        await async_attempt(f"Synology upload of {path}", attempt, attempts=1)
+        _LOGGER.debug("Uploaded %s (%s bytes) to %s, streamed", path, size, self.label)
 
     async def async_delete(self, path: str) -> None:
         """Remove one file, treating an already-missing file as success."""

@@ -1,15 +1,16 @@
-"""What a destination has to be, and the one thing they all get wrong the same way.
+"""What a destination has to be, and how they all retry.
 
 Ported from Reolink Stamina, where a destination stored, deleted and listed whole clips.
 Scrypted Stamina writes one file per segment into a pending folder while the event lasts,
-then commits it as one video: the segments read back, joined, stored, and the folder
-deleted. So the interface grows:
+then commits it as one video, streamed from the box's local spool of those segments, and
+deletes the folder. Every provider implements five members — `label`, `async_store`,
+`async_delete`, `async_list` and `async_read` (a segment back when the spool is gone; a
+committed video for playback) — and the rest have defaults it overrides when it can do
+better:
 
-* `async_read` — read a file back, to join the segments and to play a committed event
-  through Home Assistant;
-* `async_store_video` — store the joined video and confirm its size: `async_store`, then
-  `async_size`. A provider with a per-request limit lower than a long event overrides
-  `async_store` with its chunked upload;
+* `async_store_stream` — write one file from chunks, without holding it whole: an upload
+  session where the provider has one; the default buffers, up to `BUFFER_LIMIT`;
+* `async_store_video` — `async_store_stream`, then confirm the size with `async_size`;
 * `async_size` — one file's size, by listing its folder unless the provider can ask;
 * `async_delete_folder` — remove a pending folder and everything in it.
 
@@ -22,7 +23,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import asyncio
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
@@ -34,6 +35,12 @@ _LOGGER = logging.getLogger(__name__)
 REQUEST_ATTEMPTS = 4
 BACKOFF_SECONDS = 2.0
 MAX_BACKOFF_SECONDS = 30.0
+
+# A committed video goes up in chunks of this size: a multiple of both OneDrive's 320 KiB
+# and Google Drive's 256 KiB, and small enough to hold one in memory on a small box.
+STREAM_CHUNK = 10 * 1024 * 1024
+# What a provider without a streaming upload may buffer to store one file.
+BUFFER_LIMIT = 64 * 1024 * 1024
 
 # How many attempts an operation gets, when the caller does its own retrying. The uploader
 # sets it to one for segment stores, so a destination's backoff never sleeps while holding
@@ -54,9 +61,6 @@ def attempts_limited(attempts: int) -> Iterator[None]:
 _TYPES = {
     ".m4s": "video/iso.segment",
     ".mp4": "video/mp4",
-    ".m3u8": "application/vnd.apple.mpegurl",
-    ".json": "application/json",
-    ".jpg": "image/jpeg",
 }
 
 
@@ -73,7 +77,36 @@ class DestinationError(Exception):
 
 
 class UploadTooLargeError(DestinationError):
-    """Raised when a file exceeds what this destination will take in one go."""
+    """Raised when a file exceeds what this destination will take: permanent, never retried."""
+
+
+async def rechunk(chunks: AsyncIterable[bytes], size: int = STREAM_CHUNK) -> AsyncIterator[bytes]:
+    """Yield `chunks` again as pieces of exactly `size` bytes, the last one shorter."""
+    buffer = bytearray()
+    async for chunk in chunks:
+        buffer += chunk
+        while len(buffer) >= size:
+            yield bytes(buffer[:size])
+            del buffer[:size]
+    if buffer:
+        yield bytes(buffer)
+
+
+async def streamed(data: bytes) -> AsyncIterator[bytes]:
+    """Return bytes already in memory as a stream of one chunk."""
+    yield data
+
+
+async def gather(chunks: AsyncIterable[bytes], size: int) -> bytes:
+    """Return a stream of `size` bytes as one buffer, refusing to hold more than that."""
+    data = bytearray()
+    async for chunk in chunks:
+        data += chunk
+        if len(data) > size:
+            break
+    if len(data) != size:
+        raise DestinationError(f"a stream of {size} bytes gave {len(data)}")
+    return bytes(data)
 
 
 class TransientError(Exception):
@@ -157,14 +190,25 @@ class Destination(ABC):
         folder, _, _ = path.rpartition("/")
         return (await self.async_list(folder)).get(path)
 
-    async def async_store_video(self, path: str, data: bytes) -> None:
-        """Store a committed event's video, and confirm the destination holds all of it."""
-        await self.async_store(path, data)
-        stored = await self.async_size(path)
-        if stored != len(data):
-            raise DestinationError(
-                f"{self.label} holds {stored} bytes of {path}, not the {len(data)} stored"
+    async def async_store_stream(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
+        """Write one file of `size` bytes from `chunks`, creating any folders it needs.
+
+        A stream cannot be read twice, so a failure is the caller's to retry, whole. The
+        default buffers it for `async_store`, up to `BUFFER_LIMIT`; providers with an upload
+        session or a streaming write override it.
+        """
+        if size > BUFFER_LIMIT:
+            raise UploadTooLargeError(
+                f"{self.label} cannot stream; {size} bytes exceeds {BUFFER_LIMIT} buffered"
             )
+        await self.async_store(path, await gather(chunks, size))
+
+    async def async_store_video(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
+        """Store one file of a committed video, and confirm the destination holds all of it."""
+        await self.async_store_stream(path, size, chunks)
+        stored = await self.async_size(path)
+        if stored != size:
+            raise DestinationError(f"{self.label} holds {stored} bytes of {path}, not {size}")
 
     async def async_delete_folder(self, folder: str) -> None:
         """Remove a folder and the files in it. Succeeds quietly when it is already gone.

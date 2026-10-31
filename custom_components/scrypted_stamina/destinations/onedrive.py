@@ -6,19 +6,20 @@ rather than at the root of the drive.
 
 Graph deletes a folder with everything in it (one request), creates missing parents on a
 path-addressed upload, and answers a file's size by path, so every operation the uploader
-needs is native. A file over the single-request limit (a
-committed video of several hours) goes up through an upload session, in chunks.
+needs is native. A file over a few megabytes (any committed video but the shortest) goes up
+through an upload session, streamed in `STREAM_CHUNK`s.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterable
 import json
 import logging
 import time
 from urllib.parse import quote
 
-from .base import DestinationError, content_type
+from .base import STREAM_CHUNK, DestinationError, content_type, gather, rechunk, streamed
 from .oauth import OAuthDestination
 
 _LOGGER = logging.getLogger(__name__)
@@ -27,11 +28,11 @@ _LOGGER = logging.getLogger(__name__)
 GRAPH = "https://graph.microsoft.com/v1.0"
 APPROOT = f"{GRAPH}/me/drive/special/approot"
 
-# Graph accepts a single PUT up to 250 MB; a segment is a few dozen kilobytes, and a
-# committed video about 70 MB an hour. Past the limit, an upload session takes it in chunks,
-# which Graph wants in multiples of 320 KiB.
-SIMPLE_UPLOAD_LIMIT = 240 * 1024 * 1024
-SESSION_CHUNK = 32 * 320 * 1024
+# Graph documents a single PUT up to 4 MB (it takes more, but not reliably); a segment is a
+# few dozen kilobytes, and a committed video about 70 MB an hour. Past the limit an upload
+# session takes it in chunks, which Graph wants in multiples of 320 KiB.
+SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024
+SESSION_CHUNK = STREAM_CHUNK
 
 _JSON = {"Content-Type": "application/json"}
 
@@ -57,14 +58,14 @@ class OneDriveDestination(OAuthDestination):
         is worse than a reported failure — a failure gets retried.
         """
         if len(data) > SIMPLE_UPLOAD_LIMIT:
-            item = await self._async_upload_session(path, data)
-        else:
-            item = await self._async_request(
-                "PUT",
-                f"{self._item(path)}/content",
-                data=data,
-                headers={"Content-Type": content_type(path)},
-            )
+            await self.async_store_stream(path, len(data), streamed(data))
+            return
+        item = await self._async_request(
+            "PUT",
+            f"{self._item(path)}/content",
+            data=data,
+            headers={"Content-Type": content_type(path)},
+        )
         if not isinstance(item, dict) or not item.get("id"):
             raise DestinationError(f"OneDrive did not confirm storing {path}")
         stored = item.get("size")
@@ -74,7 +75,25 @@ class OneDriveDestination(OAuthDestination):
             )
         _LOGGER.debug("Uploaded %s (%s bytes) to %s", path, len(data), self.label)
 
-    async def _async_upload_session(self, path: str, data: bytes) -> object:
+    async def async_store_stream(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
+        """Upload one file from a stream: one PUT when small, else an upload session.
+
+        The session holds one chunk in memory at a time, however long the video.
+        """
+        if size <= SIMPLE_UPLOAD_LIMIT:
+            await self.async_store(path, await gather(chunks, size))
+            return
+        item = await self._async_upload_session(path, size, chunks)
+        if not isinstance(item, dict) or not item.get("id"):
+            raise DestinationError(f"OneDrive did not confirm storing {path}")
+        stored = item.get("size")
+        if stored is not None and int(stored) != size:
+            raise DestinationError(f"OneDrive stored {stored} bytes of {path}, not the {size} sent")
+        _LOGGER.debug("Uploaded %s (%s bytes) to %s in a session", path, size, self.label)
+
+    async def _async_upload_session(
+        self, path: str, total: int, chunks: AsyncIterable[bytes]
+    ) -> object:
         """Upload a large file through a Graph upload session; return the stored item.
 
         The session URL carries its own authorisation, and Graph refuses a bearer token on
@@ -90,9 +109,10 @@ class OneDriveDestination(OAuthDestination):
         if not upload_url:
             raise DestinationError(f"OneDrive did not open an upload session for {path}")
         item: object = None
-        total = len(data)
-        for start in range(0, total, SESSION_CHUNK):
-            chunk = data[start : start + SESSION_CHUNK]
+        start = 0
+        async for chunk in rechunk(chunks, SESSION_CHUNK):
+            if start + len(chunk) > total:
+                raise DestinationError(f"the stream for {path} is longer than {total} bytes")
             item = await self._async_request(
                 "PUT",
                 str(upload_url),
@@ -100,6 +120,9 @@ class OneDriveDestination(OAuthDestination):
                 headers={"Content-Range": f"bytes {start}-{start + len(chunk) - 1}/{total}"},
                 authorize=False,
             )
+            start += len(chunk)
+        if start != total:
+            raise DestinationError(f"the stream for {path} gave {start} of {total} bytes")
         return item
 
     async def async_size(self, path: str) -> int | None:

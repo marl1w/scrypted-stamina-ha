@@ -539,7 +539,7 @@ async def test_a_released_segmenter_that_resumes_is_followed_with_a_new_init(
     at = lines.index(
         f"#EXT-X-BYTERANGE:{copy.ranges['00001.m4s'][1]}@{copy.ranges['00001.m4s'][0]}"
     )
-    offset, length = copy.ranges["init-1.mp4"]
+    offset, length, _ = copy.ranges["init-1.mp4"]
     assert lines[at - 3 : at - 1] == [
         "#EXT-X-DISCONTINUITY",
         f'#EXT-X-MAP:URI="v.mp4",BYTERANGE="{length}@{offset}"',

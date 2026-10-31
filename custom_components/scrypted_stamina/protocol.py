@@ -131,7 +131,7 @@ class Subject:
         return max(0.0, self.last_seen - self.first_seen)
 
     def as_dict(self) -> dict[str, Any]:
-        """Serialise for the index, `event.json` and entity attributes."""
+        """Serialise for the index and entity attributes."""
         return {
             "id": self.id,
             "class": self.cls,
@@ -283,7 +283,7 @@ class EventFacts:
         self.trigger = self.trigger or other.trigger
 
     def as_dict(self) -> dict[str, Any]:
-        """Serialise for the index and `event.json`."""
+        """Serialise for the index."""
         return {
             "id": self.id,
             "camera": self.camera,

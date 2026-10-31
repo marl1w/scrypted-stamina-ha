@@ -20,8 +20,8 @@ States (architecture §3.4, §3.4a):
        └──link lost > 2 min, epoch change, camera offline, TTL expired ─► ORPHANED (kept)
 
 Every event, whatever its state, stays open for scoring until its follow-up window closes;
-that only *moves* anything for FOLLOW_UP events. A committed event gets its final score and
-an updated `event.json`, and stays where it is.
+that only changes the fate of FOLLOW_UP events. A committed event gets its final score in
+the index; its video is never touched again.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ HOLDS_PENDING = frozenset(
 # States that are final for the files (the follow-up window may still update metadata).
 TERMINAL = frozenset({EventState.DROPPED, EventState.COMMITTED, EventState.ORPHANED})
 
-# Why an event is kept, in `event.json` and the entity attributes.
+# Why an event is kept, in the index and the entity attributes.
 REASON_CONFIRMED = "confirmed"
 REASON_UNUSUAL = "unusual"
 REASON_UNDECIDED = "undecided"
@@ -97,6 +97,10 @@ class EventRecord:
     area_key: str = ""
     camera_name: str = ""
     folder: str = ""
+    # The committed video's file name, chosen with the folder (`naming.event_file_name`), and
+    # where the commit put it (`<kind>/<name>`, with the `-2` of a name another event had).
+    file_name: str = ""
+    video_path: str = ""
     # Scores: live while open, provisional at end, final when the follow-up window closes.
     live_score: float | None = None
     provisional_score: float | None = None
@@ -152,7 +156,7 @@ class EventRecord:
         return None
 
     def note(self, text: str) -> None:
-        """Record something worth saying in `event.json`, once."""
+        """Record something worth saying about the event, once."""
         if text not in self.notes:
             self.notes.append(text)
 

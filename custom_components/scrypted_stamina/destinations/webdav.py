@@ -13,7 +13,7 @@ unimportable for everyone else.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import AsyncIterable, Awaitable
 from io import BytesIO
 import logging
 from typing import Any
@@ -132,6 +132,28 @@ class WebDavDestination(Destination):
 
         await async_attempt(f"WebDAV upload of {path}", attempt)
         _LOGGER.debug("Uploaded %s (%s bytes) to %s", path, len(data), self.label)
+
+    async def async_store_stream(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
+        """Upload one file as a streamed `PUT`, and confirm its size from the server.
+
+        One attempt: a stream cannot be replayed, so the commit retries the whole file.
+        """
+        folder, _, _ = path.rpartition("/")
+
+        async def attempt() -> None:
+            client = self._client
+            if folder:
+                await self._async_ensure_folder(folder)
+            await self._async_call(
+                f"upload of {path}", client.upload_iter(chunks, path, content_length=size)
+            )
+            info = await self._async_call(f"check of {path}", client.info(path))
+            stored = _size(info.get("size"))
+            if stored is not None and stored != size:
+                raise DestinationError(f"WebDAV stored {stored} bytes of {path}, not {size}")
+
+        await async_attempt(f"WebDAV upload of {path}", attempt, attempts=1)
+        _LOGGER.debug("Uploaded %s (%s bytes) to %s, streamed", path, size, self.label)
 
     async def async_delete(self, path: str) -> None:
         """Remove one file, treating an already-missing file as success."""
