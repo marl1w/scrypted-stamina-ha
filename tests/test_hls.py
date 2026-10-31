@@ -1,4 +1,4 @@
-"""The committed folder's `index.m3u8`."""
+"""The HLS playlist builder: VOD fMP4 in order, with gaps as discontinuities."""
 
 from custom_components.scrypted_stamina.hls import playlist
 

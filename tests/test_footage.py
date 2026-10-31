@@ -110,8 +110,8 @@ async def test_the_playlist_lists_only_what_the_destination_holds(
     record = manager.records[eid]
     [copy] = (await manager.index.async_copies(eid)).values()
     assert set(copy.ranges) == {"init.mp4", "00000.m4s", "00002.m4s"}
-    manifest = video_playlist(record, copy, "video.mp4")
-    assert manifest.count("#EXT-X-BYTERANGE:") == 2 and "#EXT-X-DISCONTINUITY" in manifest
+    played = video_playlist(record, copy, "video.mp4")
+    assert played.count("#EXT-X-BYTERANGE:") == 2 and "#EXT-X-DISCONTINUITY" in played
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -535,12 +535,12 @@ async def test_a_released_segmenter_that_resumes_is_followed_with_a_new_init(
     # Joined in play order: each init before the segments that need it.
     order = sorted(copy.ranges, key=lambda name: copy.ranges[name][0])
     assert order == ["init.mp4", "00000.m4s", "init-1.mp4", "00001.m4s"]
-    manifest = video_playlist(manager.records[eid], copy, "v.mp4").splitlines()
-    at = manifest.index(
+    lines = video_playlist(manager.records[eid], copy, "v.mp4").splitlines()
+    at = lines.index(
         f"#EXT-X-BYTERANGE:{copy.ranges['00001.m4s'][1]}@{copy.ranges['00001.m4s'][0]}"
     )
     offset, length = copy.ranges["init-1.mp4"]
-    assert manifest[at - 3 : at - 1] == [
+    assert lines[at - 3 : at - 1] == [
         "#EXT-X-DISCONTINUITY",
         f'#EXT-X-MAP:URI="v.mp4",BYTERANGE="{length}@{offset}"',
     ]

@@ -131,7 +131,7 @@ There is no per-camera override. A **class map** per source normalises names (`p
 
 ### 2.4 Playback and clips (standard interfaces only)
 
-- **`VideoRecorder.getRecordingStream({ startTime, duration? })`:** live seekable playback, served as HLS by the plugin. With a `duration` it returns a downloadable clip, used for the full-resolution "upgrade" after a commit.
+- **`VideoRecorder.getRecordingStream({ startTime, duration? })`:** live seekable playback, served as HLS by the plugin. With a `duration` it returns a downloadable clip (planned: a full-resolution "upgrade" after a commit).
 - **`VideoClips.getVideoClips({ startTime, endTime })`:** the recorder's own clips. Used for the timeline and for the "process later" fallback.
 - A camera without these interfaces has no in-place playback; review then uses committed cloud copies. Nothing is ever copied locally.
 
@@ -192,7 +192,7 @@ The exact message and route shapes are in [api.md](api.md). All routes are under
       │ event.end + post-roll uploaded
       ▼
  ┌───────────┐  segments joined into events/<area>-<camera>-<time>.mp4, pending/<id>/ deleted
- │ COMMITTED │─► optional: full-res upgrade from VideoRecorder (duration = event span)
+ │ COMMITTED │─► planned: full-res upgrade from VideoRecorder (duration = event span)
  └───────────┘
 ```
 
@@ -206,7 +206,7 @@ Some evidence comes after the camera has stopped seeing anything: a door opened 
 - Every state change of the camera's linked entities in that window is attached to the event as late evidence (`{entity, kind, from, to, t_rel_s}`).
 - **Provisional score** at `event.end`; **final score** when the window closes, from facts, context and late evidence. The relevance model learns what late evidence is normal: a door opened at 6 p.m. with someone home is not unusual; at 3 a.m. with the alarm armed it is.
 - If the final score turns the event unusual, `event.<cam>_stamina` fires again as `unusual` with `late: true`.
-- **Decider:** an event that is ordinary at the end and not kept for a chosen class (vetoed, another class, or uploads not on *Chosen classes*) enters `FOLLOW_UP`. Its pending upload is kept until the window closes, then dropped if it is still ordinary, or moved to `unusual-unconfirmed/` if it became unusual. Events kept for a chosen class or for being unusual commit as before; only their index row is updated after the window.
+- **Decider:** an event that is ordinary at the end and not kept for a chosen class (vetoed, another class, or uploads not on *Chosen classes*) enters `FOLLOW_UP`. Its pending upload is kept until the window closes, then dropped if it is still ordinary, or committed to `unusual-unconfirmed/` if it became unusual. Events kept for a chosen class or for being unusual commit as before; only their index row is updated after the window.
 - `FOLLOW_UP` pending data has its own cap (default 1 GB per destination). Over it, the oldest vetoed-and-ordinary events are dropped first.
 - The window end time is persisted, so evaluation resumes after a restart.
 
@@ -236,7 +236,7 @@ Sequences across cameras are already part of the ported relevance model: each ev
 - **Two tiers per row.** *Fresh* (first 30 days): the full record. *Slim* (after that): id, camera, times, state, unusual, score, finalized, summary, area, duration, features, weight, and a compact record (decision, scores, reason and reasons, keep reason, path pieces, notes, subject classes and verdicts). Observations, per-subject detail, context snapshots and late-evidence detail go. A row is slimmed only once settled: final, features stored, no pending action, no copy still being written, and an orphan only once its upload is complete. Whether footage is still available is derived, not stored: *recording* while the recorder retention option covers the event's day, *offsite* while a committed video is on some destination.
 - A **thumbnail** per event: a 320 px JPEG (about 15 KB) of the frame at confirmation, or at event start, served by the plugin. Kept 30 days for kept events (committed, unusual, orphaned) and 7 days for dropped ones. The panel and the media browser show a placeholder without one.
 - **Size cap** ("History size", default 200 MB), measured as the pages SQLite uses (`(page_count − freelist_count) × page_size`; the file itself keeps its high-water size). Over it, the nightly prune **thins** slim rows oldest first: per camera and common kind (500 or more dropped events), one row in four survives and its `weight` counts for the others; the rebuild multiplies its rates and counts by that weight, with the same decay. Never thinned: kept, committed or orphaned events, unusual ones, rare kinds, and rare contexts (tamper, alarm armed or triggered, snow, storm or exceptional weather, any late evidence). If the cap cannot be met, that is logged once and nothing protected goes. Rows past the 25 months are deleted, except while their files are still on a destination.
-- A **media source** ("Scrypted events") lists events by camera, then day. Playback resolves to the plugin's recording HLS, or else a committed video: Home Assistant answers with a playlist in which each segment is a byte range of the one file (`EXT-X-BYTERANGE`), and serves those ranges from the video, read from the destination once and kept in memory while it plays. Only the sources still available are offered.
+- A **media source** ("Scrypted events") lists events by camera (titled "Area · Camera", by area), then day. Playback resolves to the plugin's recording HLS, or else a committed video: Home Assistant answers with a playlist in which each segment is a byte range of the one file (`EXT-X-BYTERANGE`), and serves each range by reading only that range from the destination (a ranged request where the provider has one; OneDrive's pre-authenticated download URL is asked for once and reused for 50 minutes). No video is held in memory. Only the sources still available are offered.
 - A **review panel** (sidebar, admins only) on one page: camera chips with each camera's state (working, learning, verifier not responding, no recent events; a tap filters to it), filters, and the event list. From 900 px wide the selected event plays beside the list, the latest unusual one preselected, with why it was flagged, the decision and what was seen; the arrow keys move through the list. On a phone a tapped row opens inline under itself.
 
 ### 3.7 Entities
@@ -249,7 +249,18 @@ Since Home Assistant 2026.8 a device belongs to exactly one config entry, so Sta
 | `binary_sensor.<cam>_unusual` | On while an unusual event is open; pulses on for a late unusual |
 | `sensor.<cam>_last_event_score` | Latest score, 0 to 1 |
 
-Each area with a camera has a subentry of type `area`, which the integration adds, renames and removes itself as cameras move between areas (no flow, so none can be added by hand; one deleted by hand comes back). Keyed by area id, with a "No area" one for cameras without an area, each holds a service device named after the area with `select.stamina_<area>_uploads` (*Chosen classes*: unusual events plus ordinary ones with a confirmed subject of a chosen class, default person and vehicle; *Unusual only*; *Off*: nothing uploads, not even to `pending/`, while events are still indexed and scored. Each event takes the position at its start; the keep reason, `unusual` or `classes: <class>`, says which rule kept it; positions are kept by area id in the index, and the old integration-wide select's position is every area's default), a quota sensor (that area's events on the destination, from the index rows by area) and a status sensor (`ok` / `failing` while a destination fails, with what the area has uploading and held). Cameras stay ungrouped. Changes to area subentries do not reload the entry. Integration-wide entities, on a "Scrypted Stamina" service device: `sensor.stamina_queue`, `sensor.stamina_orphans` and `sensor.stamina_latency`. Each destination subentry has a service device of its own, named after it, under the hub and filed under the subentry (`config_subentry_id`): quota used and its percentage, pending footage against the follow-up cap, and health (`ok` / `failing` after three failed operations in a row, with the last error). The first version's quota sensor keeps its unique id, so its history carries over.
+Integration-wide entities sit on a "Scrypted Stamina" service device; each destination and each area has a service device of its own under it, filed under its subentry (`config_subentry_id`). Each area with a camera has a subentry of type `area`, keyed by area id ("No area" for cameras without one), which the integration adds, renames and removes as cameras move between areas (there is no flow to add one; one deleted by hand comes back). Changes to area subentries do not reload the entry.
+
+| Device | Entities | Meaning |
+|---|---|---|
+| Scrypted Stamina | `sensor.stamina_queue`, `sensor.stamina_orphans`, `sensor.stamina_latency` | Segments waiting, orphaned events, detection to first upload (p50, p95) |
+| Destination | quota used, quota used percent | What it holds, against its quota |
+| | pending | Footage held for the follow-up window, against its cap |
+| | health | `ok` / `failing` after three failed operations in a row, with the last error |
+| Area | `select.stamina_<area>_uploads` | *Chosen classes* (unusual events, and ordinary ones with a confirmed subject of a chosen class, default person and vehicle), *Unusual only*, or *Off* (nothing uploads, not even to `pending/`; events are still indexed and scored). An event takes its area's position at its start; positions are kept by area id in the index |
+| | `sensor.stamina_<area>_quota_used` | What the area's events hold on the destination holding most of them, counted by the area id each event recorded at its start (a rename keeps them); attributes: share of the quota, events, uploading, pending events and bytes, the last destination error |
+
+Health is per destination, not per area: a failing destination fails every area alike.
 
 ## 4. Latency budget
 
@@ -300,7 +311,7 @@ Vetoed path: the same until the verdict. Then `DROPPING` deletes `pending/<id>/`
 | Verifier | Subjects are `unverified`. The trigger policy decides (duration and score). The verify window is skipped |
 | Camera alerts (no ObjectDetector or motion) | No live events. **Process later**: a scheduled scan of `VideoClips` or the recordings, run through a verifier if one exists. Upload happens after the fact; there is no fast path |
 | Prebuffer | No pre-roll; segments start at the detection |
-| VideoRecorder / VideoClips | No in-place playback, no full-res upgrade, no process-later. Review uses cloud copies only |
+| VideoRecorder / VideoClips | No in-place playback, no process-later. Review uses cloud copies only |
 | HA context | Scoring uses video facts only |
 | Link to HA | The plugin keeps segments for their TTL; the integration marks open events `orphaned` and keeps them |
 
