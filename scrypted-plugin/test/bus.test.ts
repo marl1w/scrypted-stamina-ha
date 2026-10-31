@@ -117,8 +117,8 @@ test('the ring is bounded in bytes as well as in count', () => {
 
 test('the ring keeps frames only, counts UTF-8 bytes, and holds up to 5000 messages', () => {
     const b = new Bus('ep_test');
-    const e = b.publish('event.update', { name: 'Ingresso è qui' });
-    assert.equal(JSON.parse(e.json).name, 'Ingresso è qui');
+    const e = b.publish('event.update', { name: 'Café è qui' });
+    assert.equal(JSON.parse(e.json).name, 'Café è qui');
     assert.equal(e.frame.endsWith(`${e.json}\n\n`), true);
     assert.equal(e.bytes, Buffer.byteLength(e.frame));
     for (let i = 0; i < 6000; i++) b.publish('event.update', {});
