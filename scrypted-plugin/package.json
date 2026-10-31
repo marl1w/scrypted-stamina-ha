@@ -1,6 +1,6 @@
 {
   "name": "@marl1w/scrypted-stamina",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Scrypted plugin that turns every camera's detections into events with subjects and verdicts, cuts fMP4 segments from the prebuffer at the first detection, and serves them, clips and recordings to the Scrypted Stamina Home Assistant integration over HTTP.",
   "license": "MIT",
   "scripts": {

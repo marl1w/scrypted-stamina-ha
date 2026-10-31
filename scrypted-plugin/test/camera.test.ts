@@ -83,6 +83,38 @@ test('motion only on the plain listener (a layer we could not listen to): counte
     assert.equal(out[0].body.event.trigger.source, CAMP);
 });
 
+test('sound added by a mixin is never the camera plugin\'s: unclaimed edges go to that mixin, so its role applies', () => {
+    const AG = '@marl1w/scrypted-audio-guard';
+    const x = setup({ mixins: ['911', '913', '915'], interfaces: ['VideoCamera', 'Camera', 'MotionSensor', 'ObjectDetector', 'AudioSensor', 'Online'] });
+    // the camera implements everything but AudioSensor, which the Audio Guard mixin adds
+    x.sc.devices.get('7')!.providedInterfaces = ['VideoCamera', 'Camera', 'MotionSensor', 'ObjectDetector', 'Online'];
+    x.sc.add({ id: '915', pluginId: AG, interfaces: [] });
+    x.core.unbind();
+    x.core.bind();
+    // before the mixin was ever heard, an unclaimed edge starts nothing
+    x.sc.emit('7', 'AudioSensor', true, {});
+    x.clock.advance(PLAIN_DEDUPE_MS + 1);
+    x.sc.emit('7', 'AudioSensor', false, {});
+    x.clock.advance(PLAIN_DEDUPE_MS + 1);
+    assert.ok(!x.out.some(m => m.type === 'event.start'), 'no owner yet: context only');
+    // the camera's own layer is not listened to for a signal it does not implement
+    x.sc.emit('7', 'AudioSensor', true, {}, '7');
+    x.clock.advance(PLAIN_DEDUPE_MS + 1);
+    assert.ok(!x.out.some(m => m.type === 'event.start'), 'the camera layer is not the camera plugin\'s sound');
+    // Audio Guard reports on its layer: attributed to Audio Guard
+    x.sc.emit('7', 'AudioSensor', true, {}, '915');
+    x.clock.advance(PLAIN_DEDUPE_MS + 1);
+    assert.equal(x.out.find(m => m.type === 'event.start')!.body.event.trigger.source, AG);
+    x.sc.emit('7', 'AudioSensor', false, {}, '915');
+    x.clock.advance(60_000);
+    // set to ignore: a later unclaimed edge is Audio Guard's, so it starts nothing
+    x.roles.setRole(AG, 'ignore');
+    const before = x.out.filter(m => m.type === 'event.start').length;
+    x.sc.emit('7', 'AudioSensor', true, {});
+    x.clock.advance(PLAIN_DEDUPE_MS + 1);
+    assert.equal(x.out.filter(m => m.type === 'event.start').length, before, 'ignored: no event');
+});
+
 test('held motion keeps the event open until it turns off plus the margin', () => {
     const { sc, clock, out } = setup();
     sc.emit('7', 'MotionSensor', true, {}, '7');

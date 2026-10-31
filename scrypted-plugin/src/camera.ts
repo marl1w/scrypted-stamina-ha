@@ -16,6 +16,8 @@ export interface DeviceState {
     /** the device that provides it (a crop camera's parent camera) */
     providerId?: string;
     interfaces: string[];
+    /** the interfaces the device implements itself, without its mixins (unknown: treated as all of them) */
+    providedInterfaces?: string[];
     mixins?: string[];
     motionDetected?: boolean;
     occupied?: boolean;
@@ -103,6 +105,9 @@ export class CameraCore {
     private stopped = false;
     /** recent edges from layer listeners, for deduplicating the plain listener */
     private layerEdges: { kind: BinaryKind; on: boolean; at: number }[] = [];
+    /** signals the camera does not implement itself (a mixin adds them), and the mixin plugin last heard reporting each */
+    private mixinKinds = new Set<BinaryKind>();
+    private kindOwner: Partial<Record<BinaryKind, string>> = {};
     private plainTimers = new Set<any>();
     /** a plain `on` edge was counted for this kind: its `off` is always processed */
     private plainOn = new Set<BinaryKind>();
@@ -195,10 +200,16 @@ export class CameraCore {
         // own value: listen per layer (the device itself, then each mixin), attributed to that layer's plugin; the plain
         // listener is the fallback for a layer that cannot be listened to, deduplicated against the layer edges
         const layers = [id, ...(st.mixins ?? []).filter(m => m !== id && this.env.pluginOf(m) !== this.env.selfPlugin)];
+        // A signal the camera does not implement itself (e.g. sound added by an audio mixin) is never the camera plugin's:
+        // its own layer is not listened to, and an edge no layer claims belongs to the mixin last heard reporting it.
+        this.mixinKinds.clear();
         for (const kind of ['motion', 'occupancy', 'audio'] as BinaryKind[]) {
             const iface = KIND_IFACE[kind];
             if (!has(st, iface)) continue;
+            const native = !st.providedInterfaces || st.providedInterfaces.includes(iface);
+            if (!native) this.mixinKinds.add(kind);
             for (const layer of layers) {
+                if (layer === id && !native) continue;
                 const src = layer === id ? this.cameraPlugin : (this.env.pluginOf(layer) ?? this.cameraPlugin);
                 try {
                     this.unlisten.push(this.env.listen(id, iface, (_d, v) => {
@@ -206,6 +217,7 @@ export class CameraCore {
                         this.safe(() => {
                             this.layerEdges.push({ kind, on: !!v, at: this.env.clock.now() });
                             if (this.layerEdges.length > 64) this.layerEdges.splice(0, this.layerEdges.length - 64);
+                            if (layer !== id) this.kindOwner[kind] = src;
                             this.onBinary(kind, `${kind}:${layer}`, {}, !!v, id, src);
                         });
                     }, layer));
@@ -363,6 +375,15 @@ export class CameraCore {
 
     onBinary(kind: BinaryKind, key: string, d: Details, on: boolean, device: string, layerSource?: string) {
         const ctx = this.ctx();
+        if (!layerSource && !d.mixinId && device === this.env.id && this.mixinKinds.has(kind)) {
+            // no layer claimed it and the camera does not implement it: the mixin that does, or nobody yet (context only)
+            layerSource = this.kindOwner[kind];
+            if (!layerSource) {
+                this.contextChanged(device, kind === 'occupancy' ? 'occupied' : kind, on);
+                if (!on) this.tracker.hold(key, false);
+                return;
+            }
+        }
         // property events carry no mixinId in practice (spike S1): the layer's plugin, else the device's own plugin
         const owner = layerSource ?? (device === this.env.id ? ctx.cameraPlugin : (this.env.state(device)?.pluginId ?? ctx.cameraPlugin));
         const source = layerSource ?? attribute({ mixinId: d.mixinId }, x => this.env.pluginOf(x), owner);
