@@ -43,6 +43,8 @@ class CameraDevice:
     name: str
     area: str | None
     shared: bool
+    # The area's id, which keys the area's subentry and its Uploads position.
+    area_id: str | None = None
 
     @property
     def area_slug(self) -> str:
@@ -102,6 +104,7 @@ def resolve_camera(
     own = own_device(hass, entry_id, camera) if entry_id else None
     if shared is not None:
         name = shared.name_by_user or shared.name or fallback_name
+        area = device_area_name(hass, shared.id)
         return CameraDevice(
             camera=camera,
             device_info=DeviceInfo(
@@ -113,10 +116,12 @@ def resolve_camera(
             ),
             device_id=shared.id,
             name=name,
-            area=device_area_name(hass, shared.id),
+            area=area,
             shared=True,
+            area_id=shared.area_id if area else None,
         )
     name = (own.name_by_user or own.name or fallback_name) if own else fallback_name
+    area = device_area_name(hass, own.id) if own else None
     return CameraDevice(
         camera=camera,
         device_info=DeviceInfo(
@@ -127,8 +132,9 @@ def resolve_camera(
         ),
         device_id=own.id if own else None,
         name=name,
-        area=device_area_name(hass, own.id) if own else None,
+        area=area,
         shared=False,
+        area_id=own.area_id if own and area else None,
     )
 
 

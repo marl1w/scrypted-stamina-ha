@@ -856,6 +856,17 @@ class EventIndex:
 
         return await self._run(_read)
 
+    async def async_copy_areas(self) -> dict[str, str]:
+        """Return the area folder of every event with a copy on some destination."""
+        return await self._run(
+            lambda db: {
+                str(event_id): str(area)
+                for event_id, area in db.execute(
+                    "SELECT DISTINCT e.id, e.area FROM copies c JOIN events e ON e.id = c.event_id"
+                )
+            }
+        )
+
     # ---------------------------------------------------------------- actions
 
     async def async_add_action(self, event_id: str, action: str, created: float) -> None:

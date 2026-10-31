@@ -34,7 +34,8 @@ DEFAULT_VERIFY_SSL: Final = False
 
 # Per-camera option: the linked entities.
 CONF_LINKED: Final = "linked_entities"
-# `select.stamina_uploads`: what is uploaded. Each event takes the position at its start.
+# Each area's Uploads select: what is uploaded. Each event takes the position of its
+# camera's area at its start.
 # `classes`: unusual events, and ordinary ones with a confirmed subject of a chosen class.
 # `unusual`: unusual events only. `off`: nothing uploads, not even to `pending/`.
 UPLOADS_CLASSES: Final = "classes"
@@ -46,6 +47,10 @@ CONF_UPLOAD_CLASSES: Final = "upload_classes"
 DEFAULT_UPLOAD_CLASSES: Final = ("person", "vehicle")
 # Offered in the options even before any camera reports its own.
 BASE_CLASSES: Final = ("person", "vehicle", "animal")
+# Each area's position, as one JSON object in the index's meta keyed by area id (or
+# `NO_AREA`). An area without one takes `META_UPLOADS`, the old global select's position.
+META_AREA_UPLOADS: Final = "area_uploads"
+META_UPLOADS: Final = "uploads"
 # The option the select replaced; read once, to migrate, then removed.
 LEGACY_UNUSUAL_OVERRIDES: Final = "unusual_uploads_when_off"
 # The no-verifier fallback (architecture §3.4): an unverified subject counts as confirmed
@@ -86,6 +91,11 @@ DEFAULT_HISTORY_SIZE_MB: Final = 200
 # ------------------------------------------------------------------ destinations
 
 SUBENTRY_TYPE_DESTINATION: Final = "destination"
+# One per area that holds a camera, managed by the integration (`areas.py`); unique id: the
+# area id, or `NO_AREA` for cameras without one.
+SUBENTRY_TYPE_AREA: Final = "area"
+CONF_AREA_ID: Final = "area_id"
+NO_AREA_TITLE: Final = "No area"
 CONF_DESTINATION_ENTRY: Final = "destination_entry"
 CONF_FOLDER: Final = "folder"
 CONF_QUOTA_GB: Final = "quota_gb"
@@ -230,3 +240,8 @@ def signal_quota(entry_id: str) -> str:
 def signal_cameras(entry_id: str) -> str:
     """Return the dispatcher signal fired when the camera list changes."""
     return f"{DOMAIN}_{entry_id}_cameras"
+
+
+def signal_areas(entry_id: str) -> str:
+    """Return the dispatcher signal fired when the area subentries change."""
+    return f"{DOMAIN}_{entry_id}_areas"

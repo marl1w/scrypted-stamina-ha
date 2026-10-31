@@ -2,13 +2,15 @@
 
 Scrypted provides the facts and the video; Home Assistant decides and stores. This package
 is the Home Assistant half (architecture §3): one config entry per plugin, destinations as
-subentries, a manager that runs the link, the decider, scoring and the uploader.
+subentries, one managed subentry per area (`areas.py`), a manager that runs the link, the
+decider, scoring and the uploader.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -38,6 +40,7 @@ from .const import (
     INDEX_FILENAME,
     LEGACY_UNUSUAL_OVERRIDES,
     PLATFORMS,
+    SUBENTRY_TYPE_AREA,
     SUBENTRY_TYPE_DESTINATION,
 )
 from .destinations import DestinationError, async_create_destination
@@ -62,6 +65,8 @@ class StaminaData:
     client: StaminaClient
     index: EventIndex
     manager: StaminaManager
+    # What a change must touch to need a reload (`_reload_key`).
+    reload_key: Any = None
 
 
 def _targets(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, Target]:
@@ -141,32 +146,63 @@ async def async_setup_entry(hass: HomeAssistant, entry: StaminaConfigEntry) -> b
         await index.async_close()
         raise
 
-    _async_drop_the_switch(hass, entry)
+    _async_drop_old_entities(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, [Platform(p) for p in PLATFORMS])
     async_register_views(hass)
     async_register_commands(hass)
     await async_register_panel(hass, entry)
+    entry.runtime_data.reload_key = _reload_key(entry)
     entry.async_on_unload(entry.add_update_listener(_async_reload))
     return True
 
 
 @callback
-def _async_drop_the_switch(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:
-    """Remove what `select.stamina_uploads` replaced: the old switch and its option.
+def _async_drop_old_entities(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:
+    """Remove what the per-area Uploads selects replaced, and what the old select did.
 
+    The integration-wide `select.stamina_uploads`, and before it a switch and its option.
     Run after the manager has started, which reads the old option once to migrate the
-    switch's state (`StaminaManager._async_restore_uploads`). Idempotent.
+    switch's state, and the old select's position as every area's default
+    (`StaminaManager._async_restore_uploads`). Idempotent.
     """
     registry = er.async_get(hass)
-    if old := registry.async_get_entity_id("switch", DOMAIN, f"{entry.entry_id}_uploads"):
-        registry.async_remove(old)
+    for domain, unique_id in (
+        ("switch", f"{entry.entry_id}_uploads"),
+        ("select", f"{entry.entry_id}_uploads_mode"),
+    ):
+        if old := registry.async_get_entity_id(domain, DOMAIN, unique_id):
+            registry.async_remove(old)
     if LEGACY_UNUSUAL_OVERRIDES in entry.options:
         options = {k: v for k, v in entry.options.items() if k != LEGACY_UNUSUAL_OVERRIDES}
         hass.config_entries.async_update_entry(entry, options=options)
 
 
+def _reload_key(entry: ConfigEntry) -> tuple[Any, ...]:
+    """Return what a reload depends on: everything but the area subentries.
+
+    Those the integration manages itself while running; adding or renaming one must not
+    restart the link.
+    """
+    return (
+        dict(entry.data),
+        dict(entry.options),
+        {
+            subentry_id: (subentry.subentry_type, subentry.title, dict(subentry.data))
+            for subentry_id, subentry in entry.subentries.items()
+            if subentry.subentry_type != SUBENTRY_TYPE_AREA
+        },
+    )
+
+
 async def _async_reload(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:
-    """Reload when options or subentries change."""
+    """Reload when options or destinations change; re-sync when only areas did.
+
+    An area subentry deleted by hand comes back at once.
+    """
+    data = getattr(entry, "runtime_data", None)
+    if data is not None and data.reload_key == _reload_key(entry):
+        data.manager.async_sync_areas()
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 

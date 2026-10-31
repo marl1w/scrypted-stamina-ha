@@ -17,6 +17,13 @@ On each destination's device (filed under its subentry):
 * pending: what the follow-up window holds in `pending/`, against its cap;
 * health: `ok`, or `failing` after `HEALTH_FAILURES` failed operations in a row (uploads,
   commits, evictions), with the last error as an attribute.
+
+On each area's device (filed under its subentry, `areas.py`), the same data filtered to the
+events of that area (by the area folder each was filed under at its start):
+
+* quota: bytes its events hold on the destination, with the share of the quota;
+* status: `ok`, or `failing` while a destination is failing (failures are not per area),
+  with what the area has uploading and held for the follow-up window.
 """
 
 from __future__ import annotations
@@ -36,8 +43,11 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import StaminaConfigEntry
 from .const import signal_quota, signal_update
 from .entity import (
+    AreaEntity,
     CameraEntity,
     StaminaEntity,
+    async_hub_device_id,
+    async_setup_per_area,
     async_setup_per_camera,
     destination_device,
     hub_device,
@@ -58,9 +68,10 @@ async def async_setup_entry(
     # One device per destination, filed under its subentry; a removed destination's
     # entities are removed with it.
     live: set[str] = set()
+    hub_id = async_hub_device_id(hass, entry)
     for subentry_id, target in manager.uploader.targets.items():
         title = entry.subentries[subentry_id].title
-        entities = [cls(manager, target, title) for cls in DESTINATION_SENSORS]
+        entities = [cls(manager, target, title, hub_id) for cls in DESTINATION_SENSORS]
         live.update(str(entity.unique_id) for entity in entities)
         async_add_entities(entities, config_subentry_id=subentry_id)
     registry = er.async_get(hass)
@@ -74,6 +85,13 @@ async def async_setup_entry(
         manager,
         async_add_entities,
         lambda camera: [LastScoreSensor(manager, camera)],
+        entry.async_on_unload,
+    )
+    async_setup_per_area(
+        hass,
+        manager,
+        async_add_entities,
+        lambda subentry, hub_id: [cls(manager, subentry, hub_id) for cls in AREA_SENSORS],
         entry.async_on_unload,
     )
 
@@ -172,14 +190,16 @@ class _DestinationSensor(StaminaEntity, SensorEntity):
 
     key: str = ""
 
-    def __init__(self, manager: StaminaManager, target: Target, title: str) -> None:
+    def __init__(self, manager: StaminaManager, target: Target, title: str, hub_id: str) -> None:
         """Bind to one destination."""
         super().__init__(manager)
         self.target = target
         # `<entry>_<subentry>_quota_used` is the id the first version had: kept, so history
         # survives the move onto the destination's device.
         self._attr_unique_id = f"{manager.entry.entry_id}_{target.subentry_id}_{self.key}"
-        self._attr_device_info = destination_device(manager.entry, target.subentry_id, title)
+        self._attr_device_info = destination_device(
+            manager.entry, target.subentry_id, title, hub_id
+        )
         self._attr_translation_key = self.key
 
     def _signal(self) -> str:
@@ -321,3 +341,66 @@ class OrphanSensor(_HubSensor):
             target.label: target.usage.orphans()[1]
             for target in self.manager.uploader.targets.values()
         }
+
+
+class AreaQuotaSensor(AreaEntity, SensorEntity):
+    """Bytes one area's events hold on the destination."""
+
+    key = "quota"
+    platform_domain = "sensor"
+    _attr_device_class = SensorDeviceClass.DATA_SIZE
+    _attr_native_unit_of_measurement = UnitOfInformation.BYTES
+    _attr_suggested_unit_of_measurement = UnitOfInformation.GIGABYTES
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _unrecorded_attributes = frozenset({"events"})
+
+    def _signal(self) -> str:
+        """Refresh when the destinations' holdings change (commit, evict, drop)."""
+        return signal_quota(self.manager.entry.entry_id)
+
+    @property
+    def native_value(self) -> int:
+        """Return the bytes held."""
+        return self.manager.area_holdings(self.area)["used"]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the share of the destination's quota, and how many events."""
+        held = self.manager.area_holdings(self.area)
+        quota = held["quota"]
+        return {
+            "percent_of_quota": None if quota <= 0 else round(100 * held["used"] / quota, 2),
+            "events": held["events"],
+        }
+
+
+class AreaStatusSensor(AreaEntity, SensorEntity):
+    """Whether one area's uploads work, and what it has in flight."""
+
+    key = "status"
+    platform_domain = "sensor"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["ok", "failing"]  # noqa: RUF012 - read-only
+    _unrecorded_attributes = frozenset({"uploading", "pending_events", "pending_bytes"})
+
+    @property
+    def native_value(self) -> str:
+        """Return `ok`, or `failing` while any destination fails."""
+        targets = self.manager.uploader.targets.values()
+        return "ok" if all(target.healthy for target in targets) else "failing"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return what the area uploads now and holds for the follow-up window."""
+        held = self.manager.area_holdings(self.area)
+        failing = [t for t in self.manager.uploader.targets.values() if not t.healthy]
+        return {
+            "uploads": self.manager.uploads_for(self.area),
+            "uploading": held["uploading"],
+            "pending_events": held["held"],
+            "pending_bytes": held["pending"],
+            "last_error": failing[0].last_error if failing else None,
+        }
+
+
+AREA_SENSORS: tuple[type[AreaEntity], ...] = (AreaQuotaSensor, AreaStatusSensor)

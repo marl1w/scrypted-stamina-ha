@@ -7,6 +7,8 @@
 * **Destinations** are subentries ("Add destination"), chosen from the storage integrations
   already set up, as in Reolink Stamina. Each has a folder, a quota, a retention, and a cap on
   the pending storage the follow-up window may hold.
+* **Areas** are subentries too, but the integration manages them (`areas.py`): their type
+  is not listed here, so the integration page offers no way to add one by hand.
 """
 
 from __future__ import annotations
@@ -296,7 +298,7 @@ class StaminaConfigFlow(ConfigFlow, domain=DOMAIN):
     def async_get_supported_subentry_types(
         cls, config_entry: ConfigEntry
     ) -> dict[str, type[ConfigSubentryFlow]]:
-        """Destinations are subentries."""
+        """Destinations are subentries; area subentries are managed, so not offered."""
         return {SUBENTRY_TYPE_DESTINATION: DestinationSubentryFlow}
 
 

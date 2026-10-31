@@ -1,4 +1,4 @@
-"""`select.stamina_uploads`: the three positions, the class filter, and the migration."""
+"""Each area's Uploads select: the three positions, the class filter, and the migrations."""
 
 from __future__ import annotations
 
@@ -11,12 +11,16 @@ from custom_components.scrypted_stamina.const import (
     DOMAIN,
     INDEX_FILENAME,
     LEGACY_UNUSUAL_OVERRIDES,
+    NO_AREA,
 )
 from custom_components.scrypted_stamina.decider import EventState
 from custom_components.scrypted_stamina.index import EventIndex
 from custom_components.scrypted_stamina.relevance import RelevanceResult
 
 from .conftest import Clock, event_id, make_entry, subject, until
+
+# The test camera has no area: it is in the "No area" subentry.
+UPLOADS = "select.stamina_no_area_uploads"
 
 
 def model(unusual: bool):
@@ -76,10 +80,10 @@ async def test_every_position(
     await hass.services.async_call(
         "select",
         "select_option",
-        {"entity_id": "select.stamina_uploads", "option": mode},
+        {"entity_id": UPLOADS, "option": mode},
         blocking=True,
     )
-    assert manager.uploads == mode
+    assert manager.uploads_for(NO_AREA) == mode
     eid = event_id(300)
     run(stamina, eid, cls)
     stored = await settle(hass, manager, clock, eid)
@@ -145,8 +149,8 @@ async def test_the_position_survives_a_restart(hass, stamina, destinations, setu
     entry = await setup()
     await entry.runtime_data.manager.async_set_uploads("unusual")
     await reload(entry)
-    assert entry.runtime_data.manager.uploads == "unusual"
-    assert hass.states.get("select.stamina_uploads").state == "unusual"
+    assert entry.runtime_data.manager.uploads_for(NO_AREA) == "unusual"
+    assert hass.states.get(UPLOADS).state == "unusual"
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -174,12 +178,12 @@ async def test_the_switch_migrates_to_the_select(
     registry.async_get_or_create("switch", DOMAIN, f"{entry.entry_id}_uploads", config_entry=entry)
 
     await setup(entry=entry)
-    assert entry.runtime_data.manager.uploads == expected
+    assert entry.runtime_data.manager.uploads_for(NO_AREA) == expected
     assert LEGACY_UNUSUAL_OVERRIDES not in entry.options
     assert registry.async_get_entity_id("switch", DOMAIN, f"{entry.entry_id}_uploads") is None
     # Idempotent: a second start keeps what was migrated.
     await reload(entry)
-    assert entry.runtime_data.manager.uploads == expected
+    assert entry.runtime_data.manager.uploads_for(NO_AREA) == expected
     await hass.config_entries.async_unload(entry.entry_id)
 
 

@@ -10,7 +10,7 @@ from homeassistant.helpers import (
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.scrypted_stamina import uploader as uploader_module
-from custom_components.scrypted_stamina.const import DOMAIN
+from custom_components.scrypted_stamina.const import DOMAIN, SUBENTRY_TYPE_DESTINATION
 
 from .conftest import event_id, make_entry, subject, until
 
@@ -20,7 +20,6 @@ PER_CAMERA = (
     "sensor.front_door_last_event_score",
 )
 HUB = (
-    "select.stamina_uploads",
     "sensor.stamina_queue",
     "sensor.stamina_latency",
     "sensor.stamina_orphans",
@@ -72,7 +71,7 @@ async def test_without_scrypted_mqtt_a_device_per_camera_is_created(hass, setup)
     assert state.attributes["capabilities"]["video_recorder"] is True
     assert state.attributes["learning"] is True
     assert hass.states.get("binary_sensor.front_door_unusual").state == "off"
-    assert hass.states.get("select.stamina_uploads").state == "classes"
+    assert hass.states.get("select.stamina_no_area_uploads").state == "classes"
     assert float(hass.states.get("sensor.webdav_nas_0_quota_used").state) == 0
     await hass.config_entries.async_unload(entry.entry_id)
 
@@ -124,7 +123,8 @@ async def test_hub_and_destination_devices(hass, setup) -> None:
     for entity_id in HUB:
         assert entities.async_get(entity_id).device_id == hub.id, entity_id
 
-    for n, subentry_id in enumerate(entry.subentries):
+    destinations = entry.get_subentries_of_type(SUBENTRY_TYPE_DESTINATION)
+    for n, subentry_id in enumerate(subentry.subentry_id for subentry in destinations):
         device = devices.async_get_device_by_identifier(
             (DOMAIN, f"{entry.entry_id}_{subentry_id}"), entry.entry_id
         )

@@ -6,7 +6,7 @@ in the right order and writes every outcome to the index before acting on it:
 
 * `event.start`: a record is created with the camera's area, name and folder fixed; the
   context is snapshotted; the event is registered for the predecessor term (so overlapping
-  events on several cameras count); uploading begins if uploads are armed.
+  events on several cameras count); uploading begins if the camera's area uploads.
 * `event.update`, `subject.verdict`, `event.segment`: facts are merged; the uploader is
   poked; the live score (for `binary_sensor.<cam>_unusual`) is refreshed.
 * `event.end`: the end context is snapshotted, the provisional score computed, and the
@@ -43,6 +43,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field
 import datetime as dt
+import json
 import logging
 import statistics
 import time
@@ -50,7 +51,11 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant, callback
-from homeassistant.helpers import device_registry as dr, issue_registry as ir
+from homeassistant.helpers import (
+    area_registry as ar,
+    device_registry as dr,
+    issue_registry as ir,
+)
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import (
     async_call_later,
@@ -61,6 +66,13 @@ from homeassistant.helpers.event import (
 from homeassistant.util import dt as dt_util
 
 from .api import StaminaApiError, StaminaClient
+from .areas import (
+    area_key,
+    area_subentries,
+    async_sync_area_subentries,
+    slug_of,
+    wanted_areas,
+)
 from .const import (
     CONF_CAMERAS,
     CONF_FOLLOW_UP_MINUTES,
@@ -86,6 +98,8 @@ from .const import (
     FRESH_DAYS,
     LATENCY_SAMPLES,
     LEGACY_UNUSUAL_OVERRIDES,
+    META_AREA_UPLOADS,
+    META_UPLOADS,
     POSITION_SAVE_SECONDS,
     RELEVANCE_HISTORY_DAYS,
     SAVE_DEBOUNCE_SECONDS,
@@ -99,6 +113,7 @@ from .const import (
     UPLOADS_CLASSES,
     UPLOADS_OFF,
     UPLOADS_UNUSUAL,
+    signal_areas,
     signal_camera,
     signal_cameras,
     signal_event,
@@ -121,7 +136,7 @@ from .decider import (
     orphan,
     subject_confirmed,
 )
-from .devices import CameraDevice, async_relink, resolve_camera
+from .devices import CameraDevice, async_relink, own_identifier, resolve_camera
 from .index import ACTION_COMMIT, ACTION_DROP, EventIndex
 from .link import StaminaLink
 from .naming import event_folder_name
@@ -204,8 +219,12 @@ class StaminaManager:
         self.now: Callable[[], float] = time.time
         self.records: dict[str, EventRecord] = {}
         self.cameras: dict[str, CameraStatus] = {}
-        # The position of `select.stamina_uploads`, persisted in the index's meta.
-        self.uploads = UPLOADS_CLASSES
+        # Each area's Uploads position by area key, persisted in the index's meta; an
+        # area without one takes the default, the old global select's position.
+        self.default_uploads = UPLOADS_CLASSES
+        self.area_uploads: dict[str, str] = {}
+        # The area folder of every event with a copy somewhere, for the per-area sensors.
+        self._event_areas: dict[str, str] = {}
         self.latencies: deque[float] = deque(maxlen=LATENCY_SAMPLES)
         self.analysis = Analysis(
             hass,
@@ -268,9 +287,16 @@ class StaminaManager:
 
     async def async_start(self) -> None:
         """Resume from the index, connect, and start the timers."""
-        self.uploads = await self._async_restore_uploads()
+        self.default_uploads = await self._async_restore_uploads()
+        stored = await self.index.async_get_meta(META_AREA_UPLOADS)
+        self.area_uploads = {
+            str(key): mode
+            for key, mode in (json.loads(stored) if stored else {}).items()
+            if mode in UPLOAD_MODES
+        }
         await self.async_refresh_cameras()
         await self.uploader.async_start()
+        self._event_areas = await self.index.async_copy_areas()
         # Learned in the background: setup does not wait on months of history. Until it is
         # done every camera reads as learning, which is what an empty model says anyway.
         self._spawn(self.analysis.async_rebuild(), "relevance rebuild")
@@ -305,6 +331,9 @@ class StaminaManager:
         )
         self._unsub.append(
             self.hass.bus.async_listen(dr.EVENT_DEVICE_REGISTRY_UPDATED, self._device_updated)
+        )
+        self._unsub.append(
+            self.hass.bus.async_listen(ar.EVENT_AREA_REGISTRY_UPDATED, self._area_updated)
         )
 
     async def async_stop(self) -> None:
@@ -381,6 +410,7 @@ class StaminaManager:
                 added = True
         if added:
             async_dispatcher_send(self.hass, signal_cameras(self.entry.entry_id))
+        self.async_sync_areas()
 
     def _camera(self, camera: str, name: str | None = None) -> CameraStatus:
         """Return a camera's status, creating a placeholder for one not listed yet."""
@@ -398,22 +428,48 @@ class StaminaManager:
 
     @callback
     def _device_updated(self, event: Event[dr.EventDeviceRegistryUpdatedData]) -> None:
-        """Link cameras to `scrypted_mqtt` devices that appear (or change) after setup."""
+        """Follow camera devices that appear or change after setup: links and areas.
+
+        A `scrypted_mqtt` device that appears is linked to; a camera moved to another area
+        (on either device) moves to that area's subentry and Uploads position.
+        """
         if event.data["action"] not in ("create", "update"):
             return
         device = dr.async_get(self.hass).async_get(event.data["device_id"])
         if device is None:
             return
-        for domain, identifier in device.identifiers:
-            if domain != SCRYPTED_MQTT_DOMAIN:
-                continue
-            camera = identifier.rpartition(":")[2]
-            status = self.cameras.get(camera)
-            if status is None:
+        found = False
+        for camera, status in self.cameras.items():
+            if own_identifier(camera) not in device.identifiers and not any(
+                domain == SCRYPTED_MQTT_DOMAIN and identifier.rpartition(":")[2] == camera
+                for domain, identifier, *_ in device.identifiers
+            ):
                 continue
             status.device = resolve_camera(self.hass, camera, status.info.name, self.entry.entry_id)
             async_relink(self.hass, self.entry.entry_id, status.device)
             self._changed(camera)
+            found = True
+        if found:
+            self.async_sync_areas()
+
+    @callback
+    def _area_updated(self, event: Event[ar.EventAreaRegistryUpdatedData]) -> None:
+        """Follow an area renamed or removed: titles, folders and subentries."""
+        if event.data["action"] == "reorder":
+            return
+        for camera, status in self.cameras.items():
+            status.device = resolve_camera(self.hass, camera, status.info.name, self.entry.entry_id)
+            self._changed(camera)
+        self.async_sync_areas()
+
+    @callback
+    def async_sync_areas(self) -> None:
+        """Keep one area subentry per area that holds a camera (`areas.py`)."""
+        if self._stopping:
+            return
+        wanted = wanted_areas([status.device for status in self.cameras.values()])
+        if async_sync_area_subentries(self.hass, self.entry, wanted):
+            async_dispatcher_send(self.hass, signal_areas(self.entry.entry_id))
 
     # ------------------------------------------------------------------ messages
 
@@ -528,11 +584,12 @@ class StaminaManager:
 
         status = self._camera(facts.camera, facts.camera_name)
         device = status.device
+        mode = self.uploads_for(area_key(device))
         local = dt_util.as_local(dt_util.utc_from_timestamp(facts.started))
         record = EventRecord(
             facts=facts,
-            admitted=self.uploads == UPLOADS_CLASSES,
-            upload_mode=self.uploads,
+            admitted=mode == UPLOADS_CLASSES,
+            upload_mode=mode,
             area=device.area_slug,
             camera_name=device.name,
             folder=event_folder_name(local, device.name, facts.id),
@@ -550,7 +607,7 @@ class StaminaManager:
         if record.admitted:
             await self.uploader.async_track(record)
         else:
-            record.note(f"uploads_{self.uploads}_at_start")
+            record.note(f"uploads_{mode}_at_start")
         self._thumbnail_soon(record, THUMBNAIL_DELAY, "start")
         return record
 
@@ -1215,13 +1272,67 @@ class StaminaManager:
                 thinned,
             )
 
-    async def async_set_uploads(self, mode: str) -> None:
-        """Set the uploads position: it applies to events that start from now on."""
+    def uploads_for(self, key: str) -> str:
+        """Return an area's Uploads position, by area key."""
+        return self.area_uploads.get(key, self.default_uploads)
+
+    async def async_set_uploads(self, mode: str, key: str | None = None) -> None:
+        """Set an area's Uploads position (every area's, without one).
+
+        It applies to events that start from now on.
+        """
         if mode not in UPLOAD_MODES:
             raise ValueError(f"unknown uploads position {mode}")
-        self.uploads = mode
-        await self.index.async_set_meta({"uploads": mode})
+        keys = [key] if key is not None else list(area_subentries(self.entry))
+        self.area_uploads.update(dict.fromkeys(keys, mode))
+        if key is None:
+            self.default_uploads = mode
+        await self.index.async_set_meta(
+            {
+                META_AREA_UPLOADS: json.dumps(self.area_uploads, sort_keys=True),
+                META_UPLOADS: self.default_uploads,
+            }
+        )
         self._changed()
+
+    def area_holdings(self, key: str) -> dict[str, Any]:
+        """Return what one area's events hold, on the destination holding most of them.
+
+        Read from the index rows (each event's area, as filed at its start) and the
+        destinations' holdings. Every kept event goes to every destination, so they agree
+        but for failures.
+        """
+        subentry = area_subentries(self.entry).get(key)
+        slug = slug_of(subentry) if subentry is not None else None
+        targets = list(self.uploader.targets.values())
+        # Known areas: events in memory, and those held somewhere (forgotten once not).
+        self._event_areas = {
+            event_id: area
+            for event_id, area in self._event_areas.items()
+            if event_id in self.records or any(t.usage.get(event_id) for t in targets)
+        } | {record.id: record.area for record in self.records.values()}
+        ids = [event_id for event_id, area in self._event_areas.items() if area == slug]
+        best: dict[str, Any] = {"used": 0, "events": 0, "quota": 0, "pending": 0, "held": 0}
+        uploading = sum(
+            1
+            for record in self.records.values()
+            if record.area == slug
+            and record.admitted
+            and record.state in (EventState.PENDING, EventState.KEEPING)
+        )
+        for target in targets:
+            found = [held for event_id in ids if (held := target.usage.get(event_id))]
+            pending = [held for held in found if held.state is EventState.FOLLOW_UP]
+            used = sum(held.size for held in found)
+            if used >= best["used"]:
+                best = {
+                    "used": used,
+                    "events": len(found),
+                    "quota": target.quota,
+                    "pending": sum(held.size for held in pending),
+                    "held": len(pending),
+                }
+        return {**best, "uploading": uploading}
 
     async def _async_restore_uploads(self) -> str:
         """Return the stored position, migrating the old switch's state once.
@@ -1229,7 +1340,7 @@ class StaminaManager:
         The switch on becomes "Chosen classes"; off becomes "Unusual only" when unusual
         events used to upload anyway (the old option, on by default), else "Off".
         """
-        stored = await self.index.async_get_meta("uploads")
+        stored = await self.index.async_get_meta(META_UPLOADS)
         if stored in UPLOAD_MODES:
             return stored
         enabled = await self.index.async_get_meta("uploads_enabled")
@@ -1239,7 +1350,7 @@ class StaminaManager:
             mode = UPLOADS_UNUSUAL
         else:
             mode = UPLOADS_OFF
-        await self.index.async_set_meta({"uploads": mode})
+        await self.index.async_set_meta({META_UPLOADS: mode})
         return mode
 
     def record_latency(self, seconds: float) -> None:
