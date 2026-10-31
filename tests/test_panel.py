@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+import shutil
+import subprocess
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -421,6 +423,26 @@ async def test_cameras(hass, hass_ws_client, stamina_entry) -> None:
     assert result["learning_needs"] == {"days": 7.0, "events": 200}
 
 
+async def test_cameras_come_grouped_by_area(hass, hass_ws_client, stamina_entry) -> None:
+    cameras = stamina_entry.manager.cameras
+    cameras["14"] = camera("14", "Side path", None)
+    cameras["15"] = camera("15", "Back yard", "Outside")
+    cameras["16"] = camera("16", "Attic", "Attic")
+    client = await hass_ws_client(hass)
+    result = await call(client, type=f"{DOMAIN}/cameras")
+    # Areas by name, cameras by name inside each, no area last; every row says its area.
+    assert [(cam["area"], cam["name"]) for cam in result["cameras"]] == [
+        ("Attic", "Attic"),
+        ("Entrance", "Front door"),
+        ("Outside", "Back yard"),
+        ("Outside", "Driveway"),
+        ("Outside", "Garden"),
+        (None, "Side path"),
+    ]
+    source = (panel.FRONTEND_DIR / "scrypted-stamina-panel.js").read_text()
+    assert "areaGroups" in source and '"No area"' in source
+
+
 # ---------------------------------------------------------------------- subscribe
 
 
@@ -481,6 +503,24 @@ async def test_panel_registers_and_reregisters(hass) -> None:
     panel.async_unregister_panel(hass)
     assert panel.PANEL_URL_PATH not in panels
     panel.async_unregister_panel(hass)
+
+
+def test_the_panel_is_one_page() -> None:
+    """No view to navigate to: the event opens beside the list, or under its row."""
+    source = (panel.FRONTEND_DIR / "scrypted-stamina-panel.js").read_text()
+    assert "pushState" not in source  # the URL is only ever replaced: Back leaves the panel
+    assert '"/cameras"' not in source and "_back(" not in source
+    for needed in ("WIDE_PX", "_preselect", "ArrowDown", "cam-chip", "aria-expanded"):
+        assert needed in source, needed
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_frontend_parses() -> None:
+    for path in panel.FRONTEND_DIR.glob("*.js"):
+        result = subprocess.run(
+            ["node", "--check", str(path)], capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 0, (path.name, result.stderr)
 
 
 def test_frontend_is_shipped_without_the_preview() -> None:

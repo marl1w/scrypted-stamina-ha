@@ -1,15 +1,19 @@
 /**
  * Scrypted Stamina: the review panel.
  *
- * Three screens, each one tap from the next, and the browser's Back between them:
+ * One page, no navigation between views:
  *
- *   /                 Events: newest first, unusual ones marked, three filters.
- *   /event/<id>       One event: it plays at once; under it, one card saying why it scored
- *                     as it did, and everything else folded into "Details".
- *   /cameras          Each camera: is it working, what can it do, is it ready.
+ *   Wide (over WIDE_PX): master-detail. The list on the left (camera chips, filters, events),
+ *   the selected event on the right: it plays at once, with why it was flagged, the decision
+ *   and what was seen. On open the latest unusual event is selected (else the latest), so
+ *   "find the latest unusual and play it" takes no click; a row click or the arrow keys
+ *   change only the right side.
+ *   Narrow (a phone): the list only. Tapping a row opens that event inline under it; tapping
+ *   it again, or another row, closes it.
  *
- * Filters live in the query string (`?unusual=1&camera=11`), so Back, reload and links keep
- * them. Registered through `panel_custom`, so it runs inside Home Assistant's frontend with
+ * The camera chips above the list say how each camera is doing and filter the list to it.
+ * The URL holds only the filters (`?unusual=1&camera=11`) and the selected event
+ * (`/event/<id>`), replaced rather than pushed, so Back leaves the panel. Registered through `panel_custom`, so it runs inside Home Assistant's frontend with
  * the real `hass`. Plain ES modules, no build. `tools/panel-preview/` runs it on sample data.
  */
 
@@ -47,6 +51,10 @@ const SUBSCRIBE_RETRY_MS = 30000;
 const THUMB_TTL_MS = 5 * 3600 * 1000;
 const MAX_ITEMS = 1000;
 const NO_FILTERS = { unusual: false, cls: "", camera: "", area: "", dropped: false };
+// From this width of the panel, the selected event shows beside the list.
+const WIDE_PX = 900;
+// A camera with no event for this long reads "No recent events".
+const QUIET_S = 24 * 3600;
 
 function errorText(err) {
   if (err?.code === "not_loaded") {
@@ -95,26 +103,46 @@ function searchFromFilters(filters) {
 
 const sameFilters = (a, b) => searchFromFilters(a) === searchFromFilters(b);
 
+const NO_AREA = "No area";
+const byName = (a, b) => a.localeCompare(b, undefined, { sensitivity: "base" });
+
+/** Cameras grouped by their Home Assistant area: areas by name, "No area" last. */
+function areaGroups(cams) {
+  const groups = new Map();
+  for (const cam of cams) {
+    const area = cam.area || null;
+    if (!groups.has(area)) groups.set(area, []);
+    groups.get(area).push(cam);
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => (a === null) - (b === null) || byName(a || "", b || ""))
+    .map(([area, members]) => ({ area, label: area || NO_AREA, cams: members.sort((x, y) => byName(x.name, y.name)) }));
+}
+
+/** "Area · Camera" where the area is known. */
+function cameraLabel(area, name) {
+  return area ? `${area} · ${name}` : name;
+}
+
 class ScryptedStaminaPanel extends HTMLElement {
   constructor() {
     super();
     this._root = this.attachShadow({ mode: "open" });
     adoptStyles(this._root, STYLES);
     this._header = el("header", { class: "header" });
-    this._views = {
-      list: el("main", { class: "view" }),
-      event: el("main", { class: "view", hidden: true }),
-      cameras: el("main", { class: "view", hidden: true }),
-    };
-    this._root.append(this._header, ...Object.values(this._views));
+    this._listPane = el("div", { class: "pane pane--list" });
+    this._detailPane = el("aside", { class: "pane pane--detail", "aria-label": "Event" });
+    this._detail = el("div", { class: "detail", role: "region", "aria-label": "Selected event" });
+    this._main = el("main", { class: "split" }, this._listPane, this._detailPane);
+    this._root.append(this._header, this._main);
 
     this._filters = { ...NO_FILTERS };
     this._list = this._freshList();
     this._cams = { items: [], loaded: false, error: null, needs: null };
     this._event = null;
+    this._selected = null;
+    this._wide = false;
     this._link = true;
-    this._view = null;
-    this._listScroll = 0;
     this._thumbs = new Map();
     this._rows = new Map();
     this._lastRefresh = 0;
@@ -123,6 +151,9 @@ class ScryptedStaminaPanel extends HTMLElement {
     };
 
     this._buildList();
+    this._onKey = (ev) => this._key(ev);
+    this._root.addEventListener("keydown", this._onKey);
+    this._resize = new ResizeObserver(() => this._layout());
   }
 
   _freshList() {
@@ -146,7 +177,7 @@ class ScryptedStaminaPanel extends HTMLElement {
 
   set narrow(value) {
     this._narrow = value;
-    if (this._view) this._renderHeader();
+    if (this._started) this._renderHeader();
   }
 
   set panel(value) {
@@ -160,11 +191,13 @@ class ScryptedStaminaPanel extends HTMLElement {
 
   connectedCallback() {
     document.addEventListener("visibilitychange", this._onVisible);
+    this._resize.observe(this);
     this._start();
   }
 
   disconnectedCallback() {
     document.removeEventListener("visibilitychange", this._onVisible);
+    this._resize.disconnect();
     this._started = false;
     this._routeKey = null;
     clearTimeout(this._nudgeTimer);
@@ -180,10 +213,44 @@ class ScryptedStaminaPanel extends HTMLElement {
   _start() {
     if (this._started || !this._hass || !this.isConnected) return;
     this._started = true;
+    this._wide = this.getBoundingClientRect().width >= WIDE_PX;
     this._subscribe();
     this._loadCameras();
     if (this._list.loaded) this._refreshList();
+    this._renderHeader();
     this._routeChanged();
+  }
+
+  /** Beside the list, or under its row: decided by the panel's own width. */
+  _layout() {
+    const wide = this.getBoundingClientRect().width >= WIDE_PX;
+    if (wide === this._wide) return;
+    this._wide = wide;
+    this._placeDetail();
+    this._renderList();
+    if (wide && !this._selected) this._preselect();
+  }
+
+  _placeDetail() {
+    this._main.classList.toggle("split--wide", this._wide);
+    this._detailPane.hidden = !this._wide;
+    if (!this._wide) return;
+    this._idle ??= empty("mdi:gesture-tap", "Pick an event", "Its video and why it was flagged show here.");
+    const target = this._selected ? this._detail : this._idle;
+    // Moving a node that holds a playing video pauses it: only place it when it is elsewhere.
+    if (this._detailPane.firstChild !== target || this._detailPane.childNodes.length !== 1) {
+      replace(this._detailPane, target);
+    }
+  }
+
+  /** Videos in the open event that are playing now, to resume after the list is redrawn. */
+  _playing() {
+    const videos = [...this._detail.querySelectorAll("video")];
+    for (const player of this._detail.querySelectorAll("ha-hls-player")) {
+      const inner = player.shadowRoot?.querySelector("video");
+      if (inner) videos.push(inner);
+    }
+    return videos.filter((video) => !video.paused);
   }
 
   _subscribe() {
@@ -214,7 +281,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       this._lastRefresh = Date.now();
       if (this._list.loaded) this._refreshList();
       if (this._cams.loaded) this._loadCameras();
-      if (this._view === "event" && this._event?.data) this._loadEvent(this._event.id);
+      if (this._event?.data) this._loadEvent(this._event.id);
     }, wait);
   }
 
@@ -229,20 +296,22 @@ class ScryptedStaminaPanel extends HTMLElement {
     if (!this._hass || !this._started) return;
     const path = this._route?.path || "";
     const search = this._search();
-    // Home Assistant may hand over the same route again; only a new one changes the screen.
+    // Home Assistant may hand over the same route again; only a new one changes anything.
     if (`${path}${search}` === this._routeKey) return;
     this._routeKey = `${path}${search}`;
 
     const filters = filtersFromSearch(search);
-    if (!sameFilters(filters, this._filters)) {
-      this._filters = filters;
-      this._listScroll = 0;
-      this._list = this._freshList();
-    }
     const match = path.match(/^\/event\/([A-Za-z0-9_.-]+)/);
-    if (match) this._show("event", match[1]);
-    else if (path.startsWith("/cameras")) this._show("cameras");
-    else this._show("list");
+    const id = match ? match[1] : null;
+    if (!sameFilters(filters, this._filters) || (!this._list.loaded && !this._list.loading)) {
+      this._filters = filters;
+      // A selection from the URL (a link) stays even when it is not on the first page.
+      this._routeHadEvent = Boolean(id);
+      this._listPane.scrollTop = 0;
+      this._loadList();
+    }
+    if (id !== this._selected) this._select(id, { route: false });
+    this._placeDetail();
   }
 
   _url(path, filters = this._filters) {
@@ -250,95 +319,93 @@ class ScryptedStaminaPanel extends HTMLElement {
     return `${prefix}${path}${searchFromFilters(filters)}`;
   }
 
-  _go(path, { filters = this._filters, replace: swap = false } = {}) {
-    const depth = (history.state?.staminaDepth || 0) + (swap ? 0 : 1);
-    history[swap ? "replaceState" : "pushState"]({ staminaDepth: depth }, "", this._url(path, filters));
-    window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: swap } }));
+  /** Write the filters and the selection to the URL, replacing: Back leaves the panel. */
+  _setRoute({ filters = this._filters, id = this._selected } = {}) {
+    const path = id ? `/event/${id}` : "";
+    history.replaceState(history.state, "", this._url(path, filters));
+    window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: true } }));
     // Home Assistant does not always pass a new route when only the query changed.
     if (this._route && this._route.search === undefined) {
-      this._route = { ...this._route, path: path || "" };
+      this._route = { ...this._route, path };
     } else if (this._route) {
-      this._route = { ...this._route, path: path || "", search: searchFromFilters(filters) };
+      this._route = { ...this._route, path, search: searchFromFilters(filters) };
     }
     this._routeChanged();
   }
 
-  /** Back to where the user came from, or to the list when they arrived from a link. */
-  _back() {
-    if ((history.state?.staminaDepth || 0) > 0) history.back();
-    else this._go("", { replace: true });
+  /**
+   * Show one event: beside the list when wide, under its row on a phone. Selecting the open
+   * row again on a phone closes it; `null` closes whatever is open.
+   */
+  _select(id, { route = true, focus = false } = {}) {
+    if (id && id === this._selected && !this._wide && route) id = null;
+    if (id !== this._selected) {
+      this._stopVideo();
+      this._selected = id;
+      this._event = null;
+      if (id) this._openEvent(id);
+    }
+    if (route) {
+      this._setRoute({ id });
+    }
+    this._placeDetail();
+    this._renderList();
+    if (focus && id) this._rows.get(id)?.node.focus({ preventScroll: false });
   }
 
-  _show(view, id) {
-    if (this._view === "list" && view !== "list") this._listScroll = this._views.list.scrollTop;
-    if (this._view === "event" && (view !== "event" || id !== this._event?.id)) {
-      this._stopVideo();
-      if (view !== "event") this._event = null;
+  /** Wide only: the latest unusual event, else the latest, so it plays without a click. */
+  async _preselect() {
+    if (!this._wide || this._selected) return;
+    const token = this._list.token;
+    let pick = null;
+    try {
+      const result = await this._ws({ ...this._query(), unusual: true, limit: 1 });
+      pick = result.events[0] || null;
+    } catch {
+      pick = null;
     }
-    this._view = view;
-    for (const [name, node] of Object.entries(this._views)) node.hidden = name !== view;
-    if (view === "list") {
-      if (!this._list.loaded && !this._list.loading) this._loadList();
-      else this._renderList();
-      this._views.list.scrollTop = this._listScroll;
-    } else if (view === "cameras") {
-      this._renderCameras();
-      this._views.cameras.scrollTop = 0;
-    } else if (this._event?.id !== id) {
-      this._views.event.scrollTop = 0;
-      this._openEvent(id);
-    }
-    this._renderHeader();
+    if (token !== this._list.token || this._selected || !this._wide) return;
+    pick = pick || this._list.items[0];
+    if (pick) this._select(pick.id, { route: true });
+  }
+
+  /** Up and down move the selection when the list and the event sit side by side. */
+  _key(ev) {
+    if (!this._wide || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    if (ev.key !== "ArrowDown" && ev.key !== "ArrowUp") return;
+    const tag = ev.composedPath()[0]?.tagName;
+    if (["SELECT", "INPUT", "TEXTAREA", "VIDEO", "HA-HLS-PLAYER"].includes(tag)) return;
+    const items = this._list.items;
+    if (!items.length) return;
+    const at = items.findIndex((item) => item.id === this._selected);
+    const next = ev.key === "ArrowDown" ? Math.min(items.length - 1, at + 1) : Math.max(0, at - 1);
+    if (next === at) return;
+    ev.preventDefault();
+    this._select(items[next].id, { focus: true });
   }
 
   // ---------------------------------------------------------------- header
 
   _renderHeader() {
-    const button = (iconName, label, onclick, disabled = false) =>
-      el("button", { class: "icon-btn", title: label, "aria-label": label, onclick, disabled }, icon(iconName));
-    const title = (main, sub) =>
+    replace(
+      this._header,
+      this._narrow
+        ? el(
+            "button",
+            {
+              class: "icon-btn",
+              title: "Menu",
+              "aria-label": "Menu",
+              onclick: () => this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true })),
+            },
+            icon("mdi:menu"),
+          )
+        : null,
       el(
         "div",
         { class: "header__title" },
-        el("h1", { class: "header__main", style: { margin: "0" }, text: main }),
-        sub ? el("div", { class: "header__sub", text: sub }) : null,
-      );
-
-    if (this._view === "list") {
-      replace(
-        this._header,
-        this._narrow
-          ? button("mdi:menu", "Menu", () =>
-              this.dispatchEvent(new Event("hass-toggle-menu", { bubbles: true, composed: true })),
-            )
-          : null,
-        title(this._panel?.title || "Events"),
-        button("mdi:cctv", "Cameras", () => this._go("/cameras")),
-      );
-      return;
-    }
-    const back = button("mdi:arrow-left", "Back", () => this._back());
-    if (this._view === "cameras") {
-      replace(this._header, back, title("Cameras"));
-      return;
-    }
-    const data = this._event?.data;
-    const items = this._list.items;
-    const at = items.findIndex((item) => item.id === this._event?.id);
-    const newer = at > 0 ? items[at - 1] : null;
-    const older = at >= 0 ? items[at + 1] : null;
-    replace(
-      this._header,
-      back,
-      data
-        ? title(data.camera_name, `${formatDay(this._hass, data.started)}, ${formatTime(this._hass, data.started, true)}`)
-        : title("Event"),
-      at >= 0
-        ? [
-            button("mdi:chevron-up", "Newer event", () => this._go(`/event/${newer.id}`, { replace: true }), !newer),
-            button("mdi:chevron-down", "Older event", () => this._go(`/event/${older.id}`, { replace: true }), !older),
-          ]
-        : null,
+        el("h1", { class: "header__main", style: { margin: "0" }, text: this._panel?.title || "Events" }),
+      ),
     );
   }
 
@@ -350,21 +417,6 @@ class ScryptedStaminaPanel extends HTMLElement {
         { class: "banner", role: "status" },
         icon("mdi:lan-disconnect"),
         el("span", { class: "banner__text", text: "Not connected to Scrypted. New events appear once the link is back." }),
-      );
-    }
-    const problems = [];
-    for (const cam of this._cams.items) {
-      if (cam.online === false) problems.push(`${cam.name} is offline`);
-      else if (cam.verifier_present && cam.verifier_live === false) problems.push(`${cam.name}'s double-check is not responding`);
-    }
-    if (problems.length && this._view === "list") {
-      const text = problems.length > 1 ? `${problems[0]} (and ${problems.length - 1} more)` : problems[0];
-      return el(
-        "button",
-        { class: "banner", onclick: () => this._go("/cameras") },
-        icon("mdi:cctv-off"),
-        el("span", { class: "banner__text", text }),
-        el("span", { class: "banner__action", text: "View cameras" }),
       );
     }
     if (this._list.stale && this._list.updatedAt) {
@@ -419,15 +471,18 @@ class ScryptedStaminaPanel extends HTMLElement {
       this._clearButton,
     );
     this._pillSlot = el("div");
+    this._camStrip = el("div", { class: "cam-chips", role: "toolbar", "aria-label": "Cameras" });
     this._listBody = el("div");
     this._sentinel = el("div", { class: "more" });
-    this._views.list.append(el("div", { class: "page" }, this._bannerSlot, this._filterBar, this._pillSlot, this._listBody));
+    this._listPane.append(
+      el("div", { class: "page" }, this._bannerSlot, this._camStrip, this._filterBar, this._pillSlot, this._listBody),
+    );
 
     this._observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((entry) => entry.isIntersecting)) this._loadMore();
       },
-      { root: this._views.list, rootMargin: "400px" },
+      { root: this._listPane, rootMargin: "400px" },
     );
     this._observer.observe(this._sentinel);
   }
@@ -438,7 +493,7 @@ class ScryptedStaminaPanel extends HTMLElement {
   }
 
   _setFilter(change) {
-    this._go("", { filters: { ...this._filters, ...change }, replace: true });
+    this._setRoute({ filters: { ...this._filters, ...change } });
   }
 
   _query() {
@@ -489,11 +544,17 @@ class ScryptedStaminaPanel extends HTMLElement {
     }
     list.loading = false;
     this._renderList();
+    // A filter change can leave the selection off the list: pick again, beside it.
+    if (this._wide && (!this._selected || !list.items.some((item) => item.id === this._selected))) {
+      if (this._selected && !this._routeHadEvent) this._select(null, { route: true });
+      this._preselect();
+    }
+    this._routeHadEvent = false;
   }
 
   async _loadMore() {
     const list = this._list;
-    if (!list.loaded || list.loading || list.error || !list.cursor || this._view !== "list") return;
+    if (!list.loaded || list.loading || list.error || !list.cursor) return;
     if (list.items.length >= MAX_ITEMS) return;
     const token = list.token;
     list.loading = true;
@@ -525,7 +586,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       list.stale = true;
       clearTimeout(this._retryTimer);
       this._retryTimer = setTimeout(() => this._nudge(), RETRY_MS);
-      if (this._view === "list") this._renderList();
+      this._renderList();
       return;
     }
     if (token !== list.token || list.loading) return;
@@ -541,7 +602,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       const arrived = top
         ? fresh.filter((item) => !known.has(item.id) && (item.started > top.started || (item.started === top.started && item.id > top.id)))
         : fresh;
-      const scrolled = this._view === "list" && this._views.list.scrollTop > 80;
+      const scrolled = this._listPane.scrollTop > 80;
       if (scrolled && arrived.length && list.items.length) {
         // Reading further down: update in place, and offer the new ones rather than pushing
         // the rows away under the finger.
@@ -552,7 +613,7 @@ class ScryptedStaminaPanel extends HTMLElement {
         this._merge(result);
       }
     }
-    if (this._view === "list") this._renderList();
+    this._renderList();
   }
 
   _merge(result) {
@@ -574,7 +635,7 @@ class ScryptedStaminaPanel extends HTMLElement {
 
   _showPending() {
     if (this._list.pending) this._merge(this._list.pending);
-    this._views.list.scrollTop = 0;
+    this._listPane.scrollTop = 0;
     this._renderList();
   }
 
@@ -598,20 +659,24 @@ class ScryptedStaminaPanel extends HTMLElement {
     this._classSelect.classList.toggle("is-set", f.cls !== "");
 
     const cams = this._cams.items;
-    const areas = [...new Set(cams.map((cam) => cam.area).filter(Boolean))].sort();
-    const whereKey = JSON.stringify([areas, cams.map((cam) => [cam.id, cam.name])]);
+    const groups = areaGroups([...cams]);
+    const whereKey = JSON.stringify(groups.map((group) => [group.area, group.cams.map((cam) => [cam.id, cam.name])]));
     if (this._whereKey !== whereKey) {
       this._whereKey = whereKey;
-      const cameraOptions = cams.map((cam) => el("option", { value: `camera:${cam.id}`, text: cam.name }));
+      // One group per area, each with "all of it" first when it has more than one camera.
       replace(
         this._whereSelect,
         el("option", { value: "", text: "All cameras" }),
-        areas.length > 1
-          ? [
-              el("optgroup", { label: "Areas" }, areas.map((area) => el("option", { value: `area:${area}`, text: area }))),
-              el("optgroup", { label: "Cameras" }, cameraOptions),
-            ]
-          : cameraOptions,
+        groups.map((group) =>
+          el(
+            "optgroup",
+            { label: group.label },
+            group.area && group.cams.length > 1
+              ? el("option", { value: `area:${group.area}`, text: `All in ${group.area}` })
+              : null,
+            group.cams.map((cam) => el("option", { value: `camera:${cam.id}`, text: cam.name })),
+          ),
+        ),
       );
     }
     const where = f.camera ? `camera:${f.camera}` : f.area ? `area:${f.area}` : "";
@@ -629,6 +694,7 @@ class ScryptedStaminaPanel extends HTMLElement {
   _renderList() {
     const list = this._list;
     replace(this._bannerSlot, this._banner());
+    this._renderCamChips();
     this._syncFilters();
     const arrived = list.pending
       ? list.pending.events.filter((item) => !list.items.some((known) => known.id === item.id)).length
@@ -669,18 +735,32 @@ class ScryptedStaminaPanel extends HTMLElement {
     for (const id of this._rows.keys()) if (!keep.has(id)) this._rows.delete(id);
     for (const id of this._thumbs.keys()) if (!keep.has(id) && id !== this._event?.id) this._thumbs.delete(id);
 
+    const row = (item) => {
+      const node = this._row(item);
+      const open = item.id === this._selected;
+      node.classList.toggle("is-selected", open);
+      if (open) node.setAttribute("aria-current", "true");
+      else node.removeAttribute("aria-current");
+      if (!this._wide) node.setAttribute("aria-expanded", String(open));
+      else node.removeAttribute("aria-expanded");
+      // On a phone the event opens right under its row.
+      return open && !this._wide ? [node, this._detail] : node;
+    };
+    // On a phone the open event is redrawn with its row: a playing video carries on.
+    const playing = this._wide ? [] : this._playing();
     replace(
       this._listBody,
       groups.map((group) => [
         el("h2", { class: "day", text: formatDay(this._hass, group.started) }),
-        el("div", { class: "rows" }, group.items.map((item) => this._row(item))),
+        el("div", { class: "rows" }, group.items.map(row)),
       ]),
       this._listFooter(),
     );
+    for (const video of playing) video.play().catch(() => {});
     // The observer only speaks when visibility changes: a short page leaves the footer in
     // view, so look again once this render is on screen.
     requestAnimationFrame(() => {
-      const box = this._views.list.getBoundingClientRect();
+      const box = this._listPane.getBoundingClientRect();
       const at = this._sentinel.getBoundingClientRect();
       if (this._sentinel.isConnected && at.top < box.bottom + 400) this._loadMore();
     });
@@ -733,7 +813,6 @@ class ScryptedStaminaPanel extends HTMLElement {
       "mdi:cctv",
       "No events yet",
       "Events appear here as soon as a camera with the Stamina extension in Scrypted sees something.",
-      el("button", { class: "btn", onclick: () => this._go("/cameras") }, "Check the cameras"),
     );
   }
 
@@ -767,7 +846,7 @@ class ScryptedStaminaPanel extends HTMLElement {
   _row(item) {
     const thumb = this._thumbnail(item);
     const signature = JSON.stringify([
-      item.state, item.unusual, item.classes, item.reason, item.duration, item.ended, item.camera_name, thumb,
+      item.state, item.unusual, item.classes, item.reason, item.duration, item.ended, item.camera_name, item.area, thumb,
     ]);
     const cached = this._rows.get(item.id);
     if (cached?.signature === signature) return cached.node;
@@ -788,7 +867,7 @@ class ScryptedStaminaPanel extends HTMLElement {
         onclick: (ev) => {
           if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
           ev.preventDefault();
-          this._go(`/event/${item.id}`);
+          this._select(item.id);
         },
       },
       el("div", { class: "thumb" }, picture, live ? null : el("span", { class: "thumb__len", text: formatDuration(item.duration) })),
@@ -799,7 +878,7 @@ class ScryptedStaminaPanel extends HTMLElement {
           "div",
           { class: "row__top" },
           el("span", { class: "row__time", text: formatTime(this._hass, item.started) }),
-          el("span", { class: "row__camera", text: item.camera_name }),
+          el("span", { class: "row__camera", text: cameraLabel(item.area, item.camera_name) }),
         ),
         el(
           "div",
@@ -825,7 +904,7 @@ class ScryptedStaminaPanel extends HTMLElement {
 
   _openEvent(id) {
     this._stopVideo();
-    this._event = { id, data: null, error: null, playingKey: undefined, media: null, choice: "auto", open: false };
+    this._event = { id, data: null, error: null, playingKey: undefined, media: null, choice: "auto", open: true };
     this._renderEvent();
     this._loadEvent(id);
   }
@@ -840,13 +919,12 @@ class ScryptedStaminaPanel extends HTMLElement {
       if (this._event?.id !== id) return;
       if (!this._event.data) this._event.error = err;
     }
-    this._renderHeader();
     this._renderEvent();
   }
 
   _renderEvent() {
     const state = this._event;
-    const view = this._views.event;
+    const view = this._detail;
     if (!state) return;
     if (!state.data) {
       const missing = state.error?.code === "not_found";
@@ -857,7 +935,6 @@ class ScryptedStaminaPanel extends HTMLElement {
               missing ? "mdi:calendar-remove-outline" : "mdi:alert-circle-outline",
               missing ? "This event is no longer here" : "The event could not be loaded",
               missing ? "Old events are removed from the history after a while." : errorText(state.error),
-              el("button", { class: "btn", onclick: () => this._go("", { replace: true }) }, "See the latest events"),
             )
           : el(
               "div",
@@ -875,12 +952,18 @@ class ScryptedStaminaPanel extends HTMLElement {
 
     const data = state.data;
     if (!state.media) {
+      state.title = el("div", { class: "detail__title" });
       state.box = el("div", { class: "player" });
       state.switch = el("div", { class: "source-switch" });
-      state.media = el("div", { class: "event__media" }, state.box, state.switch);
+      state.media = el("div", { class: "event__media" }, state.title, state.box, state.switch);
       state.details = el("div", { class: "event__details" });
-      replace(view, el("div", { class: "page" }, el("div", { class: "event" }, state.media, state.details)));
+      replace(view, el("div", { class: "event" }, state.media, state.details));
     }
+    replace(
+      state.title,
+      el("span", { class: "detail__camera", text: cameraLabel(data.area, data.camera_name) }),
+      el("span", { class: "dim", text: `${formatDay(this._hass, data.started)}, ${formatTime(this._hass, data.started, true)}` }),
+    );
     const url = state.choice === "cloud" ? data.play.cloud : data.play.url;
     // Compared without the signature: a refresh re-signs the URL, which is no reason to
     // restart the video.
@@ -925,13 +1008,22 @@ class ScryptedStaminaPanel extends HTMLElement {
   _renderSourceSwitch() {
     const state = this._event;
     const play = state.data.play;
+    const mark = (on, label) =>
+      el("span", { class: `avail${on ? " avail--on" : ""}` }, icon(on ? "mdi:check-circle-outline" : "mdi:close-circle-outline", "icon--sm"), label);
+    const marks = el(
+      "span",
+      { class: "avails" },
+      mark(Boolean(play.recorder), play.recorder ? "Recording" : "No recording"),
+      mark(Boolean(play.cloud), play.cloud ? "Offsite copy" : "No offsite copy"),
+    );
     if (!(play.url && play.cloud)) {
-      replace(state.switch);
+      replace(state.switch, marks);
       return;
     }
     const toCloud = state.choice !== "cloud";
     replace(
       state.switch,
+      marks,
       el(
         "button",
         {
@@ -1109,132 +1201,59 @@ class ScryptedStaminaPanel extends HTMLElement {
     } catch (err) {
       cams.error = err;
     }
-    if (this._view === "cameras") this._renderCameras();
-    if (this._view === "list") {
-      this._syncFilters();
-      replace(this._bannerSlot, this._banner());
-    }
+    this._renderCamChips();
+    this._syncFilters();
+    replace(this._bannerSlot, this._banner());
   }
 
-  _renderCameras() {
-    const cams = this._cams;
-    const view = this._views.cameras;
-    if (!cams.loaded) {
-      replace(
-        view,
-        cams.error
-          ? empty(
-              "mdi:alert-circle-outline",
-              "The cameras could not be loaded",
-              errorText(cams.error),
-              el("button", { class: "btn", onclick: () => ((cams.error = null), this._renderCameras(), this._loadCameras()) }, "Try again"),
-            )
-          : el(
-              "div",
-              { class: "page cams", "aria-busy": "true" },
-              Array.from({ length: 3 }, () => el("div", { class: "card skeleton", style: { height: "150px" } })),
-            ),
-      );
-      return;
-    }
-    if (!cams.items.length) {
-      replace(
-        view,
-        this._banner(),
-        empty("mdi:cctv-off", "No cameras yet", "Enable the Stamina extension on a camera in Scrypted. It shows up here within a minute."),
-      );
-      return;
-    }
-    replace(view, el("div", { class: "page" }, this._banner(), el("div", { class: "cams" }, cams.items.map((cam) => this._camera(cam)))));
-  }
-
-  _camera(cam) {
+  /** How one camera is doing, in a word or three, and the tone to show it in. */
+  _camState(cam) {
     const needs = this._cams.needs || { days: 7, events: 200 };
-    const online = cam.online === true ? "Online" : cam.online === false ? "Offline" : "Status unknown";
-    const dot = cam.online === true ? "dot dot--ok" : cam.online === false ? "dot dot--bad" : "dot";
-    const cap = (on, onLabel, offLabel, iconName, warn = false) => {
-      if (on === null || on === undefined) return null;
-      const cls = warn ? "cap cap--warn" : on ? "cap cap--on" : "cap cap--off";
-      return el("span", { class: cls }, icon(on && !warn ? iconName : warn ? "mdi:alert-outline" : "mdi:minus", "icon--sm"), on ? onLabel : offLabel);
-    };
-    const verifier =
-      cam.verifier_live === true
-        ? cap(true, "Double-check on", "", "mdi:shield-check-outline")
-        : cam.verifier_present
-          ? cap(true, "Double-check not responding", "", "", true)
-          : cap(false, "", "No double-check", "");
-    const learning = cam.learning;
-    const progress = Math.min(1, learning.days / needs.days, learning.events / needs.events);
+    if (cam.online === false) return { text: "Offline", tone: "error" };
+    if (cam.verifier_present && cam.verifier_live === false) return { text: "Verifier not responding", tone: "warn" };
+    if (!cam.learning?.active) {
+      const days = Math.floor(cam.learning?.days || 0);
+      const events = cam.learning?.events || 0;
+      return { text: `Learning: ${days}/${needs.days} days, ${events}/${needs.events} events`, tone: "accent" };
+    }
     const last = cam.last_event;
-    const open = () => this._go("", { filters: { ...NO_FILTERS, camera: cam.id } });
-    return el(
-      "section",
-      {
-        class: "card cam",
-        role: "link",
-        tabindex: "0",
-        "aria-label": `${cam.name}: show its events`,
-        onclick: open,
-        onkeydown: (ev) => {
-          if (ev.target === ev.currentTarget && (ev.key === "Enter" || ev.key === " ")) {
-            ev.preventDefault();
-            open();
-          }
-        },
-      },
-      el(
-        "div",
-        { class: "cam__head" },
-        el("span", { class: dot, "aria-hidden": "true" }),
+    if (!last || Date.now() / 1000 - last.started > QUIET_S) return { text: "No recent events", tone: "neutral" };
+    return { text: "Working", tone: "ok" };
+  }
+
+  /** One chip per camera: its state, and a tap filters the list to it (again: all cameras). */
+  _renderCamChips() {
+    const cams = this._cams.items;
+    this._camStrip.hidden = cams.length === 0;
+    const key = JSON.stringify([this._filters.camera, cams.map((cam) => [cam.id, cam.name, this._camState(cam)])]);
+    if (key === this._camKey) return;
+    this._camKey = key;
+    const chip = (cam) => {
+        const status = this._camState(cam);
+        const on = this._filters.camera === cam.id;
+        return el(
+          "button",
+          {
+            class: "cam-chip",
+            dataset: { tone: status.tone },
+            "aria-pressed": String(on),
+            title: `${cam.name}: ${status.text}`,
+            onclick: () => this._setFilter({ camera: on ? "" : cam.id, area: "" }),
+          },
+          el("span", { class: "dot", "aria-hidden": "true" }),
+          el("span", { class: "cam-chip__name", text: cam.name }),
+          el("span", { class: "cam-chip__state", text: status.text }),
+        );
+      };
+    replace(
+      this._camStrip,
+      areaGroups([...cams]).map((group) =>
         el(
           "div",
-          { class: "item__body" },
-          el("div", { class: "cam__name", text: cam.name }),
-          el("div", { class: "cam__sub", text: [cam.area, online].filter(Boolean).join(" · ") }),
+          { class: "cam-group", role: "group", "aria-label": group.label },
+          el("span", { class: "cam-group__label", text: group.label }),
+          el("div", { class: "cam-group__chips" }, group.cams.map(chip)),
         ),
-        learning.active ? badge("Ready", "ok") : badge("Learning", "accent"),
-      ),
-      el(
-        "div",
-        { class: "caps" },
-        verifier,
-        cap(
-          cam.prebuffer,
-          cam.prebuffer_s ? `${cam.prebuffer_s} s before each event` : "Video before each event",
-          "No video before events",
-          "mdi:history",
-        ),
-        cap(cam.recorder, "Recorder", "No recorder", "mdi:record-rec"),
-        cap(cam.audio, "Audio", "No audio", "mdi:microphone-outline"),
-        cap(cam.night_mode, "Night mode sensor", "No night mode sensor", "mdi:weather-night"),
-        cap(cam.tamper, "Tamper sensor", "No tamper sensor", "mdi:hand-back-left-outline"),
-      ),
-      learning.active
-        ? null
-        : el(
-            "div",
-            { class: "cam__learning" },
-            el("span", {
-              text: `Learning what is normal: ${Math.floor(learning.days)} of ${needs.days} days, ${learning.events} of ${needs.events} events.`,
-            }),
-            el("div", { class: "progress", "aria-hidden": "true" }, el("div", { class: "progress__fill", style: { width: `${progress * 100}%` } })),
-          ),
-      el(
-        "div",
-        { class: "cam__actions" },
-        last
-          ? el(
-              "button",
-              {
-                class: "link-btn",
-                onclick: (ev) => {
-                  ev.stopPropagation();
-                  this._go(`/event/${last.id}`);
-                },
-              },
-              `Last event ${formatAgo(last.started)}${last.unusual ? " (unusual)" : ""}`,
-            )
-          : el("span", { class: "cam__sub", style: { padding: "12px 10px" }, text: "No events yet" }),
       ),
     );
   }

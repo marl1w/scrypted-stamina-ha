@@ -74,7 +74,12 @@ button { border: none; background: none; cursor: pointer; padding: 0; }
 
 /* ------------------------------------------------------------------ views */
 
-.view { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; position: relative; }
+.split { flex: 1 1 auto; min-height: 0; display: flex; }
+.pane { min-height: 0; overflow: auto; overscroll-behavior: contain; position: relative; }
+.pane--list { flex: 1 1 auto; }
+.split--wide { display: grid; grid-template-columns: minmax(340px, 2fr) minmax(0, 3fr); }
+.split--wide .pane--list { border-right: 1px solid var(--ss-line); }
+.pane--detail { background: var(--ss-bg); }
 .page { max-width: 1040px; margin: 0 auto; padding: 0 0 calc(24px + env(safe-area-inset-bottom, 0px)); }
 
 .banner {
@@ -270,36 +275,48 @@ details.card[open] > summary::after { transform: rotate(180deg); }
 
 /* ------------------------------------------------------------------ cameras */
 
-.cams { display: grid; gap: 12px; padding: 12px 0; }
-.cam { display: grid; gap: 10px; cursor: pointer; }
-.cam:hover { box-shadow: var(--ss-shadow), inset 0 0 0 1px color-mix(in srgb, var(--ss-accent) 40%, transparent); }
-.cam__head { display: flex; gap: 10px; align-items: center; }
-.cam__name { font-weight: 600; font-size: 1.02rem; }
-.cam__sub { font-size: 0.86rem; color: var(--ss-dim); }
+.cam-chips { display: flex; gap: 14px; padding: 10px 12px 0; overflow-x: auto; scrollbar-width: none; }
+.cam-group { display: flex; flex-direction: column; gap: 4px; flex: 0 0 auto; }
+.cam-group__label { font-size: 0.72rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ss-dim); padding-left: 2px; }
+.cam-group__chips { display: flex; gap: 6px; }
+.cam-chips::-webkit-scrollbar { display: none; }
+.cam-chip {
+  display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; min-height: 44px; padding: 4px 12px;
+  border-radius: 12px; background: var(--ss-surface); box-shadow: inset 0 0 0 1px var(--ss-line); text-align: left;
+}
+.cam-chip[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--ss-accent); }
+.cam-chip__name { font-weight: 600; font-size: 0.88rem; white-space: nowrap; }
+.cam-chip__state { font-size: 0.8rem; color: var(--ss-dim); white-space: nowrap; }
+.cam-chip .dot { --tone: var(--ss-neutral); background: var(--tone); }
+.cam-chip[data-tone="ok"] .dot { --tone: var(--ss-ok); }
+.cam-chip[data-tone="warn"] .dot { --tone: var(--ss-unusual); }
+.cam-chip[data-tone="error"] .dot { --tone: var(--ss-error); }
+.cam-chip[data-tone="accent"] .dot { --tone: var(--ss-accent); }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; background: var(--ss-neutral); }
-.dot--ok { background: var(--ss-ok); }
-.dot--bad { background: var(--ss-error); }
-.caps { display: flex; flex-wrap: wrap; gap: 6px; }
-.cap { display: inline-flex; align-items: center; gap: 4px; font-size: 0.82rem; padding: 2px 8px; border-radius: 6px; background: var(--ss-sunken); }
-.cap--on { background: color-mix(in srgb, var(--ss-ok) 18%, transparent); }
-.cap--warn { background: color-mix(in srgb, var(--ss-unusual) 26%, transparent); }
-.cap--off { color: var(--ss-dim); }
-.progress { height: 6px; border-radius: 3px; background: var(--ss-sunken); overflow: hidden; }
-.progress__fill { height: 100%; background: var(--ss-accent); }
-.cam__learning { display: grid; gap: 6px; font-size: 0.86rem; color: var(--ss-dim); }
-.cam__actions { display: flex; gap: 4px; flex-wrap: wrap; margin: 0 -10px -8px; }
+
+/* ------------------------------------------------------------------ selection */
+
+.row.is-selected { background: color-mix(in srgb, var(--ss-accent) 14%, var(--ss-surface)); }
+.detail { background: var(--ss-bg); }
+.rows > .detail { padding: 8px 0 4px; }
+.detail__title { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 0 12px; }
+.detail__camera { font-weight: 600; font-size: 1.05rem; }
+.avails { display: inline-flex; gap: 12px; margin-right: auto; padding: 0 8px; flex-wrap: wrap; }
+.avail { display: inline-flex; align-items: center; gap: 4px; font-size: 0.82rem; color: var(--ss-dim); min-height: 32px; }
+.avail--on { color: var(--ss-text); }
+.avail--on .icon { color: var(--ss-ok); }
+.source-switch { align-items: center; flex-wrap: wrap; }
 
 /* ------------------------------------------------------------------ wide */
 
+.pane--detail .event { padding: 16px; gap: 16px; }
+.pane--detail .detail__title { padding: 0; }
+.pane--detail .event__media .player { border-radius: var(--ss-radius); }
+.pane--detail .event .card { margin: 0; }
+
 @media (min-width: 720px) {
-  .row { padding-left: 18px; }
   .thumb { width: 144px; }
-  .event { grid-template-columns: minmax(0, 3fr) minmax(300px, 2fr); align-items: start; padding: 16px; gap: 16px; }
-  .event__media { position: sticky; top: 16px; }
-  .event__media .player { border-radius: var(--ss-radius); }
-  .event .card { margin: 0; }
-  .cams { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); padding: 16px; }
-  .cams .card { margin: 0; }
+  .row { padding-left: 18px; }
   .rows { border-radius: var(--ss-radius); border: 1px solid var(--ss-line); overflow: hidden; margin: 0 12px; }
 }
 @media (prefers-reduced-motion: reduce) {
