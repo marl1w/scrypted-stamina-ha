@@ -79,7 +79,11 @@ This is independent of Stamina but follows the same principle:
 
 It can run alongside phases 0–1.
 
-## Parallel track: audio guard (new Scrypted plugin)
+## Parallel track: Coral Guard tamper
+
+A rolling reference frame per camera, plus a covered/moved/blurred detector, exposed as a BinarySensor child "Tamper".
+
+## Parallel track: audio guard (repo `marl1w/scrypted-audio-guard`)
 
 A Coral Guard-like mixin. It decodes the camera's audio from the prebuffered substream and keeps a rolling noise floor. It sets the standard **AudioSensor** `audioDetected` on a spike well above that floor (silence means no spike). Measure the CPU per camera before rolling it out to all cameras. The Scrypted MQTT bridge shows it as a sound sensor; Stamina uses it as a trigger. Classifying sounds (glass breaking, barking, shouting) comes later.
 
@@ -89,11 +93,17 @@ A Coral Guard-like mixin. It decodes the camera's audio from the prebuffered sub
 - Vetoed but unusual events: kept, in `unusual-unconfirmed/`.
 - Thumbnails: yes, 320 px JPEG, about 15 KB each.
 - Quota and retention: as in Reolink Stamina (15 GB per destination, oldest first).
+- Folder layout: one subfolder per camera HA area under `pending/`, `events/` and `unusual-unconfirmed/`.
+- Weather and sun: default context, read in Home Assistant.
 - Roles: per source plugin, in the Stamina plugin's settings. No per-camera override.
 - No MQTT for Stamina; `scrypted_mqtt` is optional (its camera devices are reused when present).
 
 - No explicit rules: unusual comes only from the learned model, after about a week of learning.
 - Day/night comes from the camera plugin as a standard BinarySensor child device (scrypted-reolink: "Night mode", from the NVR's day/night push), not from the image.
+
+## Parallel track: scrypted-reolink smart events
+
+Probe which smart events (line crossing, intrusion, loitering, forgotten or taken item) the installed cameras send through the NVR's alarm push, and expose only those.
 
 ## Parallel track: scrypted-reolink "Night mode"
 

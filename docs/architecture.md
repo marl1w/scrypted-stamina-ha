@@ -186,11 +186,11 @@ No-verifier cameras follow the fallback policy: `unverified` subjects count as c
 - Destinations are ported from Reolink Stamina's `cloud/destinations`. Each must support writing a file per segment; append is not required.
 - Layout per event:
   ```
-  pending/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 00001.m4s, …
-  events/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 0000N.m4s, index.m3u8, event.json
-  unusual-unconfirmed/<YYMMDD_HHMMSS>_<camera>_<id>/…   (vetoed but unusual: kept, apart)
+  <folder>/pending/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 00001.m4s, …
+  <folder>/events/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/init.mp4, 0000N.m4s, index.m3u8, event.json
+  <folder>/unusual-unconfirmed/<area>/<YYMMDD_HHMMSS>_<camera>_<id>/…   (vetoed but unusual: kept, apart)
   ```
-  `index.m3u8` (HLS with fMP4) plays straight from the folder. `event.json` holds the event facts, the context, the score and the reasons.
+  `<area>` is the camera device's Home Assistant area (slugified), or `no-area` when it has none. `index.m3u8` (HLS with fMP4) plays straight from the folder. `event.json` holds the event facts, the context, the score and the reasons.
 - Commit is a folder rename, where the provider supports it; otherwise copy then delete.
 - Quota and retention evict the oldest committed events first, never pending or orphaned ones.
 - Uploads run in parallel per event, with a bounded queue. The low-res segment is the default, so upstream bandwidth is about 60 KB/s per active event.
@@ -252,6 +252,9 @@ Vetoed path: the same until the verdict. Then `DROPPING` deletes `pending/<id>/`
 ## 6. Extra signals
 
 - **Day/night (colour or IR):** taken from the camera plugin. scrypted-reolink gets the NVR's day/night push and exposes a child device per camera, "Night mode", with the standard **BinarySensor** interface (on means IR/black-and-white). The Scrypted MQTT bridge shows it as `binary_sensor.<cam>_night_mode`. Stamina reads every BinarySensor child of a camera as a scoring feature, so any camera plugin that exposes a similar child device works too. Cameras without one have no day/night feature.
+- **Tamper (covered, moved, blurred):** from Coral Guard, which already decodes the frames. It compares each frame to a rolling reference image and exposes a **BinarySensor** child, "Tamper". Stamina reads it like any other BinarySensor child; a tamper during an event is a strong feature.
+- **Camera smart events** (line crossing, intrusion, loitering, forgotten or taken item): only those the installed cameras actually send. They come from the camera plugin as standard ObjectDetector detections with those classes (role trigger), or as BinarySensor children.
+- **Weather and sun:** read on the Home Assistant side, from the default `weather.*` entity and `sun.sun`, with no linking needed. They are scoring context: wind and rain explain motion-only events, and the sun's elevation separates dusk from night.
 - **Audio:** read through Scrypted's standard **AudioSensor** (`audioDetected`), with role trigger by default. It is produced by the separate audio-guard plugin (plan, parallel track), or by any plugin that implements AudioSensor.
 
 ## 6. Capabilities and fallbacks
