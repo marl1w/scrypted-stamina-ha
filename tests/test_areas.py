@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from homeassistant.components.media_source import async_browse_media
 from homeassistant.helpers import (
     area_registry as ar,
     device_registry as dr,
     entity_registry as er,
     issue_registry as ir,
 )
+from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.scrypted_stamina.const import (
@@ -253,4 +255,13 @@ async def test_the_old_area_sensors_are_removed(hass, stamina, setup) -> None:
     await hass.async_block_till_done()
     assert registry.async_get(old.entity_id) is None
     assert registry.async_get(GARDEN_QUOTA) is not None
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_the_media_source_lists_cameras_by_area(hass, stamina, setup) -> None:
+    two_areas(hass, stamina)
+    assert await async_setup_component(hass, "media_source", {})
+    entry = await setup()
+    root = await async_browse_media(hass, "media-source://scrypted_stamina")
+    assert [child.title for child in root.children] == ["Driveway · Gate", "Garden · Front door"]
     await hass.config_entries.async_unload(entry.entry_id)

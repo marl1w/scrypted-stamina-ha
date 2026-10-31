@@ -1,5 +1,8 @@
 """Media source "Scrypted events": camera → day → event (architecture §3.6).
 
+Cameras are titled "Area · Camera" like the panel, and listed by area, then name; a camera
+with no area (or one named like its area) shows its name alone, after the areas.
+
 An event plays on its own (`auto`: the camera's recording through the plugin, falling back
 to a committed cloud copy when the recorder fails or no longer has it), and it also expands
 into its two sources, so either can be chosen explicitly: "Recording" and "Cloud copy".
@@ -92,6 +95,19 @@ class StaminaMediaSource(MediaSource):
         status = data.manager.cameras.get(camera)
         return status.device.name if status else f"Camera {camera}"
 
+    def _area(self, data, camera: str) -> str | None:
+        status = data.manager.cameras.get(camera)
+        return status.device.area if status else None
+
+    def _label(self, data, camera: str) -> str:
+        """Return "Area · Camera", or the name alone when the area adds nothing."""
+        name, area = self._name(data, camera), self._area(data, camera)
+        return f"{area} · {name}" if area and area != name else name
+
+    def _order(self, data, camera: str) -> tuple[bool, str, str]:
+        area = self._area(data, camera)
+        return (not area, (area or "").casefold(), self._name(data, camera).casefold())
+
     @staticmethod
     def _folder(identifier: str | None, title: str, children, child_class=MediaClass.DIRECTORY):
         return BrowseMediaSource(
@@ -114,12 +130,12 @@ class StaminaMediaSource(MediaSource):
                 identifier=camera,
                 media_class=MediaClass.DIRECTORY,
                 media_content_type="",
-                title=self._name(data, camera),
+                title=self._label(data, camera),
                 can_play=False,
                 can_expand=True,
                 children_media_class=MediaClass.DIRECTORY,
             )
-            for camera in sorted(cameras, key=lambda item: self._name(data, item))
+            for camera in sorted(cameras, key=lambda item: self._order(data, item))
         ]
         return self._folder(None, TITLE, children)
 
@@ -141,7 +157,7 @@ class StaminaMediaSource(MediaSource):
             )
             for day, count in days.items()
         ]
-        return self._folder(camera, self._name(data, camera), children)
+        return self._folder(camera, self._label(data, camera), children)
 
     async def _events(self, entry_id: str, data, camera: str, day: str) -> BrowseMediaSource:
         try:
