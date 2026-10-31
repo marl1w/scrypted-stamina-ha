@@ -39,6 +39,7 @@ from .api import (
     normalise_url,
 )
 from .const import (
+    BASE_CLASSES,
     CONF_CAMERAS,
     CONF_DESTINATION_ENTRY,
     CONF_FINGERPRINT,
@@ -54,9 +55,9 @@ from .const import (
     CONF_RELEVANCE_SENSITIVITY,
     CONF_RETENTION_DAYS,
     CONF_TOKEN,
-    CONF_UNUSUAL_OVERRIDES,
     CONF_UNVERIFIED_SCORE,
     CONF_UNVERIFIED_SECONDS,
+    CONF_UPLOAD_CLASSES,
     CONF_URL,
     CONF_VERIFY_SSL,
     DEFAULT_FOLDER,
@@ -69,12 +70,13 @@ from .const import (
     DEFAULT_RELEVANCE_SCOPE,
     DEFAULT_RELEVANCE_SENSITIVITY,
     DEFAULT_RETENTION_DAYS,
-    DEFAULT_UNUSUAL_OVERRIDES,
     DEFAULT_UNVERIFIED_SCORE,
     DEFAULT_UNVERIFIED_SECONDS,
+    DEFAULT_UPLOAD_CLASSES,
     DEFAULT_URL,
     DEFAULT_VERIFY_SSL,
     DOMAIN,
+    LEGACY_UNUSUAL_OVERRIDES,
     RELEVANCE_SCOPES,
     RELEVANCE_SENSITIVITY_FLOORS,
     SUBENTRY_TYPE_DESTINATION,
@@ -313,6 +315,7 @@ class StaminaOptionsFlow(OptionsFlow):
         options = self.config_entry.options
         if user_input is not None:
             self._pending = {**options, **user_input}
+            self._pending.pop(LEGACY_UNUSUAL_OVERRIDES, None)
             self._pending[CONF_CAMERAS] = dict(options.get(CONF_CAMERAS) or {})
             runtime = getattr(self.config_entry, "runtime_data", None)
             if runtime is not None:
@@ -378,9 +381,16 @@ class StaminaOptionsFlow(OptionsFlow):
                         )
                     ),
                     vol.Required(
-                        CONF_UNUSUAL_OVERRIDES,
-                        default=options.get(CONF_UNUSUAL_OVERRIDES, DEFAULT_UNUSUAL_OVERRIDES),
-                    ): selector.BooleanSelector(),
+                        CONF_UPLOAD_CLASSES,
+                        default=list(options.get(CONF_UPLOAD_CLASSES, DEFAULT_UPLOAD_CLASSES)),
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=self._classes(),
+                            multiple=True,
+                            custom_value=True,
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
                     vol.Required(
                         CONF_UNVERIFIED_SECONDS,
                         default=options.get(CONF_UNVERIFIED_SECONDS, DEFAULT_UNVERIFIED_SECONDS),
@@ -404,6 +414,18 @@ class StaminaOptionsFlow(OptionsFlow):
                 }
             ),
         )
+
+    def _classes(self) -> list[str]:
+        """Return the classes to choose from: the usual ones, the cameras' own, the chosen."""
+        found = set(BASE_CLASSES)
+        found.update(self.config_entry.options.get(CONF_UPLOAD_CLASSES, DEFAULT_UPLOAD_CLASSES))
+        runtime = getattr(self.config_entry, "runtime_data", None)
+        if runtime is not None:
+            for status in runtime.manager.cameras.values():
+                reported = status.info.capabilities.get("classes")
+                if isinstance(reported, list):
+                    found.update(str(cls) for cls in reported if isinstance(cls, str))
+        return sorted(found)
 
     async def async_step_camera(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Ask one camera's linked entities and follow-up window."""

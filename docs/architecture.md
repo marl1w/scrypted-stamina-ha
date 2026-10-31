@@ -206,7 +206,7 @@ Some evidence comes after the camera has stopped seeing anything: a door opened 
 - Every state change of the camera's linked entities in that window is attached to the event as late evidence (`{entity, kind, from, to, t_rel_s}`).
 - **Provisional score** at `event.end`; **final score** when the window closes, from facts, context and late evidence. The relevance model learns what late evidence is normal: a door opened at 6 p.m. with someone home is not unusual; at 3 a.m. with the alarm armed it is.
 - If the final score turns the event unusual, `event.<cam>_stamina` fires again as `unusual` with `late: true`.
-- **Decider:** an event that is vetoed and ordinary at the end enters `FOLLOW_UP`. Its pending upload is kept until the window closes, then dropped if it is still ordinary, or moved to `unusual-unconfirmed/` if it became unusual. Confirmed or unusual events commit as before; only their `event.json` and index row are updated after the window.
+- **Decider:** an event that is ordinary at the end and not kept for a chosen class (vetoed, another class, or uploads not on *Chosen classes*) enters `FOLLOW_UP`. Its pending upload is kept until the window closes, then dropped if it is still ordinary, or moved to `unusual-unconfirmed/` if it became unusual. Events kept for a chosen class or for being unusual commit as before; only their `event.json` and index row are updated after the window.
 - `FOLLOW_UP` pending data has its own cap (default 1 GB per destination). Over it, the oldest vetoed-and-ordinary events are dropped first.
 - The window end time is persisted, so evaluation resumes after a restart.
 
@@ -248,7 +248,7 @@ Since Home Assistant 2026.8 a device belongs to exactly one config entry, so Sta
 | `binary_sensor.<cam>_unusual` | On while an unusual event is open; pulses on for a late unusual |
 | `sensor.<cam>_last_event_score` | Latest score, 0 to 1 |
 
-Integration-wide entities, on a "Stamina" service device: `switch.stamina_uploads` (arms ordinary uploads; unusual events still upload if that setting is on), `sensor.stamina_queue`, `sensor.stamina_quota_used_<destination>`, `sensor.stamina_orphans` and `sensor.stamina_latency`.
+Integration-wide entities, on a "Stamina" service device: `select.stamina_uploads` (*Chosen classes*: unusual events plus ordinary ones with a confirmed subject of a chosen class, default person and vehicle; *Unusual only*; *Off*: nothing uploads, not even to `pending/`, while events are still indexed and scored. Each event takes the position at its start; the keep reason, `unusual` or `classes: <class>`, says which rule kept it), `sensor.stamina_queue`, `sensor.stamina_quota_used_<destination>`, `sensor.stamina_orphans` and `sensor.stamina_latency`.
 
 ## 4. Latency budget
 

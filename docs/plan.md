@@ -37,7 +37,7 @@ Phase 0 answers decide the details of phases 2–4. S3 is done in the camera plu
   - the decider state machine (PENDING, KEEPING, DROPPING, COMMITTED, ORPHANED);
   - `index.m3u8` and `event.json` on commit;
   - quota and retention;
-  - `switch.stamina_uploads`, `sensor.stamina_queue`, `sensor.stamina_quota_used`.
+  - `select.stamina_uploads`, `sensor.stamina_queue`, `sensor.stamina_quota_used`.
 - Fault injection tests:
   - kill the link mid-event: expect ORPHANED, kept;
   - restart the plugin: expect a new epoch and old events orphaned;

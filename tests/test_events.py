@@ -76,7 +76,7 @@ async def test_confirmed_event_commits_with_manifest_and_details(
         assert not fake.under("scrypted-stamina/pending/")
         details = json.loads(next(fake.files[p] for p in files if p.endswith("event.json")))
         assert details["state"] == "keeping"  # written before the move
-        assert details["keep_reason"] == "confirmed"
+        assert details["keep_reason"] == "classes: person"
         assert "camera_event_time" in details["latency"]
         assert "first_upload" in details["latency"]
         assert TOKEN_FREE(details)
@@ -318,36 +318,6 @@ async def test_no_drop_while_the_link_is_down(hass, stamina, destinations, setup
     await until(lambda: eid not in manager.records)
     assert (await manager.index.async_get(eid)).state is EventState.DROPPED
     assert not destinations["storage0"].under("scrypted-stamina/pending/")
-    await hass.config_entries.async_unload(entry.entry_id)
-
-
-async def test_uploads_off_skips_ordinary_events_but_not_unusual_ones(
-    hass, stamina, destinations, setup
-) -> None:
-    entry = await setup()
-    manager = await wire(entry, Clock())
-    await hass.services.async_call(
-        "switch", "turn_off", {"entity_id": "switch.stamina_uploads"}, blocking=True
-    )
-    assert manager.uploads_enabled is False
-    eid = event_id(40)
-    run_event(stamina, eid, "confirmed")
-    await until(
-        lambda: eid in manager.records and manager.records[eid].state is EventState.COMMITTED
-    )
-    assert "uploads_off" in manager.records[eid].notes
-    assert not destinations["storage0"].files
-
-    def provisional_unusual(record, *, now, include_late=True):
-        return RelevanceResult(0.9, 3.0, 1.4, True, "rare", [])
-
-    manager.analysis.score = provisional_unusual
-    other = event_id(41)
-    run_event(stamina, other, "vetoed")
-    await until(
-        lambda: other in manager.records and manager.records[other].state is EventState.COMMITTED
-    )
-    assert destinations["storage0"].under("scrypted-stamina/unusual-unconfirmed/")
     await hass.config_entries.async_unload(entry.entry_id)
 
 

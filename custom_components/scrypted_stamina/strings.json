@@ -102,13 +102,14 @@
         "data": {
           "relevance_scope": "Compare each camera with",
           "relevance_sensitivity": "How much to flag as unusual",
-          "unusual_uploads_when_off": "Upload unusual events while uploads are off",
+          "upload_classes": "Classes uploaded in 'Chosen classes'",
           "recorder_retention_days": "Recorder keeps footage for",
           "history_size_mb": "History size",
           "unverified_min_seconds": "Without a verifier, keep subjects seen for at least",
           "unverified_min_score": "Without a verifier, keep subjects scoring at least"
         },
         "data_description": {
+          "upload_classes": "Ordinary events with a confirmed subject of one of these classes are kept while Uploads is on 'Chosen classes'. Unusual events are kept whatever their class.",
           "history_size_mb": "Room for the event history the model learns from. When it is full, routine dropped events are thinned out; kept and unusual events are never removed."
         }
       },
@@ -174,9 +175,14 @@
         "name": "Orphans"
       }
     },
-    "switch": {
+    "select": {
       "uploads": {
-        "name": "Uploads"
+        "name": "Uploads",
+        "state": {
+          "classes": "Chosen classes",
+          "unusual": "Unusual only",
+          "off": "Off"
+        }
       }
     }
   },

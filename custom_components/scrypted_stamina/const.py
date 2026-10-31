@@ -15,7 +15,7 @@ TITLE: Final = "Scrypted Stamina"
 # The integration whose camera devices Stamina attaches to, when it is installed.
 SCRYPTED_MQTT_DOMAIN: Final = "scrypted_mqtt"
 
-PLATFORMS: Final = ("binary_sensor", "event", "sensor", "switch")
+PLATFORMS: Final = ("binary_sensor", "event", "select", "sensor")
 
 # ------------------------------------------------------------------ config entry
 
@@ -34,9 +34,20 @@ DEFAULT_VERIFY_SSL: Final = False
 
 # Per-camera option: the linked entities.
 CONF_LINKED: Final = "linked_entities"
-# Whether an unusual event uploads while `switch.stamina_uploads` is off.
-CONF_UNUSUAL_OVERRIDES: Final = "unusual_uploads_when_off"
-DEFAULT_UNUSUAL_OVERRIDES: Final = True
+# `select.stamina_uploads`: what is uploaded. Each event takes the position at its start.
+# `classes`: unusual events, and ordinary ones with a confirmed subject of a chosen class.
+# `unusual`: unusual events only. `off`: nothing uploads, not even to `pending/`.
+UPLOADS_CLASSES: Final = "classes"
+UPLOADS_UNUSUAL: Final = "unusual"
+UPLOADS_OFF: Final = "off"
+UPLOAD_MODES: Final = (UPLOADS_CLASSES, UPLOADS_UNUSUAL, UPLOADS_OFF)
+# The classes an ordinary event is kept for under `classes`.
+CONF_UPLOAD_CLASSES: Final = "upload_classes"
+DEFAULT_UPLOAD_CLASSES: Final = ("person", "vehicle")
+# Offered in the options even before any camera reports its own.
+BASE_CLASSES: Final = ("person", "vehicle", "animal")
+# The option the select replaced; read once, to migrate, then removed.
+LEGACY_UNUSUAL_OVERRIDES: Final = "unusual_uploads_when_off"
 # The no-verifier fallback (architecture §3.4): an unverified subject counts as confirmed
 # once it lasted this long with at least this score.
 CONF_UNVERIFIED_SECONDS: Final = "unverified_min_seconds"

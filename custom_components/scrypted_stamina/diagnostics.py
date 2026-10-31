@@ -65,7 +65,7 @@ async def async_get_config_entry_diagnostics(
             "last_error": link.last_error if link else None,
             "lost_since": link.lost_since if link else None,
         },
-        "uploads_enabled": manager.uploads_enabled,
+        "uploads": manager.uploads,
         "uploader": {
             "queue": manager.uploader.queue,
             "active": manager.uploader.active,

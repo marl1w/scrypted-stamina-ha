@@ -45,6 +45,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 
+from .const import UPLOADS_CLASSES, UPLOADS_UNUSUAL
 from .decider import EventRecord, EventState
 from .protocol import EventFacts
 
@@ -177,6 +178,7 @@ class Copy:
 _RECORD_FIELDS = (
     "target",
     "admitted",
+    "upload_mode",
     "area",
     "camera_name",
     "folder",
@@ -215,6 +217,9 @@ def record_from_dict(data: dict[str, Any]) -> EventRecord:
     for name in _RECORD_FIELDS:
         if name in data:
             setattr(record, name, data[name])
+    if "upload_mode" not in data:
+        # From before the select: the switch's admission is the nearest position.
+        record.upload_mode = UPLOADS_CLASSES if record.admitted else UPLOADS_UNUSUAL
     return record
 
 
@@ -224,6 +229,7 @@ def record_from_dict(data: dict[str, Any]) -> EventRecord:
 _SLIM_FIELDS = (
     "target",
     "admitted",
+    "upload_mode",
     "area",
     "camera_name",
     "folder",

@@ -12,8 +12,9 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 
 from .api import InsecureUrlError, StaminaApiError, StaminaAuthError, StaminaClient
 from .const import (
@@ -35,6 +36,7 @@ from .const import (
     DEFAULT_VERIFY_SSL,
     DOMAIN,
     INDEX_FILENAME,
+    LEGACY_UNUSUAL_OVERRIDES,
     PLATFORMS,
     SUBENTRY_TYPE_DESTINATION,
 )
@@ -139,12 +141,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: StaminaConfigEntry) -> b
         await index.async_close()
         raise
 
+    _async_drop_the_switch(hass, entry)
     await hass.config_entries.async_forward_entry_setups(entry, [Platform(p) for p in PLATFORMS])
     async_register_views(hass)
     async_register_commands(hass)
     await async_register_panel(hass, entry)
     entry.async_on_unload(entry.add_update_listener(_async_reload))
     return True
+
+
+@callback
+def _async_drop_the_switch(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:
+    """Remove what `select.stamina_uploads` replaced: the old switch and its option.
+
+    Run after the manager has started, which reads the old option once to migrate the
+    switch's state (`StaminaManager._async_restore_uploads`). Idempotent.
+    """
+    registry = er.async_get(hass)
+    if old := registry.async_get_entity_id("switch", DOMAIN, f"{entry.entry_id}_uploads"):
+        registry.async_remove(old)
+    if LEGACY_UNUSUAL_OVERRIDES in entry.options:
+        options = {k: v for k, v in entry.options.items() if k != LEGACY_UNUSUAL_OVERRIDES}
+        hass.config_entries.async_update_entry(entry, options=options)
 
 
 async def _async_reload(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:

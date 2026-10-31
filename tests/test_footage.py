@@ -388,7 +388,7 @@ async def test_uploads_off_keeps_segments_until_the_window_decides(
     hass.states.async_set(GATE, "off", {"device_class": "door"})
     entry = await setup(options=OPTIONS)
     manager = await wire(entry, clock)
-    await manager.async_set_uploads(False)
+    await manager.async_set_uploads("unusual")
     eid = event_id(160)
     run_event(stamina, eid, "vetoed")
     await until(state_is(manager, eid, EventState.FOLLOW_UP))

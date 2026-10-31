@@ -12,9 +12,9 @@ transition testable in a line, and it is the only place the safety rules live:
 
 States (architecture §3.4, §3.4a):
 
-    PENDING ──end, confirmed or unusual──► KEEPING ──uploads done──► COMMITTED
+    PENDING ──end, chosen class or unusual──► KEEPING ──uploads done──► COMMITTED
        │                                     ▲
-       ├──end, vetoed and ordinary──► FOLLOW_UP ──window closes──┬─ unusual ─┘
+       ├──end, otherwise ordinary──► FOLLOW_UP ──window closes──┬─ unusual ─┘
        │                                                         │  (unusual-unconfirmed/)
        │                                                         └─ ordinary ─► DROPPING ─► DROPPED
        └──link lost > 2 min, epoch change, camera offline, TTL expired ─► ORPHANED (kept)
@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .const import FOLDER_EVENTS, FOLDER_UNUSUAL
+from .const import FOLDER_EVENTS, FOLDER_UNUSUAL, UPLOADS_CLASSES
 from .protocol import (
     VERDICT_CONFIRMED,
     VERDICT_PENDING,
@@ -64,6 +64,8 @@ REASON_CONFIRMED = "confirmed"
 REASON_UNUSUAL = "unusual"
 REASON_UNDECIDED = "undecided"
 REASON_ORPHANED = "orphaned"
+# Kept under "Chosen classes" for a subject of this class: `classes: person`.
+REASON_CLASSES = "classes"
 
 
 @dataclass(slots=True, frozen=True)
@@ -85,6 +87,9 @@ class EventRecord:
     # Whether ordinary uploads were armed when the event started (the switch gates
     # admission, not delivery: turning it off mid-event does not drop that event).
     admitted: bool = True
+    # The uploads position when the event started (`UPLOAD_MODES`): it decides what keeps
+    # an ordinary event, whatever the select says later.
+    upload_mode: str = UPLOADS_CLASSES
     # Path pieces, fixed at start so a renamed area does not split an event across folders.
     area: str = ""
     camera_name: str = ""
@@ -176,11 +181,58 @@ def verdict_summary(facts: EventFacts, policy: Policy) -> str:
     return VERDICT_VETOED
 
 
-def decide_at_end(record: EventRecord, policy: Policy) -> EventState:
+def chosen_class(record: EventRecord, policy: Policy, classes: frozenset[str] | None) -> str | None:
+    """Return the chosen class that keeps an ordinary event, or None.
+
+    A subject counts when its class is chosen and it is confirmed (the no-verifier fallback
+    included: an unverified subject on a camera without a verifier is trusted), or still
+    waiting on its verdict (a verifier not answering is not a veto). Only under the
+    `classes` position; `classes` None means every class (records from before the filter).
+    """
+    if record.upload_mode != UPLOADS_CLASSES:
+        return None
+    found = sorted(
+        subject.cls
+        for subject in record.facts.subjects.values()
+        if (classes is None or subject.cls in classes)
+        and (subject_confirmed(subject, policy) or subject.verdict == VERDICT_PENDING)
+    )
+    return found[0] if found else None
+
+
+def class_reason(cls: str) -> str:
+    """Return the keep reason of an event kept for a chosen class."""
+    return f"{REASON_CLASSES}: {cls}"
+
+
+# What each keep reason says in plain words (entity attributes; the panel has its own).
+_KEPT_BECAUSE = {
+    REASON_CONFIRMED: "something was confirmed",
+    REASON_UNUSUAL: "it was unusual",
+    REASON_UNDECIDED: "the verifier never answered",
+    REASON_ORPHANED: "it could not be decided in time",
+}
+
+
+def kept_because(reason: str | None) -> str | None:
+    """Return why an event was kept, in plain words, or None when it was not."""
+    if not reason:
+        return None
+    head, _, cls = reason.partition(": ")
+    if head == REASON_CLASSES and cls:
+        return f"a {cls} was confirmed (a chosen class)"
+    return _KEPT_BECAUSE.get(reason, reason)
+
+
+def decide_at_end(
+    record: EventRecord, policy: Policy, classes: frozenset[str] | None = None
+) -> EventState:
     """Decide what an event that has just ended becomes.
 
     Called with `record.unusual_provisional` already set. Only PENDING events are decided
-    here; anything already orphaned or kept stays as it is.
+    here; anything already orphaned or kept stays as it is. An ordinary event is kept only
+    under the `classes` position, for a subject of a chosen class; any other ordinary event
+    goes through its follow-up window and is kept only if it turns unusual there.
     """
     if record.state is not EventState.PENDING:
         return record.state
@@ -189,9 +241,8 @@ def decide_at_end(record: EventRecord, policy: Policy) -> EventState:
         record.keep_reason = REASON_ORPHANED
         return EventState.ORPHANED
 
-    summary = verdict_summary(record.facts, policy)
-    if summary in (REASON_CONFIRMED, REASON_UNDECIDED):
-        record.keep_reason = summary
+    if (cls := chosen_class(record, policy, classes)) is not None:
+        record.keep_reason = class_reason(cls)
         record.target = FOLDER_EVENTS
         return EventState.KEEPING
     if record.unusual_provisional:

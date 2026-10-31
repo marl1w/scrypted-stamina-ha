@@ -72,9 +72,15 @@ const KEEP_REASONS = {
   orphaned: "it could not be decided in time",
 };
 
+/** Why an event was kept, in words: `classes: person` is a chosen class. */
+function keepReason(reason) {
+  if (reason && reason.startsWith("classes: ")) return `a ${reason.slice(9)} was confirmed (a chosen class)`;
+  return KEEP_REASONS[reason];
+}
+
 /** The decision, as one word and a sentence. */
 export function decision(event) {
-  const why = KEEP_REASONS[event.keep_reason];
+  const why = keepReason(event.keep_reason);
   switch (event.state) {
     case "committed":
       return { label: "Kept", tone: "ok", text: why ? `Kept because ${why}.` : "Kept." };
@@ -86,7 +92,7 @@ export function decision(event) {
       return { label: "Deciding", tone: "neutral", text: "Still happening: waiting for the double-check and for the event to end." };
     case "dropping":
     case "dropped":
-      return { label: "Not kept", tone: "neutral", text: "Not kept: nothing was confirmed and nothing about it was unusual." };
+      return { label: "Not kept", tone: "neutral", text: "Not kept: no chosen class was confirmed and nothing about it was unusual." };
     case "orphaned":
       return {
         label: "Undecided: connection lost",

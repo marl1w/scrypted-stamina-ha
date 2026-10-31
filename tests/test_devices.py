@@ -17,7 +17,7 @@ PER_CAMERA = (
     "sensor.front_door_last_event_score",
 )
 HUB = (
-    "switch.stamina_uploads",
+    "select.stamina_uploads",
     "sensor.stamina_queue",
     "sensor.stamina_latency",
     "sensor.stamina_orphans",
@@ -69,7 +69,7 @@ async def test_without_scrypted_mqtt_a_device_per_camera_is_created(hass, setup)
     assert state.attributes["capabilities"]["video_recorder"] is True
     assert state.attributes["learning"] is True
     assert hass.states.get("binary_sensor.front_door_unusual").state == "off"
-    assert hass.states.get("switch.stamina_uploads").state == "on"
+    assert hass.states.get("select.stamina_uploads").state == "classes"
     assert float(hass.states.get("sensor.stamina_quota_used_webdav_nas_0").state) == 0
     await hass.config_entries.async_unload(entry.entry_id)
 

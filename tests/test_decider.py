@@ -51,9 +51,9 @@ def record(*verdicts: str, ended: bool = True, offline: bool = False, **subject_
 @pytest.mark.parametrize(
     ("verdicts", "unusual", "state", "target", "reason"),
     [
-        (("confirmed",), False, EventState.KEEPING, FOLDER_EVENTS, "confirmed"),
-        (("vetoed", "confirmed"), False, EventState.KEEPING, FOLDER_EVENTS, "confirmed"),
-        (("pending",), False, EventState.KEEPING, FOLDER_EVENTS, "undecided"),
+        (("confirmed",), False, EventState.KEEPING, FOLDER_EVENTS, "classes: person"),
+        (("vetoed", "confirmed"), False, EventState.KEEPING, FOLDER_EVENTS, "classes: person"),
+        (("pending",), False, EventState.KEEPING, FOLDER_EVENTS, "classes: person"),
         (("vetoed",), True, EventState.KEEPING, FOLDER_UNUSUAL, "unusual"),
         (("vetoed",), False, EventState.FOLLOW_UP, None, None),
         ((), False, EventState.FOLLOW_UP, None, None),

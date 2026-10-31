@@ -69,22 +69,23 @@ from .const import (
     CONF_RECORDER_RETENTION_DAYS,
     CONF_RELEVANCE_SCOPE,
     CONF_RELEVANCE_SENSITIVITY,
-    CONF_UNUSUAL_OVERRIDES,
     CONF_UNVERIFIED_SCORE,
     CONF_UNVERIFIED_SECONDS,
+    CONF_UPLOAD_CLASSES,
     DEFAULT_FOLLOW_UP_MINUTES,
     DEFAULT_HISTORY_SIZE_MB,
     DEFAULT_RECORDER_RETENTION_DAYS,
     DEFAULT_RELEVANCE_SCOPE,
     DEFAULT_RELEVANCE_SENSITIVITY,
-    DEFAULT_UNUSUAL_OVERRIDES,
     DEFAULT_UNVERIFIED_SCORE,
     DEFAULT_UNVERIFIED_SECONDS,
+    DEFAULT_UPLOAD_CLASSES,
     DOMAIN,
     FOLDER_EVENTS,
     FOLDER_UNUSUAL,
     FRESH_DAYS,
     LATENCY_SAMPLES,
+    LEGACY_UNUSUAL_OVERRIDES,
     POSITION_SAVE_SECONDS,
     RELEVANCE_HISTORY_DAYS,
     SAVE_DEBOUNCE_SECONDS,
@@ -94,6 +95,10 @@ from .const import (
     THUMBNAIL_KEEP_DAYS,
     UNUSUAL_PULSE_SECONDS,
     UPDATE_DEBOUNCE_SECONDS,
+    UPLOAD_MODES,
+    UPLOADS_CLASSES,
+    UPLOADS_OFF,
+    UPLOADS_UNUSUAL,
     signal_camera,
     signal_cameras,
     signal_event,
@@ -102,18 +107,19 @@ from .const import (
 )
 from .context import entity_kind, late_change, snapshot
 from .decider import (
-    REASON_CONFIRMED,
     REASON_UNUSUAL,
     EventRecord,
     EventState,
     Policy,
+    chosen_class,
+    class_reason,
     decide_after_follow_up,
     decide_at_end,
     drop_for_cap,
     follow_up_closed,
+    kept_because,
     orphan,
     subject_confirmed,
-    verdict_summary,
 )
 from .devices import CameraDevice, async_relink, resolve_camera
 from .index import ACTION_COMMIT, ACTION_DROP, EventIndex
@@ -187,8 +193,8 @@ class StaminaManager:
             ),
             unverified_score=float(options.get(CONF_UNVERIFIED_SCORE, DEFAULT_UNVERIFIED_SCORE)),
         )
-        self.unusual_overrides = bool(
-            options.get(CONF_UNUSUAL_OVERRIDES, DEFAULT_UNUSUAL_OVERRIDES)
+        self.upload_classes = frozenset(
+            str(cls) for cls in options.get(CONF_UPLOAD_CLASSES, DEFAULT_UPLOAD_CLASSES)
         )
         self.recorder_retention_days = float(
             options.get(CONF_RECORDER_RETENTION_DAYS, DEFAULT_RECORDER_RETENTION_DAYS)
@@ -198,7 +204,8 @@ class StaminaManager:
         self.now: Callable[[], float] = time.time
         self.records: dict[str, EventRecord] = {}
         self.cameras: dict[str, CameraStatus] = {}
-        self.uploads_enabled = True
+        # The position of `select.stamina_uploads`, persisted in the index's meta.
+        self.uploads = UPLOADS_CLASSES
         self.latencies: deque[float] = deque(maxlen=LATENCY_SAMPLES)
         self.analysis = Analysis(
             hass,
@@ -261,8 +268,7 @@ class StaminaManager:
 
     async def async_start(self) -> None:
         """Resume from the index, connect, and start the timers."""
-        enabled = await self.index.async_get_meta("uploads_enabled")
-        self.uploads_enabled = enabled != "0"
+        self.uploads = await self._async_restore_uploads()
         await self.async_refresh_cameras()
         await self.uploader.async_start()
         # Learned in the background: setup does not wait on months of history. Until it is
@@ -525,7 +531,8 @@ class StaminaManager:
         local = dt_util.as_local(dt_util.utc_from_timestamp(facts.started))
         record = EventRecord(
             facts=facts,
-            admitted=self.uploads_enabled,
+            admitted=self.uploads == UPLOADS_CLASSES,
+            upload_mode=self.uploads,
             area=device.area_slug,
             camera_name=device.name,
             folder=event_folder_name(local, device.name, facts.id),
@@ -543,7 +550,7 @@ class StaminaManager:
         if record.admitted:
             await self.uploader.async_track(record)
         else:
-            record.note("uploads_off_at_start")
+            record.note(f"uploads_{self.uploads}_at_start")
         self._thumbnail_soon(record, THUMBNAIL_DELAY, "start")
         return record
 
@@ -555,10 +562,20 @@ class StaminaManager:
             self._verdict_again.add(record.id)
             self._save(record)
             return
-        if verdict_summary(record.facts, self.policy) != REASON_CONFIRMED:
+        cls = self._confirmed_class(record)
+        if cls is None:
             self._save(record)
             return
-        await self._async_keep(record, REASON_CONFIRMED, FOLDER_EVENTS, "confirmed_after_end")
+        await self._async_keep(record, class_reason(cls), FOLDER_EVENTS, "confirmed_after_end")
+
+    def _confirmed_class(self, record: EventRecord) -> str | None:
+        """Return the chosen class a late verdict confirmed, keeping a held event."""
+        cls = chosen_class(record, self.policy, self.upload_classes)
+        confirmed = cls is not None and any(
+            subject.cls == cls and subject_confirmed(subject, self.policy)
+            for subject in record.facts.subjects.values()
+        )
+        return cls if confirmed else None
 
     async def _async_keep(self, record: EventRecord, reason: str, target: str, note: str) -> None:
         """Move a held or dropping event to KEEPING, and commit it once it is uploaded."""
@@ -570,12 +587,12 @@ class StaminaManager:
         self._spawn(self._async_commit_if_ready(record), f"commit {record.id}")
 
     async def _async_keep_upload(self, record: EventRecord) -> None:
-        """Start uploading a kept event that uploads were off for, if the option says so."""
+        """Start uploading a kept unusual event that started under "Unusual only"."""
         if record.admitted:
             return
-        if record.keep_reason == REASON_UNUSUAL and self.unusual_overrides:
+        if record.keep_reason == REASON_UNUSUAL and record.upload_mode == UPLOADS_UNUSUAL:
             record.admitted = True
-            record.note("uploaded_while_off_because_unusual")
+            record.note("uploaded_because_unusual")
             await self.uploader.async_track(record)
         else:
             record.note("uploads_off")
@@ -611,7 +628,7 @@ class StaminaManager:
         record.reason, record.reasons = result.reason, result.reasons
         self.analysis.remember(record, self.now())
 
-        state = decide_at_end(record, self.policy)
+        state = decide_at_end(record, self.policy, self.upload_classes)
         record.follow_up_until = ended + self.follow_up_seconds(record.camera)
         await self._async_set_state(record, state)
         self._open_follow_up(record)
@@ -623,8 +640,12 @@ class StaminaManager:
             self._spawn(self._async_commit_if_ready(record), f"commit {record.id}")
         elif state is EventState.ORPHANED:
             await self._async_finish_orphan(record)
-        elif state is EventState.FOLLOW_UP and not record.admitted and self.unusual_overrides:
-            # Uploads are off, but a late unusual would still be uploaded — and the plugin
+        elif (
+            state is EventState.FOLLOW_UP
+            and not record.admitted
+            and record.upload_mode == UPLOADS_UNUSUAL
+        ):
+            # Unusual only: a late unusual would still be uploaded — and the plugin
             # keeps segments only for its TTL, which the window may outlast. So the event is
             # held in `pending/` like any other; ordinary at the end, it is dropped as usual.
             record.admitted = True
@@ -758,8 +779,10 @@ class StaminaManager:
         if state is not None and isinstance(state.get("event"), dict):
             with suppress(ProtocolError):
                 record.facts.merge(EventFacts.parse(state["event"]))
-        if verdict_summary(record.facts, self.policy) == REASON_CONFIRMED:
-            await self._async_keep(record, REASON_CONFIRMED, FOLDER_EVENTS, "confirmed_before_drop")
+        if (cls := self._confirmed_class(record)) is not None:
+            await self._async_keep(
+                record, class_reason(cls), FOLDER_EVENTS, "confirmed_before_drop"
+            )
             return False
         result = self.analysis.score(record, now=self.now())
         if result.unusual:
@@ -1191,11 +1214,32 @@ class StaminaManager:
                 thinned,
             )
 
-    async def async_set_uploads(self, enabled: bool) -> None:
-        """Arm or disarm ordinary uploads (the switch gates admission, not delivery)."""
-        self.uploads_enabled = enabled
-        await self.index.async_set_meta({"uploads_enabled": "1" if enabled else "0"})
+    async def async_set_uploads(self, mode: str) -> None:
+        """Set the uploads position: it applies to events that start from now on."""
+        if mode not in UPLOAD_MODES:
+            raise ValueError(f"unknown uploads position {mode}")
+        self.uploads = mode
+        await self.index.async_set_meta({"uploads": mode})
         self._changed()
+
+    async def _async_restore_uploads(self) -> str:
+        """Return the stored position, migrating the old switch's state once.
+
+        The switch on becomes "Chosen classes"; off becomes "Unusual only" when unusual
+        events used to upload anyway (the old option, on by default), else "Off".
+        """
+        stored = await self.index.async_get_meta("uploads")
+        if stored in UPLOAD_MODES:
+            return stored
+        enabled = await self.index.async_get_meta("uploads_enabled")
+        if enabled != "0":
+            mode = UPLOADS_CLASSES
+        elif self.entry.options.get(LEGACY_UNUSUAL_OVERRIDES, True):
+            mode = UPLOADS_UNUSUAL
+        else:
+            mode = UPLOADS_OFF
+        await self.index.async_set_meta({"uploads": mode})
+        return mode
 
     def record_latency(self, seconds: float) -> None:
         """Keep a time-to-first-segment-uploaded sample."""
@@ -1293,6 +1337,7 @@ class StaminaManager:
             ],
             "decision": str(record.state),
             "keep_reason": record.keep_reason,
+            "kept_because": kept_because(record.keep_reason),
             "cloud_path": self.cloud_path(record),
             "started": dt_util.utc_from_timestamp(record.facts.started).isoformat(),
             "duration": record.facts.duration,
