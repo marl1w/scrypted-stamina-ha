@@ -66,11 +66,22 @@ Phase 0 answers decide the details of phases 2–4. S3 is done in the scrypted-r
 
 **Exit criteria:** any event of the last month can be played from HA, from the NVR when it's reachable and from the cloud when it isn't.
 
+## Phase 4b: panel
+
+- A sidebar panel to review events: timeline per camera, filters (unusual, class, area), a player (NVR recording, or else the cloud copy), the evidence for each score, and each camera's capabilities.
+- Reolink Stamina's frontend is the starting point, not a template: keep what works, cut the rest. The criteria are fewer steps, KISS, and less is more: one obvious action per screen, no settings the user must understand before seeing events, mobile first.
+- **A UI/UX review** runs before release, on top of the adversarial, security and performance reviews. It walks the main tasks and flags every extra click, unclear label, empty state and inconsistent pattern:
+  - find the latest unusual event and play it;
+  - see why it was flagged;
+  - check that a camera is working.
+
+  Its findings are fixed before the panel ships.
+
 ## Phase 5: remaining fallbacks and polish
 
 
 - "Process later" for cameras without live alerts (scheduled scan of VideoClips or recordings, with a verifier if present).
-- Thumbnails (if enabled), the timeline panel (ported from Reolink Stamina's frontend), more destinations.
+- Remaining polish and more destinations.
 - Docs, HACS packaging, brand icon.
 
 ## Parallel track: bridge reads standard interfaces (scrypted-mqtt-ha)
