@@ -77,10 +77,11 @@ def all_devices(registry: dr.DeviceRegistry) -> list[dr.DeviceEntry]:
 def scrypted_mqtt_device(hass: HomeAssistant, camera: str) -> dr.DeviceEntry | None:
     """Return the `scrypted_mqtt` device of a Scrypted device id, whatever its topic root."""
     for device in all_devices(dr.async_get(hass)):
-        for domain, identifier in device.identifiers:
-            if domain != SCRYPTED_MQTT_DOMAIN:
+        # Identifiers are usually (domain, id) pairs, but some integrations register longer tuples.
+        for item in device.identifiers:
+            if len(item) != 2 or item[0] != SCRYPTED_MQTT_DOMAIN or not isinstance(item[1], str):
                 continue
-            _, sep, device_id = identifier.rpartition(":")
+            _, sep, device_id = item[1].rpartition(":")
             if sep and device_id == camera:
                 return device
     return None

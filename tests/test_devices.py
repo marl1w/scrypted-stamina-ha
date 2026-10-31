@@ -89,7 +89,13 @@ async def test_devices_are_found_whatever_shape_the_registry_has(hass) -> None:
             identifiers={("scrypted_mqtt", f"scrypted:{n}")},
             name=f"Camera {n}",
         )
-    found = all_devices(registry)
+    # another integration's device with a three-part identifier must not break the lookup
+    other = MockConfigEntry(domain="legacy")
+    other.add_to_hass(hass)
+    registry.async_get_or_create(
+        config_entry_id=other.entry_id, identifiers={("legacy", "a", "b")}, name="Legacy"
+    )
+    found = [d for d in all_devices(registry) if d.name != "Legacy"]
     assert len(found) == 3 and all(isinstance(item, dr.DeviceEntry) for item in found)
     assert scrypted_mqtt_device(hass, "2").name == "Camera 2"
 
