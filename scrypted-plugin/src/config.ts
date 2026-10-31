@@ -3,7 +3,7 @@
 import { clampInt } from './util';
 
 export const PLUGIN_ID = '@marl1w/scrypted-stamina';
-export const VERSION = '0.1.2';
+export const VERSION = '0.1.3';
 
 export interface NumberSetting { key: string; title: string; group: string; description: string; def: number; min: number; max: number }
 

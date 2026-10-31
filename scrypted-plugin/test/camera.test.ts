@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CameraCore, CameraSink, isMirror, PLAIN_DEDUPE_MS } from '../src/camera';
+import { CameraCore, CameraSink, isMirror, PLAIN_DEDUPE_MS, VERIFIER_LIVE_MS, VERIFIER_RECENT_MS } from '../src/camera';
 import { RolesTable, signalRole } from '../src/roles';
 import { FakeScrypted } from './fakes';
 import { FakeClock } from './helpers';
@@ -200,9 +200,9 @@ test('a source first seen through motion is not locked as a trigger: its first d
     assert.equal(x.roles.get('some/analyzer')!.roleSet, true);
 });
 
-test('a verifier silent for over 10 min: the window ends unverified, not vetoed; verifier_live says so', () => {
+test('a verifier silent for over 3 min: the window ends unverified, not vetoed; verifier_live says so', () => {
     const x = setup();
-    pendingPerson(x, 11 * 60_000);
+    pendingPerson(x, VERIFIER_LIVE_MS + 1000);
     assert.equal(x.core.verifierLive(), false);
     x.clock.advance(5000);
     const v = x.out.find(m => m.type === 'subject.verdict')!;
@@ -270,8 +270,8 @@ test('a verifier is present only while it is a mixin of the camera; its liveness
     x.sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
     assert.deepEqual(x.core.verifiers(), [CG]);
     assert.equal(x.core.verifierLive(), true);
-    // Coral Guard is active elsewhere, but not on this camera for 11 min: not live here
-    x.clock.advance(11 * 60_000);
+    // Coral Guard is active elsewhere, but not on this camera for over 3 min: not live here
+    x.clock.advance(VERIFIER_LIVE_MS + 1000);
     x.roles.ensure({ source: CG, kind: 'object', className: 'verified_person' }, x.clock.now());
     assert.equal(x.core.verifierLive(), false);
     x.sc.devices.get('7')!.mixins = ['911'];
@@ -381,4 +381,136 @@ test('detections are taken from the plain, layer and system listeners, each payl
     x.clock.advance(1000);
     x.sc.emit('7', 'ObjectDetector', { ...payload, timestamp: x.clock.now() }, {}, '7');
     assert.equal(x.core.detectionStats.total, 2);
+});
+
+// ---- liveness beats: an empty ObjectsDetected from a verifier (Coral Guard 0.3.50+, about every 60 s while it verifies) ----
+
+const beat = (x: ReturnType<typeof setup>, extra: Record<string, unknown> = {}) =>
+    x.sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [], ...extra });
+
+test('liveness: the live window is about 3 min', () => {
+    assert.equal(VERIFIER_LIVE_MS, 3 * 60_000);
+});
+
+test('liveness: a verifier\'s empty beats keep it live on a quiet camera, so its silence on a false event is a veto', () => {
+    const x = setup();
+    x.sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    // an hour of quiet with a beat every minute
+    for (let i = 0; i < 60; i++) { x.clock.advance(60_000); beat(x); }
+    assert.equal(x.core.verifierLive(), true);
+    assert.equal(x.core.verifierLiveOf(CG), true);
+    x.out.length = 0;
+    x.sc.emit('7', 'ObjectDetector', { sourceId: CAMP, timestamp: x.clock.now(), detections: [{ className: 'people', score: 1 }] });
+    assert.equal(x.core.tracker.current!.subjects.length, 1, 'the beats created no subject');
+    x.clock.advance(6000);
+    assert.equal(x.out.find(m => m.type === 'subject.verdict')!.body.subject.verdict, 'vetoed');
+});
+
+test('liveness: the beats stop, and after 3 min the verifier is not live (unverified, not vetoed)', () => {
+    const x = setup();
+    x.sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    x.clock.advance(60_000);
+    beat(x);
+    x.clock.advance(2 * 60_000);
+    assert.equal(x.core.verifierLiveOf(CG), true, 'within 3 min of the last beat');
+    x.clock.advance(60_000 + 1);
+    assert.equal(x.core.verifierLiveOf(CG), false);
+    assert.equal(x.core.verifierLive(), false);
+    x.out.length = 0;
+    x.sc.emit('7', 'ObjectDetector', { sourceId: CAMP, timestamp: x.clock.now(), detections: [{ className: 'people', score: 1 }] });
+    x.clock.advance(6000);
+    assert.equal(x.out.find(m => m.type === 'subject.verdict')!.body.subject.verdict, 'unverified');
+});
+
+test('liveness: an empty payload creates no observation, no event, no source row, and is not counted as a detection', () => {
+    const x = setup();
+    beat(x);
+    x.sc.emit('7', 'ObjectDetector', { sourceId: 'some/unknown', timestamp: x.clock.now() + 1, detections: [] });
+    x.sc.emit('7', 'ObjectDetector', { sourceId: CAMP, timestamp: x.clock.now() + 2 });
+    assert.equal(x.out.length, 0);
+    assert.equal(x.core.tracker.current, undefined);
+    assert.equal(x.roles.get('some/unknown'), undefined, 'no row for a source first seen through an empty payload');
+    assert.equal(x.core.detectionStats.total, 0);
+    assert.deepEqual(x.core.verifiers(), [], 'a beat never makes a source present');
+    assert.equal(x.core.verifierLive(), false);
+});
+
+test('liveness: an empty payload from a trigger source is not verifier activity', () => {
+    const x = setup();
+    x.sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    x.sc.emit('7', 'ObjectDetector', { sourceId: CAMP, timestamp: x.clock.now(), detections: [{ className: 'people', score: 1 }] });
+    x.clock.advance(VERIFIER_LIVE_MS + 1000);
+    x.sc.emit('7', 'ObjectDetector', { sourceId: CAMP, timestamp: x.clock.now(), detections: [] });
+    assert.equal(x.core.verifierLive(), false);
+});
+
+test('liveness: empty beats arrive by the plain, layer and system listeners, each counted once and none dropped', () => {
+    for (const only of ['plain', 'layer', 'system', 'all'] as const) {
+        const x = setup();
+        const sys: ((dev: string, d: any, data: any) => void)[] = [];
+        x.core.setEnv({ ...x.core.env, listenAll: (_iface, cb) => { sys.push(cb); return () => { }; } });
+        x.sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+        x.clock.advance(VERIFIER_LIVE_MS + 1000);
+        assert.equal(x.core.verifierLive(), false);
+        const before = { ...x.core.detectionStats };
+        x.out.length = 0;
+        const payload = { sourceId: '913', timestamp: x.clock.now(), detections: [] };
+        if (only === 'plain' || only === 'all') x.sc.emit('7', 'ObjectDetector', payload);
+        if (only === 'layer' || only === 'all') x.sc.emit('7', 'ObjectDetector', payload, {}, '913');
+        if (only === 'system' || only === 'all') sys.forEach(f => f('7', {}, payload));
+        assert.equal(x.core.verifierLive(), true, only);
+        assert.equal(x.core.detectionStats.total, before.total, `${only}: not a detection`);
+        if (only === 'all') {
+            assert.deepEqual([x.core.detectionStats.plain - before.plain, x.core.detectionStats.layer - before.layer, x.core.detectionStats.system - before.system], [1, 1, 1]);
+            assert.equal(x.out.length, 0);
+        }
+    }
+});
+
+test('liveness: a duplicate beat (same payload by another path) is deduplicated before the bookkeeping', () => {
+    const x = setup();
+    const env = x.core.env;
+    const sys: ((dev: string, d: any, data: any) => void)[] = [];
+    x.core.setEnv({ ...env, listenAll: (_iface, cb) => { sys.push(cb); return () => { }; } });
+    x.sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    x.clock.advance(VERIFIER_LIVE_MS + 1000);
+    const payload = { sourceId: '913', timestamp: x.clock.now(), detections: [] };
+    x.sc.emit('7', 'ObjectDetector', payload);
+    const at = x.clock.now();
+    x.clock.advance(2000);
+    sys.forEach(f => f('7', {}, payload)); // the same beat, late by another path: dropped, liveness stays at the first arrival
+    x.clock.advance(VERIFIER_LIVE_MS - 2000 + 1);
+    assert.ok(x.clock.now() - at > VERIFIER_LIVE_MS);
+    assert.equal(x.core.verifierLive(), false);
+});
+
+test('liveness: a crop does not take its parent\'s beats (Coral Guard verifies each view on its own)', () => {
+    const x = splitSetup();
+    x.clock.advance(VERIFIER_LIVE_MS);
+    x.sc.emit('501', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [] });
+    assert.equal(x.parent.verifierLive(), true);
+    assert.equal(x.crop.verifierLive(), false);
+    assert.equal(x.out['501'].length + x.out['502'].length, 0);
+});
+
+test('liveness: beats keep a present verifier present past 7 days', () => {
+    const x = setup();
+    x.sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    for (let d = 0; d < 8; d++) {
+        for (let i = 0; i < 24; i++) { x.clock.advance(3600_000); beat(x); }
+    }
+    assert.ok(8 * 24 * 3600_000 > VERIFIER_RECENT_MS);
+    assert.deepEqual(x.core.verifiers(), [CG], 'still present: it kept beating');
+    assert.equal(x.core.verifierPresent(), true);
+});
+
+test('liveness: a verifier mixin that never detected here but beats is responding (page), yet does not count for verdicts', () => {
+    const x = setup();
+    assert.equal(x.roles.get(CG), undefined, 'no row yet: a known verifier counts by name');
+    beat(x);
+    assert.deepEqual(x.core.silentVerifiers(), [CG]);
+    assert.equal(x.core.verifierLiveOf(CG), true);
+    assert.equal(x.core.verifierPresent(), false);
+    x.clock.advance(VERIFIER_LIVE_MS + 1);
+    assert.equal(x.core.verifierLiveOf(CG), false);
 });

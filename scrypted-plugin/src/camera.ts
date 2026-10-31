@@ -4,7 +4,7 @@
 import { DEFAULT_EPISODE, EpisodeConfig, EpisodeTracker, EventRecord, publicEvent, publicObservation } from './episode';
 import { publicSubject, Subject } from './fusion';
 import { attribute, fromBinary, fromDetections, NormalizeContext, Observation } from './normalize';
-import { RolesTable } from './roles';
+import { KNOWN_VERIFIERS, RolesTable } from './roles';
 import { Clock, errText } from './util';
 
 export type Iface = 'ObjectDetector' | 'MotionSensor' | 'OccupancySensor' | 'AudioSensor' | 'BinarySensor' | 'Online';
@@ -65,8 +65,11 @@ const SAME_DETECTION_MS = 5000;
 
 /** A verifier counts as present on a camera when it emitted there within this long. */
 export const VERIFIER_RECENT_MS = 7 * 24 * 3600_000;
-/** A verifier is live when it showed activity (on this camera, or on any camera) within this long. */
-export const VERIFIER_LIVE_MS = 10 * 60_000;
+/**
+ * A verifier is live on a camera when it showed activity there within this long: a detection, a signal, or an empty
+ * ObjectsDetected (Coral Guard 0.3.50+ sends one about every 60 s, ±10 s, while it verifies the camera).
+ */
+export const VERIFIER_LIVE_MS = 3 * 60_000;
 const VERIFIERS_KEY = 'stamina:verifiers';
 const SOURCES_KEY = 'stamina:sources';
 /** binary sensor child names that map to a context feature */
@@ -309,7 +312,8 @@ export class CameraCore {
         this.recentDetections.set(key, now);
         if (this.recentDetections.size > 256)
             for (const [k, t] of this.recentDetections) if (now - t > SAME_DETECTION_MS) this.recentDetections.delete(k);
-        this.detectionStats.total++;
+        // an empty payload is a verifier's sign of life, not a detection: it is not counted as one
+        if (dets.length) this.detectionStats.total++;
         this.onDetections(d, data, fromParent);
     }
 
@@ -341,6 +345,11 @@ export class CameraCore {
         const source = attribute({ mixinId: d.mixinId, sourceId: typeof data.sourceId === 'string' ? data.sourceId : undefined }, x => this.env.pluginOf(x), ownPlugin);
         const split = this.isSplit();
         const parentPlugin = this.parentId() ? this.env.state(this.parentId()!)?.pluginId : undefined;
+        if (!Array.isArray(data.detections) || !data.detections.length) {
+            // an empty payload: liveness of a verifier on this camera only (never an observation, never a new source)
+            if (!fromParent) this.noteAlive(source);
+            return;
+        }
         const obs = fromDetections(data, source, d.eventTime, { ...ctx, cameraPlugin: ownPlugin });
         for (const o of obs) {
             if (split && !o.box && o.role !== 'enricher' && (o.source === ctx.cameraPlugin || o.source === parentPlugin)) {
@@ -373,6 +382,22 @@ export class CameraCore {
         }
     }
 
+    /**
+     * An empty ObjectsDetected from a verifier source: activity on this camera (liveness). It keeps a verifier that is already
+     * present here present (a quiet camera may see no detection for days), but never makes a source present or creates a row
+     * (a known verifier plugin without a row yet counts by name).
+     */
+    private noteAlive(source: string) {
+        const row = this.env.roles.get(source);
+        if (row ? row.role !== 'verifier' : !KNOWN_VERIFIERS.includes(source)) return;
+        const now = this.env.clock.now();
+        this.verifierActivity[source] = now;
+        if (this.verifiersSeen[source] !== undefined && now - this.verifiersSeen[source] > 60_000) {
+            this.verifiersSeen[source] = now;
+            this.schedulePersist();
+        }
+    }
+
     private feed(o: Observation) {
         this.noteSource(o);
         this.tracker.observe(o);
@@ -387,7 +412,11 @@ export class CameraCore {
         if (now - (this.sourcesSeen[o.source] ?? 0) > 60_000) {
             if (this.sourcesSeen[o.source] !== undefined || Object.keys(this.sourcesSeen).length < 32) { this.sourcesSeen[o.source] = now; dirty = true; }
         }
-        if (dirty && this.persistTimer === undefined)
+        if (dirty) this.schedulePersist();
+    }
+
+    private schedulePersist() {
+        if (this.persistTimer === undefined)
             this.persistTimer = this.env.clock.setTimeout(() => { this.persistTimer = undefined; this.persist(); }, 5000);
     }
 
@@ -427,13 +456,17 @@ export class CameraCore {
     }
 
     /**
-     * A present verifier is live when it showed activity (a detection or a signal) on THIS camera within VERIFIER_LIVE_MS
+     * A present verifier is live when it showed activity (a detection, a signal or an empty payload) on THIS camera within VERIFIER_LIVE_MS
      * (it is a mixin here, so activity elsewhere says nothing about this camera). A subject a live verifier did not confirm is
      * vetoed; with no live verifier it is unverified.
      */
     verifierLive(): boolean {
-        const now = this.env.clock.now();
-        return this.verifiers().some(s => now - (this.verifierActivity[s] ?? -Infinity) <= VERIFIER_LIVE_MS);
+        return this.verifiers().some(s => this.verifierLiveOf(s));
+    }
+
+    /** This verifier showed activity on this camera within VERIFIER_LIVE_MS (the camera page's "not responding" is its negation). */
+    verifierLiveOf(source: string): boolean {
+        return this.env.clock.now() - (this.verifierActivity[source] ?? -Infinity) <= VERIFIER_LIVE_MS;
     }
 
     /** Verifier plugins that are mixins on the camera but have not emitted recently (e.g. Coral Guard in Shadow mode). */

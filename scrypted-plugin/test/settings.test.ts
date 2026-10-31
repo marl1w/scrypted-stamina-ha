@@ -129,3 +129,11 @@ test('camera page: plain words and display names', () => {
     ]);
     assert.ok(!lines.join(' ').match(/VideoRecorder|ObjectDetector|prebuffer/i));
 });
+
+test('camera page: a verifier is "not responding" only when it is not live (no activity or beat within 3 min)', () => {
+    const line = (live: boolean) => cameraStatusLines({
+        triggers: [CAM], verifiers: [{ source: CG, live }], silent: [], prebufferMs: null, recordings: false, clips: false, split: false, parent: null, detections: 0,
+    }, nameOf)[1];
+    assert.equal(line(true), 'Double-check: Coral Guard');
+    assert.equal(line(false), 'Double-check: Coral Guard (not responding)');
+});

@@ -91,8 +91,10 @@ export class StaminaMixin extends SettingsMixinDeviceBase<any> {
         for (const m of st?.mixins ?? []) { const p = (systemManager.getDeviceById(m) as any)?.pluginId; if (p && p !== PLUGIN_ID) here.add(p); }
         const status: CameraStatus = {
             triggers: [...here].filter(x => e.roles.get(x)?.role === 'trigger').sort(),
-            verifiers: caps.verifiers.map(v => ({ source: v, live: caps.verifier_live })),
-            silent: caps.silent_verifiers,
+            // "not responding" only without activity or a liveness beat on this camera within 3 min, also for a verifier mixin
+            // that has not detected anything here yet (it does not count for verdicts until it does)
+            verifiers: [...caps.verifiers, ...caps.silent_verifiers].map(v => ({ source: v, live: this.core!.verifierLiveOf(v) })),
+            silent: [],
             prebufferMs: caps.prebuffer_ms,
             recordings: caps.video_recorder,
             clips: caps.video_clips,
