@@ -1,0 +1,14 @@
+# Python (the Home Assistant integration)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Node (the Scrypted plugin)
+node_modules/
+
+# Scrypted plugin build and test output
+scrypted-plugin/node_modules/
+scrypted-plugin/out/
+scrypted-plugin/out-test/
