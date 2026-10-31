@@ -200,3 +200,25 @@ export function formatAfter(seconds) {
   if (s < 0) return "before the end";
   return s < 90 ? `${s} s after` : `${Math.round(s / 60)} min after`;
 }
+
+// ------------------------------------------------------------------ how unusual
+
+/**
+ * Where an event sits between usual and unusual, as a word, a tone and a fill.
+ *
+ * `score` is 0..1 with 0.5 at the camera's own line (what `sensor.<cam>_last_event_score`
+ * shows), so the bar is comparable between events and cameras. `unusual` is the verdict and
+ * wins over the number: only a flagged event is called unusual, so a camera still learning
+ * tops out at "Uncommon".
+ */
+export function usualness(score, unusual) {
+  if (typeof score !== "number" || Number.isNaN(score)) {
+    return unusual
+      ? { label: "Unusual", tone: "unusual", fill: null }
+      : { label: "Not scored", tone: "none", fill: null };
+  }
+  const fill = Math.max(0.04, Math.min(1, score));
+  if (unusual) return { label: score >= 0.85 ? "Very unusual" : "Unusual", tone: score >= 0.85 ? "high" : "unusual", fill };
+  if (score >= 0.35) return { label: "Uncommon", tone: "mid", fill };
+  return { label: "Usual", tone: "low", fill };
+}

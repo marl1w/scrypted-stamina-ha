@@ -8,7 +8,8 @@
   The panel talks to Home Assistant through `hass.callWS` and
   `hass.connection.subscribeMessage` only, so stand-ins for those are all it takes.
   `?empty` gives a fresh install, `?dark` the dark theme, `?quiet` a house where nothing
-  was kept. The panel is one page: list and event side by side from 900 px, rows that open
+  was kept. The panel is one page: list and event side by side from 900 px (the cameras get a
+  column of their own from 1200 px), rows that open
   inline below that (resize the window to see both). Its filters and the selected event
   live after the `#` here (Home Assistant gives it the path instead). Video does not play (nothing signs URLs here); the player
   shows its "no video" and "could not be played" states.
@@ -54,7 +55,8 @@ const NOW = Date.now() / 1000;
 const CAMERAS = params.has("empty") ? [] : [
   { id: "11", name: "Front door", area: "Entrance", online: true, verifier: true, live: true, recorder: true, learn: [12, 640] },
   { id: "12", name: "Driveway", area: "Outside", online: true, verifier: true, live: true, recorder: true, learn: [12, 410] },
-  { id: "13", name: "Garden", area: "Outside", online: true, verifier: true, live: false, recorder: false, learn: [3.4, 96] },
+  { id: "13", name: "Garden", area: "Outside", online: true, verifier: true, live: true, recorder: false, learn: [3.4, 96] },
+  { id: "16", name: "Back gate", area: "Outside", online: true, verifier: true, live: false, recorder: true, learn: [15, 700] },
   { id: "14", name: "Garage", area: "Garage", online: false, verifier: true, live: false, recorder: true, learn: [9, 230] },
   { id: "15", name: "Side path", area: null, online: true, verifier: false, live: false, recorder: false, learn: [20, 900] },
 ];
