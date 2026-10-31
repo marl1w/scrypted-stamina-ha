@@ -1016,7 +1016,8 @@ class ScryptedStaminaPanel extends HTMLElement {
       mark(Boolean(play.recorder), play.recorder ? "Recording" : "No recording"),
       mark(Boolean(play.cloud), play.cloud ? "Offsite copy" : "No offsite copy"),
     );
-    if (!(play.url && play.cloud)) {
+    // A choice only between two sources that both have the event; the marks are status only.
+    if (!(play.recorder && play.url && play.cloud)) {
       replace(state.switch, marks);
       return;
     }

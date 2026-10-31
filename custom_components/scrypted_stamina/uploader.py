@@ -90,6 +90,8 @@ LAG_BUDGET = 8
 # A destination that fails is skipped for this long, doubling up to the maximum.
 BREAKER_SECONDS = 15.0
 BREAKER_MAX_SECONDS = 300.0
+# Failed operations in a row after which a destination's health reads `failing`.
+HEALTH_FAILURES = 3
 # How often an ended event's state is asked while waiting for its last segment, and how
 # often once the plugin has been silent for a whole TTL about an event not known closed.
 _TAIL_POLL = 2.0
@@ -121,6 +123,9 @@ class Target:
     uploaded: int = 0
     degraded_until: float = 0.0
     failures: int = 0
+    # Failed operations in a row, of any kind (upload, commit, eviction, update): what the
+    # destination's health sensor reads, so a commit that keeps failing is not only a log line.
+    errors: int = 0
     probing: bool = False
     over_quota: bool = False
     slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(2))
@@ -150,11 +155,22 @@ class Target:
         if admission == _PROBE:
             self.probing = False
 
+    @property
+    def healthy(self) -> bool:
+        """Return False once operations keep failing (`HEALTH_FAILURES` in a row)."""
+        return self.errors < HEALTH_FAILURES
+
+    def error(self, err: Exception) -> None:
+        """Record one failed operation."""
+        self.last_error = scrub_credentials(str(err))
+        self.errors += 1
+
     def failed(self, err: Exception, admission: str | None, now: float) -> bool:
         """Record a failure; return whether it counted (breaker closed, or the probe)."""
         self.last_error = scrub_credentials(str(err))
         if admission not in (_CLOSED, _PROBE):
             return False
+        self.errors += 1
         self.probing = False
         self.failures += 1
         delay = min(BREAKER_SECONDS * 2 ** (self.failures - 1), BREAKER_MAX_SECONDS)
@@ -164,6 +180,7 @@ class Target:
     def succeeded(self) -> None:
         """Close the breaker."""
         self.failures = 0
+        self.errors = 0
         self.degraded_until = 0.0
         self.probing = False
         self.last_error = None
@@ -811,7 +828,7 @@ class Uploader:
                 try:
                     await self._async_evict(target, held.event_id)
                 except DestinationError as err:
-                    target.last_error = scrub_credentials(str(err))
+                    target.error(err)
                     return
 
     async def _async_evict(self, target: Target, event_id: str) -> None:
@@ -853,7 +870,7 @@ class Uploader:
                 try:
                     await self._async_evict(target, held.event_id)
                 except DestinationError as err:
-                    target.last_error = scrub_credentials(str(err))
+                    target.error(err)
 
     # ------------------------------------------------------------------ acks
 
@@ -940,12 +957,13 @@ class Uploader:
             try:
                 await self._async_commit_copy(target.destination, record, copy, final, details)
             except DestinationError as err:
-                target.last_error = scrub_credentials(str(err))
+                target.error(err)
                 _LOGGER.warning(
                     "%s could not commit %s: %s", target.label, record.id, target.last_error
                 )
                 raise
             copy.folder, copy.committed = final, True
+            target.errors = 0
             target.usage.set(record.id, record.facts.started, record.state, copy.size)
             await self._index.async_save_copy(record.id, subentry_id, copy)
         record.latency["committed"] = time.time()
@@ -1003,7 +1021,7 @@ class Uploader:
             try:
                 await target.destination.async_store(f"{copy.folder}/{EVENT_JSON}", details)
             except DestinationError as err:
-                target.last_error = scrub_credentials(str(err))
+                target.error(err)
                 _LOGGER.warning("%s could not update %s: %s", target.label, record.id, err)
 
     async def async_drop(self, record: EventRecord) -> None:

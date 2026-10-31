@@ -17,7 +17,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import StaminaConfigEntry
 from .const import UPLOAD_MODES
-from .entity import StaminaEntity, hub_device
+from .entity import StaminaEntity, hub_device, hub_entity_id
 
 
 async def async_setup_entry(
@@ -41,6 +41,7 @@ class UploadsSelect(StaminaEntity, SelectEntity):
         # Not the old switch's id: that entity is removed on upgrade (`__init__.py`).
         self._attr_unique_id = f"{manager.entry.entry_id}_uploads_mode"
         self._attr_device_info = hub_device(manager.entry)
+        self.entity_id = hub_entity_id("select", "uploads")
 
     @property
     def current_option(self) -> str:

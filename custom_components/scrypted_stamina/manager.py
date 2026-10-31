@@ -716,6 +716,7 @@ class StaminaManager:
                 await self.uploader.async_commit(record)
             except Exception as err:  # any failure is retried later
                 _LOGGER.warning("Commit of %s failed, will retry: %s", record.id, err)
+                self._changed()  # the destination's health may have turned
                 self._retry_later(record, self._async_commit_if_ready)
                 return
             if record.state is EventState.KEEPING:

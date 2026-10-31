@@ -169,7 +169,20 @@
         "name": "Latency"
       },
       "quota_used": {
-        "name": "Quota used {destination}"
+        "name": "Quota used"
+      },
+      "quota_percent": {
+        "name": "Quota used percent"
+      },
+      "pending": {
+        "name": "Pending"
+      },
+      "health": {
+        "name": "Health",
+        "state": {
+          "ok": "OK",
+          "failing": "Failing"
+        }
       },
       "orphans": {
         "name": "Orphans"

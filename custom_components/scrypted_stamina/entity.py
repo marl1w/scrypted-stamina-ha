@@ -2,7 +2,8 @@
 
 Per-camera entities sit on a Stamina device per camera, named like the camera and linked to
 its `scrypted_mqtt` device when there is one (see `devices.py`). Integration-wide entities
-sit on one "Stamina" service device.
+sit on one "Scrypted Stamina" service device, and each destination's on a device of its own,
+named after the destination and filed under its subentry.
 """
 
 from __future__ import annotations
@@ -19,19 +20,38 @@ from .const import DOMAIN, signal_camera, signal_cameras, signal_update
 from .devices import async_ensure_device
 from .manager import CameraStatus, StaminaManager
 
-HUB_NAME = "Stamina"
+HUB_NAME = "Scrypted Stamina"
 
 
 def hub_device(entry: ConfigEntry) -> DeviceInfo:
     """Return the integration's own device."""
     return DeviceInfo(
         identifiers={(DOMAIN, entry.entry_id)},
-        # "Stamina", so the integration-wide entities read `switch.stamina_uploads`.
         name=HUB_NAME,
         manufacturer="Scrypted",
         model="Stamina",
         entry_type=DeviceEntryType.SERVICE,
     )
+
+
+def destination_device(entry: ConfigEntry, subentry_id: str, title: str) -> DeviceInfo:
+    """Return one destination's device, under the hub."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, f"{entry.entry_id}_{subentry_id}")},
+        name=title,
+        manufacturer="Scrypted",
+        model="Stamina destination",
+        entry_type=DeviceEntryType.SERVICE,
+        via_device=(DOMAIN, entry.entry_id),
+    )
+
+
+def hub_entity_id(domain: str, key: str) -> str:
+    """Return a hub entity's id, `<domain>.stamina_<key>`, whatever the device is named.
+
+    Only a suggestion: an entity already in the registry keeps its own id.
+    """
+    return f"{domain}.stamina_{key}"
 
 
 class StaminaEntity(Entity):
