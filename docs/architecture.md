@@ -191,7 +191,7 @@ Some evidence comes after the camera has stopped seeing anything: a door opened 
 - `FOLLOW_UP` pending data has its own cap (default 1 GB per destination). Over it, the oldest vetoed-and-ordinary events are dropped first.
 - The window end time is persisted, so evaluation resumes after a restart.
 
-A later extension: **incidents** link events across cameras in the same or adjacent areas, close in time (gate, then garden, then patio door), so the score sees the whole path.
+Sequences across cameras are already part of the ported relevance model: each event is paired with the camera that fired just before it in its pool, and that predecessor and the gap are learned like any other feature (reason: "90s after <camera>"). Pools are all cameras together (default), per HA area, or per camera. Per area replaces Reolink Stamina's per-recorder pool, so no NVR logic is involved.
 
 ### 3.5 Uploader
 
