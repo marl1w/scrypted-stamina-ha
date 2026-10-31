@@ -143,7 +143,7 @@ All routes are under `/endpoint/@marl1w/scrypted-stamina/` with `Authorization: 
 
 ### 3.2 Context
 
-**Configuration:** the integration's options have one page per camera with an entity picker. It is pre-filled with suggestions from the camera device's area (contacts, alarm panel, presence, lights), and you add or remove entities. Each entity's kind (door, alarm, presence, light, other) comes from its domain and device class, and tells scoring and rules how to read it.
+**Configuration:** the integration's options have one page per camera with an entity picker. It is pre-filled with suggestions from the camera device's area (contacts, alarm panel, presence, lights), and you add or remove entities. Each entity's kind (door, alarm, presence, light, other) comes from its domain and device class, and tells scoring how to read it.
 
 - Per camera device, an options picker of **linked entities** (contacts, alarm panel, presence, lights…).
 - At `event.start` and `event.end`, the integration records each linked entity's state and its last change relative to the event (e.g. "door opened 5 s before"). These features feed scoring and are stored with the event.
@@ -240,7 +240,7 @@ t      SCRYPTED (stamina plugin)              HA (stamina integration)          
        ─ subject.verdict confirmed ────────►  decider: KEEPING
 2.3 …  segments every 2 s ─────────────────►  fetch + upload, ack  ─────────────► pending/<id>/…
 40.0   last observation + 10 s margin
-       ─ event.end {subjects, span} ───────►  score + rules; context at end
+       ─ event.end {subjects, span} ───────►  score; context at end
                                               upload tail; write index.m3u8, event.json
                                               rename pending/<id> → events/<id>  ► events/<id>/
                                               entities: event.<cam>_stamina fires
