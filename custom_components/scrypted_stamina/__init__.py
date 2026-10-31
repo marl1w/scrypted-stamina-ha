@@ -16,9 +16,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import entity_registry as er, issue_registry as ir
 
 from .api import InsecureUrlError, StaminaApiError, StaminaAuthError, StaminaClient
+from .areas import area_subentries, slug_of
 from .const import (
     CONF_DESTINATION_ENTRY,
     CONF_FINGERPRINT,
@@ -172,9 +173,35 @@ def _async_drop_old_entities(hass: HomeAssistant, entry: StaminaConfigEntry) -> 
     ):
         if old := registry.async_get_entity_id(domain, DOMAIN, unique_id):
             registry.async_remove(old)
+            if domain == "select":
+                _async_tell_uploads_moved(hass, entry)
     if LEGACY_UNUSUAL_OVERRIDES in entry.options:
         options = {k: v for k, v in entry.options.items() if k != LEGACY_UNUSUAL_OVERRIDES}
         hass.config_entries.async_update_entry(entry, options=options)
+
+
+@callback
+def _async_tell_uploads_moved(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:
+    """Raise a repair issue, once, naming the per-area selects the global one became.
+
+    Raised when the old select is removed, which happens once; the user dismisses it.
+    """
+    registry = er.async_get(hass)
+    selects = []
+    for key, subentry in sorted(area_subentries(entry).items(), key=lambda i: i[1].title):
+        unique_id = f"{entry.entry_id}_area_{key}_uploads"
+        entity_id = registry.async_get_entity_id("select", DOMAIN, unique_id)
+        selects.append(entity_id or f"select.stamina_{slug_of(subentry).replace('-', '_')}_uploads")
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        f"uploads_per_area_{entry.entry_id}",
+        is_fixable=False,
+        is_persistent=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="uploads_per_area",
+        translation_placeholders={"selects": ", ".join(selects) or "none yet"},
+    )
 
 
 def _reload_key(entry: ConfigEntry) -> tuple[Any, ...]:

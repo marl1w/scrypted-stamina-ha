@@ -18,12 +18,10 @@ On each destination's device (filed under its subentry):
 * health: `ok`, or `failing` after `HEALTH_FAILURES` failed operations in a row (uploads,
   commits, evictions), with the last error as an attribute.
 
-On each area's device (filed under its subentry, `areas.py`), the same data filtered to the
-events of that area (by the area folder each was filed under at its start):
-
-* quota: bytes its events hold on the destination, with the share of the quota;
-* status: `ok`, or `failing` while a destination is failing (failures are not per area),
-  with what the area has uploading and held for the follow-up window.
+On each area's device (filed under its subentry, `areas.py`), quota used: the bytes the
+area's events hold on the destination (by the area each was filed under at its start), with
+the share of the quota, what the area has uploading and held for the follow-up window, and
+the last error. Health stays on the destinations: a failure is not per area.
 """
 
 from __future__ import annotations
@@ -77,6 +75,11 @@ async def async_setup_entry(
     registry = er.async_get(hass)
     for item in er.async_entries_for_config_entry(registry, entry.entry_id):
         if item.domain != "sensor" or item.unique_id in live:
+            continue
+        if item.unique_id.startswith(f"{entry.entry_id}_area_"):
+            # The area sensors before `quota_used`: `quota` and `status`.
+            if item.unique_id.endswith(("_quota", "_status")):
+                registry.async_remove(item.entity_id)
             continue
         if item.unique_id.endswith(tuple(f"_{cls.key}" for cls in DESTINATION_SENSORS)):
             registry.async_remove(item.entity_id)
@@ -344,19 +347,17 @@ class OrphanSensor(_HubSensor):
 
 
 class AreaQuotaSensor(AreaEntity, SensorEntity):
-    """Bytes one area's events hold on the destination."""
+    """Bytes one area's events hold on the destination, and what the area has in flight."""
 
-    key = "quota"
+    key = "quota_used"
     platform_domain = "sensor"
     _attr_device_class = SensorDeviceClass.DATA_SIZE
     _attr_native_unit_of_measurement = UnitOfInformation.BYTES
     _attr_suggested_unit_of_measurement = UnitOfInformation.GIGABYTES
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _unrecorded_attributes = frozenset({"events"})
-
-    def _signal(self) -> str:
-        """Refresh when the destinations' holdings change (commit, evict, drop)."""
-        return signal_quota(self.manager.entry.entry_id)
+    _unrecorded_attributes = frozenset(
+        {"events", "uploading", "pending_events", "pending_bytes", "last_error"}
+    )
 
     @property
     def native_value(self) -> int:
@@ -365,42 +366,17 @@ class AreaQuotaSensor(AreaEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return the share of the destination's quota, and how many events."""
+        """Return the share of the quota, the events, and what is uploading or pending."""
         held = self.manager.area_holdings(self.area)
         quota = held["quota"]
         return {
             "percent_of_quota": None if quota <= 0 else round(100 * held["used"] / quota, 2),
             "events": held["events"],
-        }
-
-
-class AreaStatusSensor(AreaEntity, SensorEntity):
-    """Whether one area's uploads work, and what it has in flight."""
-
-    key = "status"
-    platform_domain = "sensor"
-    _attr_device_class = SensorDeviceClass.ENUM
-    _attr_options = ["ok", "failing"]  # noqa: RUF012 - read-only
-    _unrecorded_attributes = frozenset({"uploading", "pending_events", "pending_bytes"})
-
-    @property
-    def native_value(self) -> str:
-        """Return `ok`, or `failing` while any destination fails."""
-        targets = self.manager.uploader.targets.values()
-        return "ok" if all(target.healthy for target in targets) else "failing"
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return what the area uploads now and holds for the follow-up window."""
-        held = self.manager.area_holdings(self.area)
-        failing = [t for t in self.manager.uploader.targets.values() if not t.healthy]
-        return {
-            "uploads": self.manager.uploads_for(self.area),
             "uploading": held["uploading"],
-            "pending_events": held["held"],
-            "pending_bytes": held["pending"],
-            "last_error": failing[0].last_error if failing else None,
+            "pending_events": held["pending_events"],
+            "pending_bytes": held["pending_bytes"],
+            "last_error": held["last_error"],
         }
 
 
-AREA_SENSORS: tuple[type[AreaEntity], ...] = (AreaQuotaSensor, AreaStatusSensor)
+AREA_SENSORS: tuple[type[AreaEntity], ...] = (AreaQuotaSensor,)

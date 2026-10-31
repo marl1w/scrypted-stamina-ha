@@ -4,7 +4,7 @@ Per-camera entities sit on a Stamina device per camera, named like the camera an
 its `scrypted_mqtt` device when there is one (see `devices.py`). Integration-wide entities
 sit on one "Scrypted Stamina" service device; each destination's on a device of its own,
 named after the destination and filed under its subentry; and each area's (its Uploads
-select, quota and status) on a device named after the area, filed under the area's
+select and quota) on a device named after the area, filed under the area's
 subentry (`areas.py`).
 """
 

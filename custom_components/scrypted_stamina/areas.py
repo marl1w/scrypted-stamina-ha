@@ -1,7 +1,7 @@
 """One subentry per area that holds a camera, managed by the integration itself.
 
 Home Assistant's integration page groups devices by subentry, so each area gets one, titled
-with the area's name, holding one device with the area's Uploads select, quota and status.
+with the area's name, holding one device with the area's Uploads select and quota.
 Cameras without an area share a "No area" one. The unique id is the area id (or `NO_AREA`):
 an area keeps its Uploads position across renames, and across its subentry being removed
 and added again.

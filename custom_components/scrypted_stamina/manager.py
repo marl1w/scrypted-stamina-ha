@@ -223,8 +223,10 @@ class StaminaManager:
         # area without one takes the default, the old global select's position.
         self.default_uploads = UPLOADS_CLASSES
         self.area_uploads: dict[str, str] = {}
-        # The area folder of every event with a copy somewhere, for the per-area sensors.
+        # The area key of every event with a copy somewhere, and what each area's events
+        # hold, recounted when holdings change (`_recount_areas`), for the area sensors.
         self._event_areas: dict[str, str] = {}
+        self._area_totals: dict[str, dict[str, int]] = {}
         self.latencies: deque[float] = deque(maxlen=LATENCY_SAMPLES)
         self.analysis = Analysis(
             hass,
@@ -296,12 +298,20 @@ class StaminaManager:
         }
         await self.async_refresh_cameras()
         await self.uploader.async_start()
-        self._event_areas = await self.index.async_copy_areas()
+        slugs = {slug_of(sub): key for key, sub in area_subentries(self.entry).items()}
+        self._event_areas = {
+            event_id: key or slugs.get(slug, "")
+            for event_id, (key, slug) in (await self.index.async_copy_areas()).items()
+        }
         # Learned in the background: setup does not wait on months of history. Until it is
         # done every camera reads as learning, which is what an empty model says anyway.
         self._spawn(self.analysis.async_rebuild(), "relevance rebuild")
         self.analysis.async_schedule()
         await self._async_resume()
+        for record in self.records.values():
+            if not record.area_key:
+                record.area_key = slugs.get(record.area, "")
+        self._recount_areas()
 
         seq = await self.index.async_get_meta("seq")
         epoch = await self.index.async_get_meta("epoch")
@@ -591,6 +601,7 @@ class StaminaManager:
             admitted=mode == UPLOADS_CLASSES,
             upload_mode=mode,
             area=device.area_slug,
+            area_key=area_key(device),
             camera_name=device.name,
             folder=event_folder_name(local, device.name, facts.id),
         )
@@ -599,6 +610,7 @@ class StaminaManager:
         record.latency["ha_received"] = self.now()
         record.context_start = snapshot(self.hass, self.linked(facts.camera), facts.started)
         self.records[facts.id] = record
+        self._event_areas[record.id] = record.area_key
         # Registered at once, so an event on another camera that overlaps this one sees it
         # as what fired first.
         self.analysis.remember(record, self.now())
@@ -1274,63 +1286,66 @@ class StaminaManager:
         """Return an area's Uploads position, by area key."""
         return self.area_uploads.get(key, self.default_uploads)
 
-    async def async_set_uploads(self, mode: str, key: str | None = None) -> None:
-        """Set an area's Uploads position (every area's, without one).
-
-        It applies to events that start from now on.
-        """
+    async def async_set_uploads(self, mode: str, key: str) -> None:
+        """Set an area's Uploads position. It applies to events that start from now on."""
         if mode not in UPLOAD_MODES:
             raise ValueError(f"unknown uploads position {mode}")
-        keys = [key] if key is not None else list(area_subentries(self.entry))
-        self.area_uploads.update(dict.fromkeys(keys, mode))
-        if key is None:
-            self.default_uploads = mode
+        self.area_uploads[key] = mode
         await self.index.async_set_meta(
-            {
-                META_AREA_UPLOADS: json.dumps(self.area_uploads, sort_keys=True),
-                META_UPLOADS: self.default_uploads,
-            }
+            {META_AREA_UPLOADS: json.dumps(self.area_uploads, sort_keys=True)}
         )
         self._changed()
 
-    def area_holdings(self, key: str) -> dict[str, Any]:
-        """Return what one area's events hold, on the destination holding most of them.
+    def _recount_areas(self) -> None:
+        """Recount what each area's events hold, on the destination holding most of them.
 
-        Read from the index rows (each event's area, as filed at its start) and the
-        destinations' holdings. Every kept event goes to every destination, so they agree
-        but for failures.
+        Run when the destinations' holdings change (commit, evict, drop, start), not on every
+        read. Every kept event goes to every destination, so they agree but for failures.
         """
-        subentry = area_subentries(self.entry).get(key)
-        slug = slug_of(subentry) if subentry is not None else None
         targets = list(self.uploader.targets.values())
-        # Known areas: events in memory, and those held somewhere (forgotten once not).
         self._event_areas = {
-            event_id: area
-            for event_id, area in self._event_areas.items()
+            event_id: key
+            for event_id, key in self._event_areas.items()
             if event_id in self.records or any(t.usage.get(event_id) for t in targets)
-        } | {record.id: record.area for record in self.records.values()}
-        ids = [event_id for event_id, area in self._event_areas.items() if area == slug]
-        best: dict[str, Any] = {"used": 0, "events": 0, "quota": 0, "pending": 0, "held": 0}
-        uploading = sum(
-            1
-            for record in self.records.values()
-            if record.area == slug
-            and record.admitted
-            and record.state in (EventState.PENDING, EventState.KEEPING)
-        )
+        }
+        totals: dict[str, dict[str, int]] = {}
         for target in targets:
-            found = [held for event_id in ids if (held := target.usage.get(event_id))]
-            pending = [held for held in found if held.state is EventState.FOLLOW_UP]
-            used = sum(held.size for held in found)
-            if used >= best["used"]:
-                best = {
-                    "used": used,
-                    "events": len(found),
-                    "quota": target.quota,
-                    "pending": sum(held.size for held in pending),
-                    "held": len(pending),
-                }
-        return {**best, "uploading": uploading}
+            mine: dict[str, list[int]] = {}
+            for event_id, key in self._event_areas.items():
+                if held := target.usage.get(event_id):
+                    counted = mine.setdefault(key, [0, 0])
+                    counted[0] += held.size
+                    counted[1] += 1
+            for key, (used, events) in mine.items():
+                if key not in totals or used >= totals[key]["used"]:
+                    totals[key] = {"used": used, "events": events, "quota": target.quota}
+        self._area_totals = totals
+
+    def area_holdings(self, key: str) -> dict[str, Any]:
+        """Return what one area's events hold, and what it has uploading and pending.
+
+        The holdings are the last recount's; the rest is read from the events in memory.
+        """
+        targets = list(self.uploader.targets.values())
+        quota = targets[-1].quota if targets else 0
+        held = self._area_totals.get(key) or {"used": 0, "events": 0, "quota": quota}
+        mine = [record for record in self.records.values() if record.area_key == key]
+        pending = [record for record in mine if record.state is EventState.FOLLOW_UP]
+        failing = [target for target in targets if not target.healthy]
+        return {
+            **held,
+            "uploading": sum(
+                1
+                for record in mine
+                if record.admitted and record.state in (EventState.PENDING, EventState.KEEPING)
+            ),
+            "pending_events": len(pending),
+            "pending_bytes": sum(
+                max((t.usage.get(r.id).size for t in targets if t.usage.get(r.id)), default=0)
+                for r in pending
+            ),
+            "last_error": failing[0].last_error if failing else None,
+        }
 
     async def _async_restore_uploads(self) -> str:
         """Return the stored position, migrating the old switch's state once.
@@ -1497,6 +1512,9 @@ class StaminaManager:
     @callback
     def _flush_changes(self) -> None:
         cameras, self._dirty_cameras = self._dirty_cameras, set()
+        if self._dirty_quota:
+            # Before any signal: the area sensors refresh on the hub's.
+            self._recount_areas()
         if self._dirty_hub:
             self._dirty_hub = False
             async_dispatcher_send(self.hass, signal_update(self.entry.entry_id))

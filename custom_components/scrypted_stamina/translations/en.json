@@ -190,16 +190,6 @@
       },
       "orphans": {
         "name": "Orphans"
-      },
-      "quota": {
-        "name": "Quota used"
-      },
-      "status": {
-        "name": "Status",
-        "state": {
-          "ok": "OK",
-          "failing": "Failing"
-        }
       }
     },
     "select": {
@@ -214,6 +204,10 @@
     }
   },
   "issues": {
+    "uploads_per_area": {
+      "title": "Uploads is now set per area",
+      "description": "The single Uploads select (`select.stamina_uploads`) was removed. Each area now has its own, which took its position: {selects}. Point automations and dashboards that used the old select at these."
+    },
     "over_quota": {
       "title": "{destination} is over its quota",
       "description": "Pending footage could not fit inside the quota of {destination}, and no committed event was left to remove for room. The footage was uploaded anyway, over the quota. Raise the quota, or free space on the destination."

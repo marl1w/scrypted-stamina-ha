@@ -128,7 +128,7 @@ async def test_a_change_mid_event_applies_to_new_events_only(
     first = event_id(320)
     stamina.start(first, subjects=[subject("s1")])
     await until(lambda: first in manager.records)
-    await manager.async_set_uploads("off")
+    await manager.async_set_uploads("off", NO_AREA)
     stamina.segment(first, 0, init=True)
     stamina.end(first, subjects=[subject("s1", verdict="confirmed")], next_segment=1, init=True)
     assert (await settle(hass, manager, clock, first)).state is EventState.COMMITTED
@@ -137,7 +137,7 @@ async def test_a_change_mid_event_applies_to_new_events_only(
     second = event_id(321)
     stamina.start(second, subjects=[subject("s1")])
     await until(lambda: second in manager.records)
-    await manager.async_set_uploads("classes")
+    await manager.async_set_uploads("classes", NO_AREA)
     stamina.segment(second, 0, init=True)
     stamina.end(second, subjects=[subject("s1", verdict="confirmed")], next_segment=1, init=True)
     stored = await settle(hass, manager, clock, second)
@@ -147,7 +147,7 @@ async def test_a_change_mid_event_applies_to_new_events_only(
 
 async def test_the_position_survives_a_restart(hass, stamina, destinations, setup, reload) -> None:
     entry = await setup()
-    await entry.runtime_data.manager.async_set_uploads("unusual")
+    await entry.runtime_data.manager.async_set_uploads("unusual", NO_AREA)
     await reload(entry)
     assert entry.runtime_data.manager.uploads_for(NO_AREA) == "unusual"
     assert hass.states.get(UPLOADS).state == "unusual"

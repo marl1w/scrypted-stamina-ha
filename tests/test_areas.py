@@ -1,4 +1,4 @@
-"""Area subentries: one per area with a camera, each with its own Uploads, quota and status."""
+"""Area subentries: one per area with a camera, each with its own Uploads and quota."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from homeassistant.helpers import (
     area_registry as ar,
     device_registry as dr,
     entity_registry as er,
+    issue_registry as ir,
 )
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -24,6 +25,8 @@ from .conftest import Clock, event_id, make_entry, subject, until
 
 GARDEN = "select.stamina_garden_uploads"
 DRIVEWAY = "select.stamina_driveway_uploads"
+GARDEN_QUOTA = "sensor.stamina_garden_quota_used"
+DRIVEWAY_QUOTA = "sensor.stamina_driveway_quota_used"
 
 
 def camera_device(hass, mqtt: MockConfigEntry, camera: str, name: str, area_id: str | None):
@@ -65,7 +68,7 @@ async def test_one_subentry_and_device_per_area(hass, stamina, setup) -> None:
     subentry = next(
         s for s in entry.get_subentries_of_type(SUBENTRY_TYPE_AREA) if s.title == "Garden"
     )
-    for entity_id in (GARDEN, "sensor.stamina_garden_quota", "sensor.stamina_garden_status"):
+    for entity_id in (GARDEN, GARDEN_QUOTA):
         item = entities.async_get(entity_id)
         assert item is not None, entity_id
         assert item.config_subentry_id == subentry.subentry_id
@@ -74,8 +77,9 @@ async def test_one_subentry_and_device_per_area(hass, stamina, setup) -> None:
         assert device.config_subentry_id == subentry.subentry_id
         assert device.via_device_id == hub.id
     assert hass.states.get(GARDEN).state == UPLOADS_CLASSES
-    assert hass.states.get("sensor.stamina_garden_status").state == "ok"
-    assert float(hass.states.get("sensor.stamina_garden_quota").state) == 0
+    assert float(hass.states.get(GARDEN_QUOTA).state) == 0
+    # Health stays on the destinations: no per-area status.
+    assert hass.states.get("sensor.stamina_garden_status") is None
 
     # Cameras stay where they were: not filed under any subentry.
     camera = devices.async_get(entities.async_get("event.garden_front_door_stamina").device_id)
@@ -118,6 +122,10 @@ async def test_the_global_select_migrates_to_every_area(hass, stamina, setup, re
 
     await setup(entry=entry)
     assert registry.async_get(old.entity_id) is None
+    # A one-time repair issue names the selects that replaced it.
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"uploads_per_area_{entry.entry_id}")
+    assert issue is not None and not issue.is_fixable
+    assert issue.translation_placeholders == {"selects": f"{DRIVEWAY}, {GARDEN}"}
     assert hass.states.get(GARDEN).state == "unusual"
     assert hass.states.get(DRIVEWAY).state == "unusual"
 
@@ -125,9 +133,12 @@ async def test_the_global_select_migrates_to_every_area(hass, stamina, setup, re
     await hass.services.async_call(
         "select", "select_option", {"entity_id": GARDEN, "option": "off"}, blocking=True
     )
+    ir.async_get(hass).async_ignore(DOMAIN, issue.issue_id, True)
     await reload(entry)
     assert hass.states.get(GARDEN).state == "off"
     assert hass.states.get(DRIVEWAY).state == "unusual"
+    # Not raised again: the old select is gone.
+    assert ir.async_get(hass).async_get_issue(DOMAIN, issue.issue_id).dismissed_version
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -178,29 +189,68 @@ async def test_a_hand_deleted_area_comes_back(hass, stamina, setup) -> None:
     await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_the_area_quota_counts_its_events(hass, stamina, destinations, setup) -> None:
-    two_areas(hass, stamina)
-    entry = await setup()
-    manager = entry.runtime_data.manager
-    clock = Clock()
-    manager.now = clock
+def _commit_one(stamina, manager, eid: str, camera: str = "38") -> None:
+    """Run one confirmed, rare (so kept) event on a camera."""
 
     def _score(record, *, now, include_late=True) -> RelevanceResult:
         return RelevanceResult(0.2, 3.0, 1.4, False, "rare", [])
 
     manager.analysis.score = _score
-    eid = event_id(520)
-    stamina.start(eid, subjects=[subject("s1")])
+    stamina.start(eid, camera=camera, subjects=[subject("s1")])
     for n in range(2):
         stamina.segment(eid, n, init=n == 0)
     stamina.verdict(eid, subject("s1", verdict="confirmed"))
     stamina.end(eid, subjects=[subject("s1", verdict="confirmed")], next_segment=2, init=True)
+
+
+async def test_the_area_quota_counts_its_events(hass, stamina, destinations, setup) -> None:
+    garden, _, _, _ = two_areas(hass, stamina)
+    entry = await setup()
+    manager = entry.runtime_data.manager
+    manager.now = Clock()
+    eid = event_id(520)
+    _commit_one(stamina, manager, eid)
     await until(lambda: eid in manager.records and manager.records[eid].ended)
     await until(lambda: manager.records[eid].state is EventState.COMMITTED)
-    manager._changed()
-    await until(lambda: float(hass.states.get("sensor.stamina_garden_quota").state) > 0)
-    state = hass.states.get("sensor.stamina_garden_quota")
+    assert manager.records[eid].area_key == garden.id
+    # Refreshed by the commit itself.
+    await until(lambda: float(hass.states.get(GARDEN_QUOTA).state) > 0)
+    state = hass.states.get(GARDEN_QUOTA)
     assert state.attributes["events"] == 1
     assert state.attributes["percent_of_quota"] is not None
-    assert float(hass.states.get("sensor.stamina_driveway_quota").state) == 0
+    assert state.attributes["uploading"] == 0
+    assert state.attributes["pending_events"] == 0
+    assert state.attributes["last_error"] is None
+    assert float(hass.states.get(DRIVEWAY_QUOTA).state) == 0
+
+    # Renamed, the area keeps counting the events it had, in memory and after a restart.
+    used = manager.area_holdings(garden.id)["used"]
+    ar.async_get(hass).async_update(garden.id, name="Back yard")
+    await hass.async_block_till_done()
+    assert manager.area_holdings(garden.id)["used"] == used
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.manager.area_holdings(garden.id)["used"] == used
+    assert float(hass.states.get(GARDEN_QUOTA).state) > 0
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_the_old_area_sensors_are_removed(hass, stamina, setup) -> None:
+    two_areas(hass, stamina)
+    entry = await setup()
+    registry = er.async_get(hass)
+    garden = next(
+        s for s in entry.get_subentries_of_type(SUBENTRY_TYPE_AREA) if s.title == "Garden"
+    )
+    old = registry.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        f"{entry.entry_id}_area_{garden.unique_id}_status",
+        config_entry=entry,
+        config_subentry_id=garden.subentry_id,
+    )
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert registry.async_get(old.entity_id) is None
+    assert registry.async_get(GARDEN_QUOTA) is not None
     await hass.config_entries.async_unload(entry.entry_id)

@@ -13,7 +13,7 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
 from custom_components.scrypted_stamina import uploader as uploader_module
-from custom_components.scrypted_stamina.const import INDEX_FILENAME
+from custom_components.scrypted_stamina.const import INDEX_FILENAME, NO_AREA
 from custom_components.scrypted_stamina.decider import EventRecord, EventState
 from custom_components.scrypted_stamina.index import Copy, EventIndex
 from custom_components.scrypted_stamina.protocol import EventFacts
@@ -359,7 +359,7 @@ async def test_uploads_off_keeps_segments_until_the_window_decides(
     hass.states.async_set(GATE, "off", {"device_class": "door"})
     entry = await setup(options=OPTIONS)
     manager = await wire(entry, clock)
-    await manager.async_set_uploads("unusual")
+    await manager.async_set_uploads("unusual", NO_AREA)
     eid = event_id(160)
     run_event(stamina, eid, "vetoed")
     await until(state_is(manager, eid, EventState.FOLLOW_UP))

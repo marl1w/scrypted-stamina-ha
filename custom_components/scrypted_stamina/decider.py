@@ -92,6 +92,9 @@ class EventRecord:
     upload_mode: str = UPLOADS_CLASSES
     # Path pieces, fixed at start so a renamed area does not split an event across folders.
     area: str = ""
+    # The area's key (its id, or `NO_AREA`) at start: what the area's sensors count it under,
+    # whatever the area is called later. Empty on records from before it was kept.
+    area_key: str = ""
     camera_name: str = ""
     folder: str = ""
     # Scores: live while open, provisional at end, final when the follow-up window closes.
