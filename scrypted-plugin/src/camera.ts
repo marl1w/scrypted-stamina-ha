@@ -46,6 +46,8 @@ export interface CameraEnv {
     episode(): EpisodeConfig;
     /** this plugin's id: its own mixin layer is not listened to */
     selfPlugin?: string;
+    /** system-wide events of one interface (a third delivery path for detections), as (device id, details, data) */
+    listenAll?(iface: Iface, cb: (deviceId: string, details: Details, data: any) => void): () => void;
 }
 
 export interface CameraSink {
@@ -53,7 +55,13 @@ export interface CameraSink {
     eventStarted(core: CameraCore, ev: EventRecord): void;
     eventEnded(core: CameraCore, ev: EventRecord): void;
     subjectDecided(core: CameraCore, ev: EventRecord, s: Subject): void;
+    /** the camera's mixins or children changed: the sources may have changed */
+    sourcesChanged?(core: CameraCore): void;
 }
+
+export type DetectionPath = 'plain' | 'layer' | 'system';
+/** the same detection payload arriving by several paths within this long counts once */
+const SAME_DETECTION_MS = 5000;
 
 /** A verifier counts as present on a camera when it emitted there within this long. */
 export const VERIFIER_RECENT_MS = 7 * 24 * 3600_000;
@@ -99,6 +107,10 @@ export class CameraCore {
     private verifierActivity: Record<string, number> = {};
     /** child device ids, refreshed on every bind */
     private kids: string[] = [];
+    /** detections are listened to by several paths (in-plugin delivery differs from a client's): dedupe and count */
+    private recentDetections = new Map<string, number>();
+    readonly detectionStats = { total: 0, plain: 0, layer: 0, system: 0 };
+    private loggedPaths = new Set<DetectionPath>();
 
     constructor(public env: CameraEnv, private sink: CameraSink) {
         try { this.verifiersSeen = JSON.parse(env.storageGet(VERIFIERS_KEY) || '{}') || {}; } catch { this.verifiersSeen = {}; }
@@ -146,16 +158,36 @@ export class CameraCore {
         if (key === this.boundKey) return;
         this.unbind();
         this.boundKey = key;
+        this.sink.sourcesChanged?.(this);
         const id = this.env.id;
         const on = (dev: string, iface: Iface, fn: (d: Details, data: any) => void) => {
             try { this.unlisten.push(this.env.listen(dev, iface, (d, data) => { if (!this.stopped) this.safe(() => fn(d || {}, data)); })); }
             catch (e) { this.env.console.warn(`${this.env.name()}: cannot listen to ${iface}: ${errText(e)}`); }
         };
         const has = (s: DeviceState | undefined, i: string) => !!s?.interfaces?.includes(i);
-        // ObjectDetector events are not masked by mixins and carry sourceId: one plain listener (spike S1)
-        if (has(st, 'ObjectDetector')) on(id, 'ObjectDetector', (d, data) => this.onDetections(d, data));
+        // ObjectDetector events carry sourceId. A client receives them on a plain listener (spike S1), but in this plugin that
+        // path delivered nothing on the deployed 0.1.1: listen plainly, per layer and system-wide, and count each payload once
+        const layerIds = [id, ...(st.mixins ?? []).filter(m => m !== id && this.env.pluginOf(m) !== this.env.selfPlugin)];
+        const watchDetections = (dev: string, fromParent?: string) => {
+            on(dev, 'ObjectDetector', (d, data) => this.onDetectionEvent('plain', d, data, fromParent));
+            for (const layer of dev === id ? layerIds : [dev]) {
+                try { this.unlisten.push(this.env.listen(dev, 'ObjectDetector', (d, data) => { if (!this.stopped) this.safe(() => this.onDetectionEvent('layer', d || {}, data, fromParent)); }, layer)); }
+                catch { /* no layer listening: the other paths cover it */ }
+            }
+        };
+        if (has(st, 'ObjectDetector')) watchDetections(id);
         // a crop camera: its parent's whole-frame AI applies to it as ambiguous evidence (nothing else of the parent does)
-        if (parent && has(this.env.state(parent), 'ObjectDetector')) on(parent, 'ObjectDetector', (d, data) => this.onDetections(d, data, parent));
+        if (parent && has(this.env.state(parent), 'ObjectDetector')) watchDetections(parent, parent);
+        if (this.env.listenAll && (has(st, 'ObjectDetector') || parent)) {
+            try {
+                this.unlisten.push(this.env.listenAll('ObjectDetector', (dev, d, data) => {
+                    if (this.stopped) return;
+                    if (dev === id) this.safe(() => this.onDetectionEvent('system', d || {}, data));
+                    else if (parent && dev === parent) this.safe(() => this.onDetectionEvent('system', d || {}, data, parent));
+                }));
+            }
+            catch { /* no system listener */ }
+        }
         // property events (motion, occupancy, audio) carry no mixinId and a mixin that owns the interface masks the camera's
         // own value: listen per layer (the device itself, then each mixin), attributed to that layer's plugin; the plain
         // listener is the fallback for a layer that cannot be listened to, deduplicated against the layer edges
@@ -259,6 +291,26 @@ export class CameraCore {
 
     private ctx(): NormalizeContext {
         return { roles: this.env.roles, cameraPlugin: this.cameraPlugin, now: this.env.clock.now() };
+    }
+
+    /** One detection payload from one delivery path: counted once whatever the number of paths that bring it. */
+    onDetectionEvent(path: DetectionPath, d: Details, data: any, fromParent?: string) {
+        if (!data || typeof data !== 'object') return;
+        const dets = Array.isArray(data.detections) ? data.detections : [];
+        const key = `${fromParent ?? ''}|${data.sourceId ?? ''}|${data.timestamp ?? d.eventTime ?? ''}|${data.detectionId ?? ''}|${dets.slice(0, 8).map((x: any) => `${x?.className}:${x?.score}:${x?.id ?? ''}`).join(',')}`;
+        const now = this.env.clock.now();
+        this.detectionStats[path]++;
+        if (!this.loggedPaths.has(path)) {
+            this.loggedPaths.add(path);
+            this.env.console.log(`${this.env.name()}: detections arrive by the ${path} listener`);
+        }
+        const seen = this.recentDetections.get(key);
+        if (seen !== undefined && now - seen <= SAME_DETECTION_MS) return;
+        this.recentDetections.set(key, now);
+        if (this.recentDetections.size > 256)
+            for (const [k, t] of this.recentDetections) if (now - t > SAME_DETECTION_MS) this.recentDetections.delete(k);
+        this.detectionStats.total++;
+        this.onDetections(d, data, fromParent);
     }
 
     /** The parent camera, when this camera is a view (crop) of another camera. */

@@ -304,12 +304,13 @@ test('a camera mixin re-created keeps its core and open event (attach); a releas
     const a = engine.attach(sc.env('7', clock, engine.roles, ep));
     sc.emit('7', 'ObjectDetector', { sourceId: CAMP, timestamp: clock.now(), detections: [{ className: 'people', score: 1 }] });
     const id = a.tracker.current!.id;
+    const listeners = sc.listeners.filter(l => l.iface === 'ObjectDetector').length;
     engine.detach('7');
     const b = engine.attach(sc.env('7', clock, engine.roles, ep));
     assert.equal(b, a);
     assert.equal(b.tracker.current!.id, id);
     assert.ok(!msgs.some(m => m.type === 'event.end'));
-    assert.equal(sc.listeners.filter(l => l.iface === 'ObjectDetector').length, 1, 'listeners rebound, not doubled');
+    assert.equal(sc.listeners.filter(l => l.iface === 'ObjectDetector').length, listeners, 'listeners rebound, not doubled');
     engine.detach('7');
     clock.advance(10_000);
     assert.equal(msgs.find(m => m.type === 'event.end').event.end_reason, 'stopped');
@@ -437,5 +438,41 @@ test('a start picture still queued after 5 s is not taken', async () => {
     clock.advance(6000);
     for (let k = 0; k < 5; k++) { gate.splice(0).forEach(f => f()); await sleep(2); }
     assert.equal(calls, 2, 'the third camera\'s start picture waited too long');
+    engine.stop();
+});
+
+test('discovery: rows for every source on the cameras before they send anything; again when mixins change', async () => {
+    const clock = new FakeClock();
+    const { spawn } = fakeSpawn();
+    let calls = 0;
+    const host = fakeHost(clock, spawn, {
+        discover: async () => {
+            calls++;
+            return {
+                found: [
+                    { source: CAMP, cameraPlugin: true, ifaces: ['ObjectDetector', 'MotionSensor'] },
+                    { source: 'scrypted-coral-guard', cameraPlugin: false, ifaces: ['ObjectDetector', 'MotionSensor', 'OccupancySensor'] },
+                    { source: '@marl1w/scrypted-audio-guard', cameraPlugin: false, ifaces: ['AudioSensor'] },
+                ],
+                declared: { [CAMP]: ['people', 'verified_person'] },
+            };
+        },
+    });
+    const engine = new Engine(host);
+    const sc = new FakeScrypted();
+    sc.add({ id: '7', name: 'Cam', pluginId: CAMP, interfaces: ['VideoCamera', 'ObjectDetector'], mixins: [] });
+    const core = new CameraCore(sc.env('7', clock, engine.roles), engine);
+    engine.register(core);
+    clock.advance(2000);
+    await sleep(5);
+    assert.equal(calls, 1);
+    assert.deepEqual(engine.roles.list().map(r => [r.source, r.role, r.firstSeen]), [
+        ['@marl1w/scrypted-audio-guard', 'trigger', 0], [CAMP, 'trigger', 0], ['scrypted-coral-guard', 'verifier', 0]]);
+    assert.deepEqual(engine.declared.get(CAMP), ['people', 'verified_person']);
+    sc.devices.get('7')!.mixins = ['300'];
+    core.bind();
+    clock.advance(2000);
+    await sleep(5);
+    assert.equal(calls, 2, 'a mixin change discovers again');
     engine.stop();
 });

@@ -125,5 +125,5 @@ test('lastSeen is exact in memory and persisted at most once a minute', () => {
     t.ensure({ source: CAM, kind: 'object', className: 'people', cameraPlugin: CAM }, 0);
     for (let i = 1; i <= 120; i++) t.ensure({ source: CAM, kind: 'object', className: 'people', cameraPlugin: CAM }, i * 1000);
     assert.equal(t.get(CAM)!.lastSeen, 120_000);
-    assert.equal(saves, 3, 'created, then at 60 s and 120 s');
+    assert.equal(saves, 4, 'created, its class noted, then at 60 s and 120 s');
 });

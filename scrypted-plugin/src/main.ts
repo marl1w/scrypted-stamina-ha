@@ -8,7 +8,8 @@ import { apiPath, ClipInfo, clipInfo } from './api';
 import { CameraCore, CameraEnv, DeviceState, Iface, isMirror } from './camera';
 import { NUMBER_SETTINGS, PLUGIN_ID, readNumber, NumberKey } from './config';
 import { Engine, Host, StreamOptionsInfo } from './engine';
-import { applySourceSetting, sourceSettings } from './settings';
+import { applySourceSetting, CameraStatus, cameraStatusLines, sourceSettings } from './settings';
+import { Discovered } from './roles';
 import { buildInputArgs, StreamInput } from './segmenter';
 import { cleanLabel, errText, realClock, tokenFingerprint, withTimeout } from './util';
 
@@ -66,6 +67,7 @@ export class StaminaMixin extends SettingsMixinDeviceBase<any> {
             storageSet: (k, v) => this.storage.setItem(k, v),
             episode: () => provider.engine.episodeConfig(),
             selfPlugin: PLUGIN_ID,
+            listenAll: (iface, cb) => provider.listenAll(iface, cb),
         };
         // a mirror view repeats a crop for another Home: observing it would duplicate that crop's events
         if (isMirror(deviceState(id))) {
@@ -78,20 +80,29 @@ export class StaminaMixin extends SettingsMixinDeviceBase<any> {
 
     async getMixinSettings(): Promise<Setting[]> {
         if (!this.core)
-            return [{ key: 'stamina:status', title: 'Stamina', readonly: true, value: 'Mirror view: not observed. Its source camera is, so its events are not duplicated.' }];
-        const info = this.provider.engine.camerasInfo().find(c => c.id === this.id);
+            return [{ key: 'stamina:status', title: 'Stamina', readonly: true, value: 'Mirror view: not watched. Its source camera is, so its events are not counted twice.' }];
+        const e = this.provider.engine;
+        const info = e.camerasInfo().find(c => c.id === this.id);
         const caps = info?.capabilities;
-        const yes = (v: unknown) => v === null || v === undefined ? 'unknown' : v ? 'yes' : 'no';
+        if (!info || !caps) return [{ key: 'stamina:status', title: 'Stamina', readonly: true, value: 'Starting…' }];
+        // the sources on this camera: its own plugin, its mixins, and any seen here
+        const st = deviceState(this.id);
+        const here = new Set<string>([...(st?.pluginId ? [st.pluginId] : []), ...info.sources.map(x => x.source)]);
+        for (const m of st?.mixins ?? []) { const p = (systemManager.getDeviceById(m) as any)?.pluginId; if (p && p !== PLUGIN_ID) here.add(p); }
+        const status: CameraStatus = {
+            triggers: [...here].filter(x => e.roles.get(x)?.role === 'trigger').sort(),
+            verifiers: caps.verifiers.map(v => ({ source: v, live: caps.verifier_live })),
+            silent: caps.silent_verifiers,
+            prebufferMs: caps.prebuffer_ms,
+            recordings: caps.video_recorder,
+            clips: caps.video_clips,
+            split: caps.split,
+            parent: caps.parent,
+            detections: caps.detections,
+        };
         return [
-            { key: 'stamina:status', title: 'Capabilities', readonly: true, type: 'textarea', value: caps ? [
-                `Verifier: ${caps.verifiers.length ? caps.verifiers.join(', ') : 'none (subjects are unverified)'}`,
-                ...(caps.silent_verifiers.length ? [`Silent verifier mixins (not counted): ${caps.silent_verifiers.join(', ')}`] : []),
-                `Prebuffer: ${yes(caps.prebuffer)}${caps.prebuffer_ms ? ` (${Math.round(caps.prebuffer_ms / 1000)} s)` : ''}`,
-                `Recordings (VideoRecorder): ${yes(caps.video_recorder)}; clips (VideoClips): ${yes(caps.video_clips)}`,
-                `Audio: ${yes(caps.audio)}`,
-            ].join('\n') : 'starting' },
-            { key: 'stamina:sources', title: 'Sources seen', readonly: true, type: 'textarea', description: 'Roles are set in the Scrypted Stamina plugin settings, for all cameras.', value: (info?.sources ?? []).map(s => `${s.source}: ${s.role ?? '?'}`).join('\n') || 'none yet' },
-            { key: 'stamina:event', title: 'Open event', readonly: true, value: info?.open_event ?? 'none' },
+            { key: 'stamina:status', title: 'Stamina', readonly: true, type: 'textarea', value: cameraStatusLines(status, x => this.provider.pluginName(x)).join('\n'), description: 'What each plugin does is set in the Scrypted Stamina plugin, for all cameras.' },
+            { key: 'stamina:event', title: 'Event now', readonly: true, value: info.open_event ? 'yes' : 'no' },
         ];
     }
 
@@ -112,8 +123,6 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
     readonly engine: Engine;
     readonly live = new Map<string, StaminaMixin>();
     private ffmpegPromise?: Promise<string>;
-    /** class map rows dropped at the last save, per source (shown in its description) */
-    private classMapInvalid = new Map<string, string[]>();
     private endpoint?: string;
 
     constructor(nativeId?: string) {
@@ -155,6 +164,7 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
             interfaces: id => (systemManager.getDeviceById(id) as any)?.interfaces ?? [],
             ffmpegPath: () => this.ffmpeg(),
             spawn: (c, a, o) => child_process.spawn(c, a, o),
+            discover: ids => this.discover(ids),
         };
         this.engine = new Engine(host);
         if (this.storage.getItem('tokenShown') === 'true')
@@ -171,7 +181,7 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
     }
 
     /** A plugin's display name (its root device's name), when Scrypted knows it. */
-    private pluginName(source: string): string | undefined {
+    pluginName(source: string): string | undefined {
         try { return cleanLabel((systemManager.getDeviceById(source) as any)?.name, 64); }
         catch { return undefined; }
     }
@@ -188,16 +198,21 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
         const e = this.engine;
         const token = e.token();
         const shown = this.storage.getItem('tokenShown') === 'true';
-        const settings: Setting[] = [
-            { group: 'Integration', key: 'integrationUrl', title: 'Integration URL', readonly: true, value: await this.integrationUrl(), description: 'Enter this URL in the Scrypted Stamina Home Assistant integration (or the https one on port 10443).' },
-            { group: 'Integration', key: 'token', title: 'API token', readonly: true, value: shown ? token : `hidden (fingerprint ${tokenFingerprint(token)})`, description: shown ? 'Copy it into the Home Assistant integration, then press Hide token. It is not shown again.' : 'Hidden. The fingerprint identifies it without revealing any of it. Regenerate to get a new one (the old one stops working at once).' },
-            ...(shown ? [{ group: 'Integration', key: 'hideToken', title: 'Hide token', type: 'button' as const }] : []),
-            { group: 'Integration', key: 'regenerateToken', title: 'Regenerate token', type: 'button', description: 'Disconnects the integration until it has the new token.' },
-            { group: 'Video', key: 'segments', title: 'Video segments', type: 'boolean', value: e.segmentsEnabled(), description: 'Cut fMP4 segments from the prebuffer at every event start. Off: events only (shadow mode).' },
-            ...NUMBER_SETTINGS.map((s): Setting => ({ group: s.group, key: s.key, title: s.title, type: 'integer', range: [s.min, s.max], description: `${s.description} ${s.min} to ${s.max}, default ${s.def}.`, value: readNumber(s.key as NumberKey, this.storage.getItem(s.key)) })),
+        const { sources, classes, advanced } = sourceSettings(e.roles.list(), src => this.pluginName(src), { declared: e.declared });
+        return [
+            { group: 'Integration', key: 'integrationUrl', title: 'URL', readonly: true, value: await this.integrationUrl(), description: 'Copy this and the token into Home Assistant.' },
+            shown
+                ? { group: 'Integration', key: 'token', title: 'Token', readonly: true, value: token }
+                : { group: 'Integration', key: 'token', title: 'Token', readonly: true, value: 'Hidden. Regenerate to get a new one.' },
+            shown
+                ? { group: 'Integration', key: 'hideToken', title: 'Hide token', type: 'button' }
+                : { group: 'Integration', key: 'regenerateToken', title: 'Regenerate token', type: 'button', description: 'Home Assistant disconnects until it has the new token.' },
+            ...sources,
+            ...classes,
+            { group: 'Advanced', key: 'segments', title: 'Save video clips', type: 'boolean', value: e.segmentsEnabled(), description: 'Record each event from a few seconds before it starts. Off: events only.' },
+            ...NUMBER_SETTINGS.map((s): Setting => ({ group: 'Advanced', key: s.key, title: s.title, type: 'integer', range: [s.min, s.max], description: `${s.description} ${s.min} to ${s.max}, default ${s.def}.`, value: readNumber(s.key as NumberKey, this.storage.getItem(s.key)) })),
+            ...advanced,
         ];
-        settings.push(...sourceSettings(e.roles.list(), src => this.pluginName(src), this.classMapInvalid));
-        return settings;
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
@@ -206,10 +221,68 @@ export class StaminaProvider extends ScryptedDeviceBase implements MixinProvider
         else if (key === 'regenerateToken') { e.regenerateToken(); this.console.log('API token regenerated.'); }
         else if (key === 'segments') this.storage.setItem('segments', String(value === true || value === 'true'));
         else if (NUMBER_SETTINGS.some(s => s.key === key)) this.storage.setItem(key, String(readNumber(key as NumberKey, String(value))));
-        else if (applySourceSetting(e.roles, key, value, this.classMapInvalid)) { /* roles and class maps */ }
+        else if (applySourceSetting(e.roles, key, value)) { /* roles and classes */ }
         else return;
         e.applySettings();
         this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+    }
+
+    /** One system-wide listener for all cameras, dispatched by interface (a delivery path for detections). */
+    private allListeners = new Map<string, Set<(dev: string, d: any, data: any) => void>>();
+    private systemListener?: { removeListener(): void };
+
+    listenAll(iface: string, cb: (dev: string, d: any, data: any) => void): () => void {
+        let set = this.allListeners.get(iface);
+        if (!set) { set = new Set(); this.allListeners.set(iface, set); }
+        set.add(cb);
+        if (!this.systemListener)
+            this.systemListener = systemManager.listen((src, details, data) => {
+                const subs = details?.eventInterface ? this.allListeners.get(details.eventInterface) : undefined;
+                if (!subs?.size || !src?.id) return;
+                for (const f of [...subs]) { try { f(src.id, details, data); } catch { /* the subscriber's own */ } }
+            });
+        return () => { set!.delete(cb); };
+    }
+
+    /**
+     * Sources on these cameras: the camera's own plugin when the camera has a detection or sensor interface, and each mixin
+     * (but Stamina) whose canMixin adds ObjectDetector, MotionSensor, OccupancySensor or AudioSensor; plus the classes the
+     * cameras declare (getObjectTypes), attributed to the camera plugin.
+     */
+    private async discover(cameraIds: string[]): Promise<{ found: Discovered[]; declared: Record<string, string[]> }> {
+        const RELEVANT = ['ObjectDetector', 'MotionSensor', 'OccupancySensor', 'AudioSensor'];
+        const found = new Map<string, Discovered>();
+        const declared: Record<string, string[]> = {};
+        const asked = new Map<string, Promise<string[]>>();
+        for (const id of cameraIds) {
+            const cam: any = systemManager.getDeviceById(id);
+            if (!cam?.interfaces) continue;
+            const ifs = (cam.interfaces as string[]).filter(i => RELEVANT.includes(i));
+            if (cam.pluginId && ifs.length) {
+                const prev = found.get(cam.pluginId);
+                found.set(cam.pluginId, { source: cam.pluginId, cameraPlugin: true, ifaces: [...new Set([...(prev?.ifaces ?? []), ...ifs])] });
+                if (ifs.includes('ObjectDetector')) {
+                    try {
+                        const t: any = await withTimeout(cam.getObjectTypes(), 5000, 'object types');
+                        const list = declared[cam.pluginId] ??= [];
+                        for (const c of (t?.classes ?? []).slice(0, 48)) { const x = cleanLabel(c, 48); if (x && !list.includes(x)) list.push(x); }
+                    }
+                    catch { /* no object types */ }
+                }
+            }
+            for (const m of cam.mixins ?? []) {
+                const prov: any = systemManager.getDeviceById(m);
+                const plugin = prov?.pluginId;
+                if (!plugin || plugin === PLUGIN_ID || typeof prov.canMixin !== 'function') continue;
+                const k = `${m}|${cam.type}`;
+                if (!asked.has(k)) asked.set(k, withTimeout(Promise.resolve(prov.canMixin(cam.type, cam.interfaces)), 5000, 'canMixin').then(r => Array.isArray(r) ? r : []).catch(() => []));
+                const adds = (await asked.get(k)!).filter((i: string) => RELEVANT.includes(i));
+                if (!adds.length) continue;
+                const prev = found.get(plugin);
+                found.set(plugin, { source: plugin, cameraPlugin: prev?.cameraPlugin ?? false, ifaces: [...new Set([...(prev?.ifaces ?? []), ...adds])] });
+            }
+        }
+        return { found: [...found.values()], declared };
     }
 
     async canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[] | null | undefined | void> {

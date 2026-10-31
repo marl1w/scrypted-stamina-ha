@@ -10,7 +10,7 @@ import { EpisodeConfig, EventRecord, publicEvent } from './episode';
 import { Subject } from './fusion';
 import { jpegSize, MAX_THUMB_BYTES, scaleJpeg, THUMB_WIDTH } from './jpeg';
 import { PlaybackManager } from './playback';
-import { RolesTable } from './roles';
+import { Discovered, RolesTable } from './roles';
 import { SegmenterDeps, SegmenterHandle, startSegmenter, StreamInput } from './segmenter';
 import { SegmentStore } from './segments';
 import { Clock, errText, newToken, realClock, withTimeout } from './util';
@@ -30,6 +30,11 @@ export interface Host {
     /** a JPEG about `width` px wide, or undefined when the camera has no snapshot */
     picture(cameraId: string, width: number): Promise<Buffer | undefined>;
     interfaces(cameraId: string): string[];
+    /**
+     * Sources on these cameras from the system state: the camera's own plugin and each mixin (but this one) that provides
+     * ObjectDetector, MotionSensor, OccupancySensor or AudioSensor there; and the classes each declares (getObjectTypes).
+     */
+    discover?(cameraIds: string[]): Promise<{ found: Discovered[]; declared: Record<string, string[]> }>;
     ffmpegPath(): Promise<string>;
     spawn(cmd: string, args: string[], opts: SpawnOptions): ChildProcess;
 }
@@ -120,6 +125,9 @@ export class Engine implements CameraSink {
     private options = new Map<string, { at: number; info?: StreamOptionsInfo; pending?: Promise<void> }>();
     private detachTimers = new Map<string, any>();
     private refreshTimer: any;
+    private discoverTimer: any;
+    /** classes each source declares (the cameras' getObjectTypes for the camera plugin) */
+    readonly declared = new Map<string, string[]>();
     private evictWarnAt = -Infinity;
     private rolesSave: any;
     private sweepTimer: any;
@@ -232,11 +240,30 @@ export class Engine implements CameraSink {
         this.cores.set(core.id, core);
         core.bind();
         this.scheduleRefresh();
+        this.sourcesChanged();
     }
 
     unregister(core: CameraCore) {
         if (this.cores.get(core.id) === core) this.cores.delete(core.id);
         core.stop();
+    }
+
+    /** A camera's mixins or children changed: discover the sources again (debounced). */
+    sourcesChanged() {
+        if (this.discoverTimer !== undefined || !this.host.discover) return;
+        this.discoverTimer = this.host.clock.setTimeout(() => {
+            this.discoverTimer = undefined;
+            this.discoverSources().catch(e => this.host.console.warn(`source discovery: ${errText(e)}`));
+        }, 2000);
+    }
+
+    /** Rows for every source found in the system state, before it sends anything (its inferred role, "not seen yet"). */
+    async discoverSources() {
+        if (!this.host.discover || !this.cores.size) return;
+        const r = await withTimeout(this.host.discover([...this.cores.keys()]), 30_000, 'source discovery');
+        for (const d of r.found) this.roles.preseed(d);
+        this.declared.clear();
+        for (const [src, classes] of Object.entries(r.declared)) this.declared.set(src, classes.slice(0, 48));
     }
 
     /** Stream options are read once for all cameras shortly after the mixins register (then every 5 min on demand). */
@@ -254,6 +281,7 @@ export class Engine implements CameraSink {
 
     stop() {
         clearInterval(this.sweepTimer);
+        if (this.discoverTimer !== undefined) this.host.clock.clearTimeout(this.discoverTimer);
         for (const t of this.detachTimers.values()) this.host.clock.clearTimeout(t);
         this.detachTimers.clear();
         for (const c of [...this.cores.values()]) this.unregister(c);
@@ -629,6 +657,7 @@ export class Engine implements CameraSink {
                     video_recorder: ifs.includes('VideoRecorder'),
                     video_clips: ifs.includes('VideoClips'),
                     audio: opt ? opt.audio : null,
+                    detections: c.detectionStats.total,
                     split: c.isSplit(),
                     views: c.views(),
                     parent: c.parentId() ?? null,

@@ -1,6 +1,6 @@
 # Stamina plugin HTTP API (v1)
 
-The contract between the Scrypted plugin (`@marl1w/scrypted-stamina`) and the Home Assistant integration (`scrypted_stamina`). Plugin version 0.1.1, API version 1. (0.1.1 changes only the plugin's settings page; the API is unchanged.)
+The contract between the Scrypted plugin (`@marl1w/scrypted-stamina`) and the Home Assistant integration (`scrypted_stamina`). Plugin version 0.1.2, API version 1.
 
 ## Changes after review (still 0.1.0, API v1)
 
@@ -19,6 +19,12 @@ Integration code written against the first draft must align with these:
 11. **Token regeneration** ends SSE streams, pending polls (they answer `401`) and playback sessions.
 12. **Playback**: a session with `d` lives at least `d` + 5 min; when its memory is full of segments not fetched yet, reading pauses (nothing unfetched is dropped).
 13. `GET /v1/health` has `ring_bytes`; `segmenters` includes segmenters waiting to hand over to a continuation.
+
+## Changes in 0.1.2 (API v1)
+
+25. `capabilities.detections`: how many detection payloads the plugin has received for the camera since it started (a diagnostic: 0 on a busy camera means detections do not reach the plugin).
+26. The `sources` of `GET /v1/cameras` can list sources that have not sent anything yet: the plugin now finds them in the system state (the camera's plugin and every mixin that provides detections or sensors). Their `last_seen` is absent until they do.
+27. A class mapped to "ignore" in the settings is dropped: no observation carries it.
 
 ## Changes in 0.1.1 (API v1)
 
@@ -98,7 +104,7 @@ Times are Unix epoch **milliseconds** unless the field name says otherwise (`*_s
 {
   "ok": true,
   "api": 1,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "epoch": "ep_Xb3kQ9vT0aLm",
   "last_seq": 1234,
   "uptime_s": 3600,
@@ -139,6 +145,7 @@ Times are Unix epoch **milliseconds** unless the field name says otherwise (`*_s
         "verifier_live": true,
         "verifiers": ["scrypted-coral-guard"],
         "silent_verifiers": [],
+        "detections": 120,
         "split": false,
         "views": [],
         "parent": null

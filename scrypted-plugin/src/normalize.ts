@@ -1,6 +1,6 @@
 // Normalisation: a raw Scrypted signal (ObjectsDetected, a sensor edge) -> Observations with a source, role and mapped class.
 
-import { ObsKind, Role, RolesTable, signalRole } from './roles';
+import { IGNORE_CLASS, ObsKind, Role, RolesTable, signalRole } from './roles';
 import { clampNum, cleanLabel } from './util';
 
 /** Normalised box: [x1, y1, x2, y2] as fractions of the frame (0..1). */
@@ -106,7 +106,10 @@ export function fromDetections(data: any, source: string, eventTime: number | un
         const label = cleanLabel(d?.label, 64) ?? null;
         const row = ctx.roles.ensure({ source, kind: 'object', className: raw, label: label ?? undefined, cameraPlugin: ctx.cameraPlugin }, ctx.now);
         if (!row || row.role === 'ignore') continue;
+        ctx.roles.noteClass(source, raw);
         const cls = ctx.roles.mapClass(source, raw);
+        // the user chose "ignore" for this class of this source
+        if (cls === IGNORE_CLASS) continue;
         const kind: ObsKind = cls === 'motion' ? 'motion' : 'object';
         const score = typeof d?.score === 'number' && Number.isFinite(d.score) ? Math.round(clampNum(d.score, 0, 1, 0) * 1000) / 1000 : null;
         const zones = Array.isArray(d?.zones) ? d.zones.slice(0, 8).map((z: unknown) => cleanLabel(z, 48)).filter(Boolean) as string[] : null;

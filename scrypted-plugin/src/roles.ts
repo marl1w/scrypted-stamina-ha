@@ -19,8 +19,11 @@ export interface RoleRow {
     roleSet: boolean;
     /** a verifier whose motion/occupancy turn on only after its own verification (Coral Guard): those signals confirm */
     gated: boolean;
-    /** raw class name -> normalised class */
+    /** raw class name -> normalised class (IGNORE_CLASS: dropped) */
     classMap: Record<string, string>;
+    /** raw classes seen from this source (bounded), shown in the class map */
+    classes: string[];
+    /** 0 while the source was only discovered (it has not sent anything yet) */
     firstSeen: number;
     lastSeen: number;
 }
@@ -45,13 +48,22 @@ export const ENRICHER_CLASSES = ['face', 'plate', 'license_plate'];
 /** Smart-event classes a camera may send as detections (role trigger, no box). */
 export const SMART_EVENT_CLASSES = ['line_crossing', 'intrusion', 'loitering', 'forgotten_item', 'taken_item'];
 
-/** Common aliases every new row starts with. */
+/** Common aliases a source without its own defaults starts with. */
 export const COMMON_CLASS_MAP: Record<string, string> = {
     people: 'person',
     dog_cat: 'animal',
-    verified_person: 'person',
-    verified_vehicle: 'vehicle',
-    verified_animal: 'animal',
+};
+
+/** Coral Guard's published classes: they belong to Coral Guard only (0.1.1 put them on every source). */
+const CORAL_CLASSES = ['verified_person', 'verified_vehicle', 'verified_animal'];
+
+/** A class mapped to this is dropped (the user chose "ignore" for it). */
+export const IGNORE_CLASS = '!ignore';
+
+/** Raw classes a known source declares, shown in the class map before it is seen sending them. */
+export const KNOWN_CLASSES: Record<string, string[]> = {
+    '@marl1w/scrypted-reolink': ['people', 'vehicle', 'dog_cat'],
+    'scrypted-coral-guard': CORAL_CLASSES,
 };
 
 /** Defaults per known source plugin (merged over the common aliases). */
@@ -66,7 +78,23 @@ export const SOURCE_CLASS_MAPS: Record<string, Record<string, string>> = {
 };
 
 export function defaultClassMap(source: string): Record<string, string> {
-    return { ...COMMON_CLASS_MAP, ...(SOURCE_CLASS_MAPS[source] ?? {}) };
+    return { ...(SOURCE_CLASS_MAPS[source] ?? COMMON_CLASS_MAP) };
+}
+
+/** Facts from the system state: a plugin that provides detection or sensor interfaces on a camera with Stamina. */
+export interface Discovered {
+    source: string;
+    /** it is the camera's own plugin */
+    cameraPlugin: boolean;
+    /** which of ObjectDetector, MotionSensor, OccupancySensor, AudioSensor it provides */
+    ifaces: string[];
+}
+
+/** The role a discovered (not yet seen) source starts with. */
+export function inferDiscovered(d: Discovered): Role {
+    if (d.cameraPlugin) return 'trigger';
+    if (KNOWN_VERIFIERS.includes(d.source)) return 'verifier';
+    return d.ifaces.includes('ObjectDetector') ? 'verifier' : 'trigger';
 }
 
 /** Facts about the first observation of a new source, used to infer its role. */
@@ -102,6 +130,7 @@ export function signalRole(r: Pick<RoleRow, 'role' | 'gated'>): Role {
 }
 
 const SOURCE_RE = /^[A-Za-z0-9@._/-]{1,100}$/;
+export const CLASS_NAME_RE = /^[\w.:-]{1,48}$/;
 
 export function validSource(s: string): boolean {
     return SOURCE_RE.test(s);
@@ -173,9 +202,13 @@ export class RolesTable {
                 if (r.classMap && typeof r.classMap === 'object')
                     for (const [k, v] of Object.entries(r.classMap).slice(0, 64))
                         if (typeof v === 'string' && cleanLabel(k) && cleanLabel(v)) classMap[cleanLabel(k)!] = cleanLabel(v)!;
+                // 0.1.1 gave every source Coral Guard's verified_* aliases: they are removed where they are only that default
+                if (r.source !== 'scrypted-coral-guard')
+                    for (const c of CORAL_CLASSES) if (classMap[c] && classMap[c] === c.slice(9)) delete classMap[c];
+                const classes = Array.isArray(r.classes) ? r.classes.filter((c: unknown) => typeof c === 'string' && CLASS_NAME_RE.test(c)).slice(0, 48) : [];
                 this.rows.set(r.source, {
                     source: r.source, role, inferred: !!r.inferred, roleSet: typeof r.roleSet === 'boolean' ? r.roleSet : true,
-                    gated, classMap, firstSeen: Number(r.firstSeen) || 0, lastSeen: Number(r.lastSeen) || 0,
+                    gated, classMap, classes, firstSeen: Number(r.firstSeen) || 0, lastSeen: Number(r.lastSeen) || 0,
                 });
             }
         }
@@ -188,8 +221,43 @@ export class RolesTable {
 
     /** Rows of 0.1.0 still carry a separate signal role: rewritten once in the current shape. */
     static needsMigration(json: string | null | undefined): boolean {
-        try { return Array.isArray(JSON.parse(json || '[]')) && JSON.parse(json || '[]').some((r: any) => r && 'signalRole' in r); }
+        try {
+            const arr = JSON.parse(json || '[]');
+            return Array.isArray(arr) && arr.some((r: any) => r && ('signalRole' in r || !('classes' in r)
+                || (r.source !== 'scrypted-coral-guard' && r.classMap && CORAL_CLASSES.some(c => c in r.classMap))));
+        }
         catch { return false; }
+    }
+
+    /**
+     * A source found in the system state (a mixin or the camera's plugin providing detections or sensors): a row with its
+     * inferred role, before it sends anything (firstSeen 0 = not seen yet). Existing rows are left alone.
+     */
+    preseed(d: Discovered): RoleRow | undefined {
+        if (this.rows.has(d.source) || !validSource(d.source) || this.rows.size >= RolesTable.MAX_ROWS) return this.rows.get(d.source);
+        const r: RoleRow = {
+            source: d.source, role: inferDiscovered(d), inferred: true, roleSet: false, gated: KNOWN_GATED.includes(d.source),
+            classMap: defaultClassMap(d.source), classes: [], firstSeen: 0, lastSeen: 0,
+        };
+        this.rows.set(d.source, r);
+        this.onChange?.();
+        return r;
+    }
+
+    /** A raw class seen from a source: remembered (bounded) for the class map. */
+    noteClass(source: string, raw: string) {
+        const r = this.rows.get(source);
+        if (!r || r.classes.includes(raw) || r.classes.length >= 48 || !CLASS_NAME_RE.test(raw)) return;
+        r.classes.push(raw);
+        this.onChange?.();
+    }
+
+    /** One class map entry: a class, `raw` itself (keep as is), or IGNORE_CLASS. */
+    setClass(source: string, raw: string, to: string) {
+        const r = this.rows.get(source);
+        if (!r || !CLASS_NAME_RE.test(raw) || !(to === IGNORE_CLASS || CLASS_NAME_RE.test(to))) return;
+        r.classMap = { ...r.classMap, [raw]: to };
+        this.onChange?.();
     }
 
     list(): RoleRow[] {
@@ -215,7 +283,7 @@ export class RolesTable {
             r = {
                 // a row first seen through a signal is a trigger until its first detection decides (a known verifier plugin is
                 // a verifier by name, not because of the signal)
-                source: f.source, role: isObject ? inferRole(f) : KNOWN_VERIFIERS.includes(f.source) ? 'verifier' : 'trigger', inferred: true, roleSet: isObject, gated, classMap: defaultClassMap(f.source), firstSeen: now, lastSeen: now,
+                source: f.source, role: isObject ? inferRole(f) : KNOWN_VERIFIERS.includes(f.source) ? 'verifier' : 'trigger', inferred: true, roleSet: isObject, gated, classMap: defaultClassMap(f.source), classes: [], firstSeen: now, lastSeen: now,
             };
             this.rows.set(f.source, r);
             this.persistedAt.set(f.source, now);
@@ -223,6 +291,7 @@ export class RolesTable {
             return r;
         }
         let dirty = false;
+        if (!r.firstSeen) { r.firstSeen = now; dirty = true; }
         if (f.kind === 'object' && !r.roleSet) {
             if (r.inferred) r.role = inferRole(f);
             r.roleSet = true;

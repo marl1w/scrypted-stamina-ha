@@ -363,3 +363,22 @@ test('split: the parent\'s AI of another family, or later than 2 s, does not joi
     assert.equal(ev.subjects.length, 1);
     assert.equal(ev.subjects[0].sources[CAMP], undefined);
 });
+
+test('detections are taken from the plain, layer and system listeners, each payload once', () => {
+    const x = setup();
+    const env = x.core.env;
+    const sys: ((dev: string, d: any, data: any) => void)[] = [];
+    x.core.setEnv({ ...env, listenAll: (_iface, cb) => { sys.push(cb); return () => { }; } });
+    const payload = { sourceId: CAMP, timestamp: x.clock.now(), detections: [{ className: 'people', score: 1 }] };
+    x.sc.emit('7', 'ObjectDetector', payload);                 // plain
+    x.sc.emit('7', 'ObjectDetector', payload, {}, '7');        // device layer
+    sys.forEach(f => f('7', {}, payload));                     // system-wide
+    sys.forEach(f => f('99', {}, payload));                    // another camera: not ours
+    assert.equal(x.out.filter(m => m.type === 'event.start').length, 1);
+    assert.equal(x.core.tracker.current!.observations, 1);
+    assert.deepEqual({ ...x.core.detectionStats }, { total: 1, plain: 1, layer: 1, system: 1 });
+    // only a layer delivers: still counted
+    x.clock.advance(1000);
+    x.sc.emit('7', 'ObjectDetector', { ...payload, timestamp: x.clock.now() }, {}, '7');
+    assert.equal(x.core.detectionStats.total, 2);
+});
