@@ -93,6 +93,13 @@ for (let n = 0; n < (CAMERAS.length ? 140 : 0); n++) {
   t -= 600 + ((n * 977) % 5400);
 }
 
+const slug = (text) => text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+const stamp = (t) => {
+  const d = new Date(t * 1000);
+  const two = (n) => String(n).padStart(2, "0");
+  return `${two(d.getFullYear() % 100)}${two(d.getMonth() + 1)}${two(d.getDate())}_${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+};
+
 function detail(row) {
   const cam = CAMERAS.find((c) => c.id === row.camera);
   const subjects = row.classes.filter((c) => c !== "motion").map((cls) => ({
@@ -115,7 +122,7 @@ function detail(row) {
     watching: ["door", "presence"],
     late_evidence: row.late ? [{ entity: "binary_sensor.side_gate", name: "Side gate", kind: "door", from: "off", to: "on", t_rel_s: 40 }] : [],
     learning: cam.learn[0] < 7, keep_reason: row.unusual ? "unusual" : `classes: ${row.classes[0]}`, target: "events",
-    cloud_path: kept ? `events/${(cam.area || "no-area").toLowerCase()}/${row.id}` : null,
+    cloud_path: kept ? `events/${slug(cam.area || "no-area")}-${slug(cam.name)}-${stamp(row.started)}.mp4` : null,
     copies: kept ? [{ destination: "WebDAV: NAS", committed: row.state === "committed", deleted: false, files: 12 }] : [],
     notes: row.state === "orphaned" ? ["camera_offline"] : [], gaps: 0,
     play: {

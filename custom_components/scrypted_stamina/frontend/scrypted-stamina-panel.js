@@ -147,9 +147,9 @@ function meter(score, unusual, large = false) {
   );
 }
 
-/** "Area · Camera" where the area is known. */
+/** "Area · Camera" where the area is known and says something the name does not. */
 function cameraLabel(area, name) {
-  return area ? `${area} · ${name}` : name;
+  return area && area !== name ? `${area} · ${name}` : name;
 }
 
 class ScryptedStaminaPanel extends HTMLElement {
@@ -173,6 +173,8 @@ class ScryptedStaminaPanel extends HTMLElement {
     this._wide = false;
     this._roomy = false;
     this._camsOpen = false;
+    // The route a filter change is writing (`_setRoute`), so `_routeChanged` knows it.
+    this._filterRoute = null;
     this._link = true;
     this._thumbs = new Map();
     this._rows = new Map();
@@ -341,14 +343,15 @@ class ScryptedStaminaPanel extends HTMLElement {
   }
 
   _routeChanged() {
-    const filtering = this._filtering;
-    this._filtering = false;
     if (!this._hass || !this._started) return;
     const path = this._route?.path || "";
     const search = this._search();
     // Home Assistant may hand over the same route again; only a new one changes anything.
     if (`${path}${search}` === this._routeKey) return;
     this._routeKey = `${path}${search}`;
+    // Whether this route is one a filter change wrote, whoever passes it in first.
+    const filtering = this._routeKey === this._filterRoute;
+    this._filterRoute = null;
 
     const filters = filtersFromSearch(search);
     const match = path.match(/^\/event\/([A-Za-z0-9_.-]+)/);
@@ -370,9 +373,13 @@ class ScryptedStaminaPanel extends HTMLElement {
     return `${prefix}${path}${searchFromFilters(filters)}`;
   }
 
-  /** Write the filters and the selection to the URL, replacing: Back leaves the panel. */
-  _setRoute({ filters = this._filters, id = this._selected } = {}) {
+  /**
+   * Write the filters and the selection to the URL, replacing: Back leaves the panel.
+   * `filtering` says a filter changed it, so an open event that no longer matches gives way.
+   */
+  _setRoute({ filters = this._filters, id = this._selected, filtering = false } = {}) {
     const path = id ? `/event/${id}` : "";
+    this._filterRoute = filtering ? `${path}${searchFromFilters(filters)}` : null;
     history.replaceState(history.state, "", this._url(path, filters));
     window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: true } }));
     // Home Assistant does not always pass a new route when only the query changed.
@@ -382,6 +389,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       this._route = { ...this._route, path, search: searchFromFilters(filters) };
     }
     this._routeChanged();
+    this._filterRoute = null;
   }
 
   /**
@@ -562,8 +570,7 @@ class ScryptedStaminaPanel extends HTMLElement {
   }
 
   _setFilter(change) {
-    this._filtering = true;
-    this._setRoute({ filters: { ...this._filters, ...change } });
+    this._setRoute({ filters: { ...this._filters, ...change }, filtering: true });
   }
 
   _query() {
@@ -756,7 +763,9 @@ class ScryptedStaminaPanel extends HTMLElement {
     }
     this._whereSelect.value = where;
     this._whereSelect.classList.toggle("is-set", where !== "");
-    this._whereSelect.hidden = cams.length < 2 && !where;
+    // The camera box filters the same thing: the select shows only while there is none
+    // (cameras not loaded yet, with a filter from a link).
+    this._whereSelect.hidden = cams.length > 0 || !where;
     this._droppedChip.hidden = !f.dropped;
     this._clearButton.hidden = !this._filtersSet();
   }
@@ -1292,7 +1301,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       const byDays = Math.min(1, days / needs.days);
       const byEvents = Math.min(1, events / needs.events);
       return {
-        short: byDays <= byEvents ? `Learning ${days}/${needs.days} d` : `Learning ${events}/${needs.events} ev`,
+        short: "Learning",
         text: `Learning what is normal: ${days} of ${needs.days} days, ${events} of ${needs.events} events`,
         tone: "accent",
         progress: Math.min(byDays, byEvents),
@@ -1315,14 +1324,13 @@ class ScryptedStaminaPanel extends HTMLElement {
     if (key === this._camKey) return;
     this._camKey = key;
 
-    // Folded, the line says only what needs a look.
+    // Folded, the line says only what needs a look (learning does not: it ends by itself).
     const count = (tone) => states.filter((state) => state.tone === tone).length;
     const parts = [`${cams.length}`];
     if (count("error")) parts.push(`${count("error")} offline`);
     if (count("warn")) parts.push(`${count("warn")} double-check down`);
-    if (count("accent")) parts.push(`${count("accent")} learning`);
     if (parts.length === 1) parts.push("all working");
-    const worst = ["error", "warn", "accent"].find((tone) => count(tone)) || "ok";
+    const worst = ["error", "warn"].find((tone) => count(tone)) || "ok";
     replace(this._camSummary, el("span", { class: "dot", dataset: { tone: worst }, "aria-hidden": "true" }), parts.join(" · "));
 
     const row = (cam) => {

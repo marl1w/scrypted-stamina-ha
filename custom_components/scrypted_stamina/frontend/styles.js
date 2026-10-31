@@ -246,7 +246,7 @@ select.chip {
 }
 .card__title { margin: 16px 0 8px; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ss-dim); }
 .card__title:first-child { margin-top: 0; }
-.verdict { display: flex; align-items: flex-end; gap: 6px 14px; flex-wrap: wrap; }
+.verdict { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .sentence { margin: 8px 0 0; line-height: 1.5; }
 .note { margin: 10px 0 0; font-size: 0.88rem; color: var(--ss-dim); line-height: 1.45; display: flex; gap: 6px; align-items: flex-start; }
 
@@ -324,11 +324,10 @@ button.cam-group__label:hover { color: var(--ss-text); }
 .dot[data-tone="error"] { --tone: var(--ss-error); }
 .dot[data-tone="accent"] { --tone: var(--ss-accent); }
 
-/* Its own column when roomy: always open, no fold, the area filter replaces the select. */
+/* Its own column when roomy: always open, no fold. */
 .pane--cams .cams { margin: 0; border-radius: 0; background: none; box-shadow: none; padding: 8px 4px 24px; }
 .pane--cams .cams__toggle { display: none; }
 .pane--cams .cams__body { display: flex; flex-direction: column; gap: 6px; padding: 0; }
-.split--roomy .chip--where { display: none; }
 
 /* ------------------------------------------------------------------ how unusual */
 
