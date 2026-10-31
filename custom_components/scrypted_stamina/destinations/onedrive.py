@@ -103,14 +103,23 @@ class OneDriveDestination(OAuthDestination):
     async def _async_folder_id(self, folder: str) -> str:
         """Return the id of a folder, creating it and its parents where missing.
 
-        Each segment is created with `conflictBehavior: fail`, so one that exists answers
-        409 and is then read by path; "replace" would empty it.
+        Each segment is read by path first and only created when missing: creating one that
+        exists answers 409 in a subfolder but 400 directly under the app folder. It is created
+        with `conflictBehavior: fail` ("replace" would empty it), and a creation that loses a
+        race is read by path again.
         """
         parent_url = APPROOT
         walked: list[str] = []
         folder_id: str | None = None
         for segment in [part for part in folder.split("/") if part]:
             walked.append(segment)
+            item = await self._async_request(
+                "GET", self._item("/".join(walked)), allow_missing=True
+            )
+            if isinstance(item, dict) and item.get("id"):
+                folder_id = str(item["id"])
+                parent_url = f"{GRAPH}/me/drive/items/{folder_id}"
+                continue
             item = await self._async_request(
                 "POST",
                 f"{parent_url}/children",

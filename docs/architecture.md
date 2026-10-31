@@ -162,7 +162,7 @@ The exact message and route shapes are in [api.md](api.md). All routes are under
 
 ### 3.2 Context
 
-**Configuration:** the integration's options have one page per camera with an entity picker. It is pre-filled with suggestions from the camera device's area (contacts, alarm panel, presence, lights), and you add or remove entities. Each entity's kind (door, alarm, presence, light, other) comes from its domain and device class, and tells scoring how to read it.
+**Configuration:** the integration's options have one page per camera with an entity picker. It starts empty: you pick the entities that matter (contacts, alarm panel, presence, lights); nothing is guessed. Each entity's kind (door, alarm, presence, light, other) comes from its domain and device class, and tells scoring how to read it.
 
 - Per camera device, an options picker of **linked entities** (contacts, alarm panel, presence, lights…).
 - At `event.start` and `event.end`, the integration records each linked entity's state and its last change relative to the event (e.g. "door opened 5 s before"). These features feed scoring and are stored with the event.

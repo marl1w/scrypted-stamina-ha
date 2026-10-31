@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -102,10 +103,8 @@ async def test_onedrive_moves_by_patching_the_parent() -> None:
 
     async def request(method, url, **kwargs):
         calls.append((method, url, kwargs))
-        if method == "POST":
-            return None  # 409: the folder exists
         if method == "GET":
-            return {"id": f"id-{len(calls)}"}
+            return {"id": f"id-{len(calls)}"}  # every parent exists already
         return {"id": "moved"}
 
     destination._async_request = request
@@ -113,8 +112,29 @@ async def test_onedrive_moves_by_patching_the_parent() -> None:
     method, url, kwargs = calls[-1]
     assert method == "PATCH" and url.endswith(f"{SOURCE}:")
     assert '"name": "261031_210509_front-door_ev_1"' in kwargs["data"]
-    assert '"parentReference": {"id": "id-6"}' in kwargs["data"]
-    assert all(c[2].get("allow_conflict") for c in calls if c[0] == "POST")
+    assert '"parentReference": {"id": "id-3"}' in kwargs["data"]
+    # an existing folder is never created again (Graph answers 400 for that under the app folder)
+    assert not [c for c in calls if c[0] == "POST"]
+
+
+async def test_onedrive_creates_only_missing_parents() -> None:
+    destination = OneDriveDestination(MagicMock(), loaded("onedrive"))
+    calls = []
+
+    async def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if method == "GET":
+            return {"id": "root"} if url.endswith("scrypted-stamina:") else None  # 404
+        if method == "POST":
+            assert kwargs.get("allow_conflict")
+            return {"id": "new-" + json.loads(kwargs["data"])["name"]}
+        return {"id": "moved"}
+
+    destination._async_request = request
+    await destination.async_move(SOURCE, TARGET)
+    posted = [json.loads(c[2]["data"])["name"] for c in calls if c[0] == "POST"]
+    assert posted == ["events", "garden"]
+    assert '"parentReference": {"id": "new-garden"}' in calls[-1][2]["data"]
 
 
 async def test_google_drive_moves_by_swapping_parents() -> None:

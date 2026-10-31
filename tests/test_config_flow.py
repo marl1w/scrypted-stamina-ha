@@ -146,7 +146,7 @@ async def test_destination_subentry_from_a_loaded_storage_integration(hass, stam
     storage.mock_state(hass, ConfigEntryState.NOT_LOADED)
 
 
-async def test_options_have_a_page_per_camera_prefilled_from_its_area(hass, stamina, setup) -> None:
+async def test_options_have_a_page_per_camera_starting_empty(hass, stamina, setup) -> None:
     mqtt = MockConfigEntry(domain="scrypted_mqtt")
     mqtt.add_to_hass(hass)
     area = ar.async_get(hass).async_create("Porch")
@@ -185,7 +185,7 @@ async def test_options_have_a_page_per_camera_prefilled_from_its_area(hass, stam
     defaults = {
         str(key): key.default() for key in result["data_schema"].schema if callable(key.default)
     }
-    assert defaults[CONF_LINKED] == [door.entity_id]  # the battery sensor is not suggested
+    assert defaults[CONF_LINKED] == []  # nothing is guessed, even with a door in the area
     assert defaults[CONF_FOLLOW_UP_MINUTES] == 10
 
     result = await hass.config_entries.options.async_configure(

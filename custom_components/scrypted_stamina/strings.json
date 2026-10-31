@@ -115,7 +115,7 @@
       },
       "camera": {
         "title": "{camera}",
-        "description": "Entities whose state is recorded with every event of this camera, and whose changes after an event count as late evidence. Suggested from the camera's area.",
+        "description": "Entities whose state is recorded with every event of this camera, and whose changes after an event count as late evidence. Empty until you add some.",
         "data": {
           "linked_entities": "Linked entities",
           "follow_up_minutes": "Follow-up window"

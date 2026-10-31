@@ -82,7 +82,6 @@ from .const import (
     SUBENTRY_TYPE_DESTINATION,
     TITLE,
 )
-from .context import suggestions
 from .destinations import DESTINATION_DOMAINS
 
 CONF_ACCEPT = "accept_certificate"
@@ -441,13 +440,10 @@ class StaminaOptionsFlow(OptionsFlow):
         if self._at >= len(self._cameras):
             return self.async_create_entry(data=self._pending)
 
-        camera, name, device_id = self._cameras[self._at]
+        camera, name, _device_id = self._cameras[self._at]
         current = self._pending[CONF_CAMERAS].get(camera)
-        linked = (
-            list(current.get(CONF_LINKED) or [])
-            if current is not None
-            else suggestions(self.hass, device_id)
-        )
+        # A camera starts with nothing linked: the user picks what matters, nothing is guessed.
+        linked = list((current or {}).get(CONF_LINKED) or [])
         minutes = (current or {}).get(CONF_FOLLOW_UP_MINUTES, DEFAULT_FOLLOW_UP_MINUTES)
         return self.async_show_form(
             step_id="camera",

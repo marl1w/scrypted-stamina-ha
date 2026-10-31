@@ -26,33 +26,6 @@ from homeassistant.helpers import (
     entity_registry as er,
 )
 
-# Entity domains a camera's area offers as suggestions, in the order they are listed.
-SUGGESTED_DOMAINS = (
-    "binary_sensor",
-    "alarm_control_panel",
-    "lock",
-    "cover",
-    "person",
-    "device_tracker",
-    "light",
-)
-# Binary sensor device classes worth suggesting; anything else is noise (battery, problem…).
-_SUGGESTED_BINARY_CLASSES = frozenset(
-    {
-        "door",
-        "garage_door",
-        "window",
-        "opening",
-        "motion",
-        "occupancy",
-        "presence",
-        "vibration",
-        "moving",
-        "sound",
-        "tamper",
-        "safety",
-    }
-)
 _KINDS_BY_CLASS = {
     "door": "door",
     "garage_door": "door",
@@ -103,36 +76,6 @@ def device_area_name(hass: HomeAssistant, device_id: str | None) -> str | None:
         return None
     area = ar.async_get(hass).async_get_area(device.area_id)
     return area.name if area is not None else None
-
-
-def suggestions(hass: HomeAssistant, device_id: str | None) -> list[str]:
-    """Return entities in the camera device's area worth linking (architecture §3.2)."""
-    if device_id is None:
-        return []
-    device = dr.async_get(hass).async_get(device_id)
-    if device is None or device.area_id is None:
-        return []
-    entities = er.async_get(hass)
-    devices = dr.async_get(hass)
-    found: list[str] = []
-    for entry in entities.entities.values():
-        if entry.disabled_by is not None or entry.hidden_by is not None:
-            continue
-        if entry.domain not in SUGGESTED_DOMAINS or entry.device_id == device_id:
-            continue
-        area_id = entry.area_id
-        if area_id is None and entry.device_id is not None:
-            owner = devices.async_get(entry.device_id)
-            area_id = owner.area_id if owner is not None else None
-        if area_id != device.area_id:
-            continue
-        if entry.domain == "binary_sensor":
-            device_class = entry.device_class or entry.original_device_class
-            if device_class not in _SUGGESTED_BINARY_CLASSES:
-                continue
-        found.append(entry.entity_id)
-    order = {domain: index for index, domain in enumerate(SUGGESTED_DOMAINS)}
-    return sorted(found, key=lambda item: (order.get(item.partition(".")[0], 99), item))
 
 
 def default_weather(hass: HomeAssistant) -> str | None:
