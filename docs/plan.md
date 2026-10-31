@@ -50,6 +50,7 @@ Phase 0 answers decide the details of phases 2–4. S3 is done in the scrypted-r
 
 - Linked entities per camera (options flow), and the context snapshot at start and end.
 - Port `relevance/` from Reolink Stamina: features, learned normal, score.
+- Follow-up window (architecture §3.4a): late evidence from linked entities, a provisional score at the end and a final score after the window, the `FOLLOW_UP` decider state with its own pending cap, and a late `unusual` event.
 - Day/night: the camera's BinarySensor children (e.g. scrypted-reolink's "Night mode") as features.
 - Source reliability learned from verdicts.
 - `binary_sensor.<cam>_unusual`, and `unusual` events on `event.<cam>_stamina`.
@@ -66,6 +67,8 @@ Phase 0 answers decide the details of phases 2–4. S3 is done in the scrypted-r
 **Exit criteria:** any event of the last month can be played from HA, from the NVR when it's reachable and from the cloud when it isn't.
 
 ## Phase 5: remaining fallbacks and polish
+
+- Incidents: link events across cameras in the same or adjacent areas, close in time.
 
 - "Process later" for cameras without live alerts (scheduled scan of VideoClips or recordings, with a verifier if present).
 - Thumbnails (if enabled), the timeline panel (ported from Reolink Stamina's frontend), more destinations.

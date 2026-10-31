@@ -179,6 +179,20 @@ All routes are under `/endpoint/@marl1w/scrypted-stamina/` with `Authorization: 
 
 No-verifier cameras follow the fallback policy: `unverified` subjects count as confirmed once they last at least N s (default 2) with a score of at least T. An event that is vetoed but unusual is **kept**, in `unusual-unconfirmed/` rather than `events/`.
 
+### 3.4a Follow-up window (late evidence)
+
+Some evidence comes after the camera has stopped seeing anything: a door opened a few minutes after a person was seen, a shock sensor, the alarm actually triggering.
+
+- After `event.end` an event stays open for scoring for a **follow-up window**: default 10 min, set per camera on the same options page as its linked entities.
+- Every state change of the camera's linked entities in that window is attached to the event as late evidence (`{entity, kind, from, to, t_rel_s}`).
+- **Provisional score** at `event.end`; **final score** when the window closes, from facts, context and late evidence. The relevance model learns what late evidence is normal: a door opened at 6 p.m. with someone home is not unusual; at 3 a.m. with the alarm armed it is.
+- If the final score turns the event unusual, `event.<cam>_stamina` fires again as `unusual` with `late: true`.
+- **Decider:** an event that is vetoed and ordinary at the end enters `FOLLOW_UP`. Its pending upload is kept until the window closes, then dropped if it is still ordinary, or moved to `unusual-unconfirmed/` if it became unusual. Confirmed or unusual events commit as before; only their `event.json` and index row are updated after the window.
+- `FOLLOW_UP` pending data has its own cap (default 1 GB per destination). Over it, the oldest vetoed-and-ordinary events are dropped first.
+- The window end time is persisted, so evaluation resumes after a restart.
+
+A later extension: **incidents** link events across cameras in the same or adjacent areas, close in time (gate, then garden, then patio door), so the score sees the whole path.
+
 ### 3.5 Uploader
 
 **Destinations** are subentries ("Add destination"), as in Reolink Stamina. Each one picks an account or server from the storage integrations already set up: Synology DSM, WebDAV, SFTP Storage, OneDrive, Google Drive. Each has its own folder, quota (default 15 GB), and retention (oldest evicted first). Every kept event goes to every destination.
