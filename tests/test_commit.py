@@ -448,3 +448,47 @@ async def test_onedrive_refuses_a_stream_shorter_than_announced(monkeypatch) -> 
     destination._async_request = request
     with pytest.raises(DestinationError, match="7 of 10"):
         await destination.async_store_stream(VIDEO, 10, chunks())
+
+
+# ------------------------------------------------------------------ playback across files
+
+
+async def test_a_video_of_several_files_plays_each_range_from_its_file(
+    hass, hass_client_no_auth, stamina, destinations, setup
+) -> None:
+    from custom_components.scrypted_stamina import playback
+
+    from .conftest import event_id, until
+    from .test_events import run_event
+
+    entry = await setup()
+    manager = entry.runtime_data.manager
+    eid = event_id(82)
+    run_event(stamina, eid, "confirmed")
+    await until(
+        lambda: eid in manager.records and manager.records[eid].state is EventState.COMMITTED
+    )
+    fake = destinations["storage0"]
+    [path] = fake.videos()
+    # What an orphan received after its commit: a second file, as a commit records it.
+    [(sid, copy)] = (await manager.index.async_copies(eid)).items()
+    part2 = path.removesuffix(".mp4") + "-part2.mp4"
+    fake.files[part2] = b"later"
+    copy.files["00002.m4s"] = 5
+    copy.ranges["00002.m4s"] = [0, 5, 2]
+    manager.records[eid].facts.segments = 3
+    await manager.index.async_save_copy(eid, sid, copy)
+    playback._LOOKUPS._items.clear()
+
+    client = await hass_client_no_auth()
+    lines = (
+        await (await client.get(playback.play_url(hass, entry.entry_id, eid, "cloud"))).text()
+    ).splitlines()
+    at = lines.index("#EXT-X-BYTERANGE:5@0")
+    assert "/video-part2.mp4?" in lines[at + 1]
+    assert any("/video.mp4?" in line for line in lines)  # the first file's ranges too
+    fake.ops.clear()
+    response = await client.get(lines[at + 1], headers={"Range": "bytes=0-4"})
+    assert response.status == 206 and await response.read() == b"later"
+    assert fake.ops == [("read_range", part2)]
+    await hass.config_entries.async_unload(entry.entry_id)

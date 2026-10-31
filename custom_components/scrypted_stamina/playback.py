@@ -47,7 +47,7 @@ from homeassistant.core import HomeAssistant, callback
 from .api import StaminaApiError, async_read_limited, playback_path
 from .const import DOMAIN, MAX_SEGMENT_BYTES
 from .destinations import DestinationError
-from .uploader import video_playlist
+from .uploader import cloud_name, cloud_part, video_playlist
 
 if TYPE_CHECKING:
     from . import StaminaData
@@ -67,7 +67,6 @@ THUMBNAIL_CACHE = "private, max-age=3600"
 MAX_PLAYLIST_BYTES = 1024 * 1024
 # A committed video (about 70 MB an hour) is never read whole: each range a player asks for
 # is read from the destination as that range, at most this much at a time.
-VIDEO_NAME = "video.mp4"
 VIDEO_CHUNK = 4 * 1024 * 1024
 # Seconds of recording either side of an event, for in-place playback.
 PLAYBACK_LEAD = 5.0
@@ -366,8 +365,14 @@ async def _async_cloud_playlist(
         target = data.manager.uploader.targets.get(subentry)
         if target is None or not copy.playable or not copy.ranges:
             continue
-        uri = cloud_url(hass, entry_id, subentry, record.id, VIDEO_NAME, cap)
-        return _response(text=video_playlist(record, copy, uri), content_type=HLS)
+        text = video_playlist(
+            record,
+            copy,
+            lambda part, held=subentry: cloud_url(
+                hass, entry_id, held, record.id, cloud_name(part), cap
+            ),
+        )
+        return _response(text=text, content_type=HLS)
     return None
 
 
@@ -541,7 +546,8 @@ class CloudView(HomeAssistantView):
     ) -> web.StreamResponse:
         """Serve the video, or the range of it asked for."""
         hass = self._hass
-        if not verify(hass, request) or name != VIDEO_NAME:
+        part = cloud_part(name)  # `video.mp4`, or `video-part<n>.mp4` for what came later
+        if not verify(hass, request) or part is None:
             return _response(403)
         data = _data(hass, entry_id)
         if data is None:
@@ -550,7 +556,9 @@ class CloudView(HomeAssistantView):
         copy = (await _LOOKUPS.get(data, event_id)).get(subentry)
         if target is None or copy is None or not copy.playable:
             return _response(404)
-        size = copy.video_size
+        size = copy.part_size(part)
+        if size <= 0:
+            return _response(404)
         headers = {**SECURITY_HEADERS, "Accept-Ranges": "bytes", "Content-Type": "video/mp4"}
         span = _byte_range(request.headers.get("Range"), size)
         if span is None:
@@ -563,7 +571,7 @@ class CloudView(HomeAssistantView):
                 )
             status = 206
             headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        destination, path = target.destination, str(copy.video)  # playable: not None
+        destination, path = target.destination, str(copy.part_path(part))  # playable
         # The first chunk is read before anything is sent, so a destination that fails
         # outright is a clean 502 rather than a cut response.
         try:
