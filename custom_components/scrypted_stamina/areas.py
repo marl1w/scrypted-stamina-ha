@@ -1,27 +1,30 @@
-"""One subentry per area that holds a camera, managed by the integration itself.
+"""One device per area that holds a camera, with the area's Uploads select and quota.
 
-Home Assistant's integration page groups devices by subentry, so each area gets one, titled
-with the area's name, holding one device with the area's Uploads select and quota.
-Cameras without an area share a "No area" one. The unique id is the area id (or `NO_AREA`):
-an area keeps its Uploads position across renames, and across its subentry being removed
-and added again.
+The devices are filed under the first destination's subentry, so the integration page lists
+them with it rather than as entries of their own (directly on the entry when there is no
+destination). Cameras without an area share a "No area" device. The device and entity
+unique ids carry the area id (or `NO_AREA`), so an area keeps its Uploads position across
+renames.
 
-The integration adds, renames and removes these as cameras move between areas; there is no
-flow to add one by hand (`config_flow.py` does not list the type). One deleted by hand comes
-back on the next sync, and with it the area's stored position.
+Earlier versions gave every area a subentry of its own; `async_file_area_devices` moves
+their devices and entities onto the destination and deletes those subentries.
 """
 
 from __future__ import annotations
 
-from types import MappingProxyType
+from typing import Final
 
-from homeassistant.config_entries import ConfigEntry, ConfigSubentry
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 
-from .const import CONF_AREA_ID, DOMAIN, NO_AREA, NO_AREA_TITLE, SUBENTRY_TYPE_AREA
+from .const import DOMAIN, NO_AREA, SUBENTRY_TYPE_DESTINATION
 from .devices import CameraDevice
 from .naming import area_slug
+
+NO_AREA_TITLE: Final = "No area"
+# The subentries earlier versions kept per area; only read to remove them.
+LEGACY_SUBENTRY_TYPE_AREA: Final = "area"
 
 
 def area_key(device: CameraDevice) -> str:
@@ -34,62 +37,49 @@ def area_identifier(entry_id: str, key: str) -> tuple[str, str]:
     return (DOMAIN, f"{entry_id}_area_{key}")
 
 
-def area_subentries(entry: ConfigEntry) -> dict[str, ConfigSubentry]:
-    """Return the area subentries, by area key."""
-    return {
-        str(subentry.unique_id): subentry
-        for subentry in entry.subentries.values()
-        if subentry.subentry_type == SUBENTRY_TYPE_AREA
-    }
-
-
 def wanted_areas(devices: list[CameraDevice]) -> dict[str, str]:
     """Return the areas the cameras are in, by key, with their titles."""
     return {area_key(device): device.area or NO_AREA_TITLE for device in devices}
 
 
-def slug_of(subentry: ConfigSubentry) -> str:
+def slug_of(key: str, title: str) -> str:
     """Return the area folder name events of this area are filed under."""
-    if subentry.unique_id == NO_AREA:
-        return NO_AREA
-    return area_slug(subentry.title)
+    return NO_AREA if key == NO_AREA else area_slug(title)
+
+
+def area_home(entry: ConfigEntry) -> str | None:
+    """Return the subentry the area devices are filed under: the first destination's."""
+    return next(
+        (
+            subentry.subentry_id
+            for subentry in entry.subentries.values()
+            if subentry.subentry_type == SUBENTRY_TYPE_DESTINATION
+        ),
+        None,
+    )
 
 
 @callback
-def async_sync_area_subentries(
-    hass: HomeAssistant, entry: ConfigEntry, wanted: dict[str, str]
-) -> bool:
-    """Add, rename and remove area subentries to match `wanted`; return whether any changed.
+def async_file_area_devices(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """File every area device, and its entities, under `area_home`; drop old area subentries.
 
-    With no camera known at all (the plugin unreachable at start), nothing is removed.
+    Moved before the subentries go, so removing them takes no device or entity with it:
+    entity ids, names and history stay. Idempotent; run at every setup, which also follows a
+    first destination added or removed.
     """
-    if not wanted:
-        return False
-    existing = area_subentries(entry)
-    changed = False
-    devices = dr.async_get(hass)
-    for key, title in wanted.items():
-        subentry = existing.pop(key, None)
-        if subentry is None:
-            hass.config_entries.async_add_subentry(
-                entry,
-                ConfigSubentry(
-                    data=MappingProxyType({CONF_AREA_ID: key}),
-                    subentry_type=SUBENTRY_TYPE_AREA,
-                    title=title,
-                    unique_id=key,
-                ),
-            )
-            changed = True
-        elif subentry.title != title:
-            hass.config_entries.async_update_subentry(entry, subentry, title=title)
-            device = devices.async_get_device_by_identifier(
-                area_identifier(entry.entry_id, key), entry.entry_id
-            )
-            if device is not None:
-                devices.async_update_device(device.id, name=title)
-            changed = True
-    for subentry in existing.values():
-        hass.config_entries.async_remove_subentry(entry, subentry.subentry_id)
-        changed = True
-    return changed
+    home = area_home(entry)
+    devices, entities = dr.async_get(hass), er.async_get(hass)
+    prefix = f"{entry.entry_id}_area_"
+    for device in dr.async_entries_for_config_entry(devices, entry.entry_id):
+        if not any(d == DOMAIN and i.startswith(prefix) for d, i in device.identifiers):
+            continue
+        if device.config_subentry_id != home:
+            devices.async_update_device(device.id, new_config_subentry_id=home)
+        for item in er.async_entries_for_device(
+            entities, device.id, include_disabled_entities=True
+        ):
+            if item.config_subentry_id != home:
+                entities.async_update_entity(item.entity_id, config_subentry_id=home)
+    for subentry in list(entry.subentries.values()):
+        if subentry.subentry_type == LEGACY_SUBENTRY_TYPE_AREA:
+            hass.config_entries.async_remove_subentry(entry, subentry.subentry_id)

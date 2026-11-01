@@ -66,13 +66,7 @@ from homeassistant.helpers.event import (
 from homeassistant.util import dt as dt_util
 
 from .api import StaminaApiError, StaminaClient
-from .areas import (
-    area_key,
-    area_subentries,
-    async_sync_area_subentries,
-    slug_of,
-    wanted_areas,
-)
+from .areas import area_key, slug_of, wanted_areas
 from .const import (
     CONF_CAMERAS,
     CONF_FOLLOW_UP_MINUTES,
@@ -224,6 +218,8 @@ class StaminaManager:
         self.now: Callable[[], float] = time.time
         self.records: dict[str, EventRecord] = {}
         self.cameras: dict[str, CameraStatus] = {}
+        # The areas that hold a camera, by key, with their titles: one device each (`areas.py`).
+        self.areas: dict[str, str] = {}
         # Each area's Uploads position by area key, persisted in the index's meta; an
         # area without one takes the default, the old global select's position.
         self.default_uploads = UPLOADS_CLASSES
@@ -324,7 +320,7 @@ class StaminaManager:
                 async_track_state_change_event(self.hass, linked, self._linked_changed)
             )
         await self.uploader.async_start()
-        slugs = {slug_of(sub): key for key, sub in area_subentries(self.entry).items()}
+        slugs = {slug_of(key, title): key for key, title in self.areas.items()}
         self._event_areas = {
             event_id: key or slugs.get(slug, "")
             for event_id, (key, slug) in (await self.index.async_copy_areas()).items()
@@ -466,7 +462,7 @@ class StaminaManager:
         """Follow camera devices that appear or change after setup: links and areas.
 
         A `scrypted_mqtt` device that appears is linked to; a camera moved to another area
-        (on either device) moves to that area's subentry and Uploads position.
+        (on either device) moves to that area's device and Uploads position.
         """
         if event.data["action"] not in ("create", "update"):
             return
@@ -489,7 +485,7 @@ class StaminaManager:
 
     @callback
     def _area_updated(self, event: Event[ar.EventAreaRegistryUpdatedData]) -> None:
-        """Follow an area renamed or removed: titles, folders and subentries."""
+        """Follow an area renamed or removed: titles, folders and area devices."""
         if event.data["action"] == "reorder":
             return
         for camera, status in self.cameras.items():
@@ -499,11 +495,15 @@ class StaminaManager:
 
     @callback
     def async_sync_areas(self) -> None:
-        """Keep one area subentry per area that holds a camera (`areas.py`)."""
+        """Keep `areas` to the areas that hold a camera, and tell their entities.
+
+        With no camera known at all (the plugin unreachable at start), nothing is removed.
+        """
         if self._stopping:
             return
         wanted = wanted_areas([status.device for status in self.cameras.values()])
-        if async_sync_area_subentries(self.hass, self.entry, wanted):
+        if wanted and wanted != self.areas:
+            self.areas = wanted
             async_dispatcher_send(self.hass, signal_areas(self.entry.entry_id))
 
     # ------------------------------------------------------------------ messages

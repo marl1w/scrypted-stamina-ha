@@ -500,13 +500,11 @@ class DestinationSubentryFlow(ConfigSubentryFlow):
         if not options:
             return self.async_abort(reason="no_destination")
         if user_input is not None:
-            label = next(
-                item["label"]
-                for item in options
-                if item["value"] == user_input[CONF_DESTINATION_ENTRY]
-            )
+            # Titled by provider; setup adds the account when two share one.
+            owner = self.hass.config_entries.async_get_entry(user_input[CONF_DESTINATION_ENTRY])
+            title = (await async_get_integration(self.hass, owner.domain)).name if owner else ""
             return self.async_create_entry(
-                title=label, data=user_input, unique_id=user_input[CONF_DESTINATION_ENTRY]
+                title=title, data=user_input, unique_id=user_input[CONF_DESTINATION_ENTRY]
             )
         return self.async_show_form(
             step_id="user", data_schema=self._schema({}, options, choose=True)

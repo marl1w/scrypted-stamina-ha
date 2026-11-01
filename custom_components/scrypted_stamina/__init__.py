@@ -2,12 +2,13 @@
 
 Scrypted provides the facts and the video; Home Assistant decides and stores. This package
 is the Home Assistant half (architecture §3): one config entry per plugin, destinations as
-subentries, one managed subentry per area (`areas.py`), a manager that runs the link, the
-decider, scoring and the uploader.
+subentries (each area's device filed under the first, `areas.py`), a manager that runs the
+link, the decider, scoring and the uploader.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import logging
 from typing import Any
@@ -17,9 +18,10 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er, issue_registry as ir
+from homeassistant.loader import IntegrationNotFound, async_get_integration
 
 from .api import InsecureUrlError, StaminaApiError, StaminaAuthError, StaminaClient
-from .areas import area_subentries, slug_of
+from .areas import async_file_area_devices, slug_of
 from .const import (
     CONF_DESTINATION_ENTRY,
     CONF_FINGERPRINT,
@@ -41,7 +43,6 @@ from .const import (
     INDEX_FILENAME,
     LEGACY_UNUSUAL_OVERRIDES,
     PLATFORMS,
-    SUBENTRY_TYPE_AREA,
     SUBENTRY_TYPE_DESTINATION,
 )
 from .destinations import DestinationError, async_create_destination
@@ -121,6 +122,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: StaminaConfigEntry) -> b
     except StaminaApiError as err:
         raise ConfigEntryNotReady(f"the Stamina plugin is not reachable: {err}") from err
 
+    await _async_title_destinations(hass, entry)
+    async_file_area_devices(hass, entry)
     index = EventIndex(hass, hass.config.path(INDEX_FILENAME))
     await index.async_open()
 
@@ -157,6 +160,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: StaminaConfigEntry) -> b
     return True
 
 
+async def _async_title_destinations(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Title each destination by its provider, adding the account when two share one.
+
+    So the integration page reads "OneDrive", not "OneDrive — OneDrive". Run at every setup,
+    which a destination added or removed causes, so a second one of a provider retitles the
+    first too.
+    """
+    owners = {
+        subentry.subentry_id: owner
+        for subentry in entry.subentries.values()
+        if subentry.subentry_type == SUBENTRY_TYPE_DESTINATION
+        and (
+            owner := hass.config_entries.async_get_entry(
+                str(subentry.data.get(CONF_DESTINATION_ENTRY))
+            )
+        )
+    }
+    shared = Counter(owner.domain for owner in owners.values())
+    for subentry_id, owner in owners.items():
+        try:
+            provider = (await async_get_integration(hass, owner.domain)).name
+        except IntegrationNotFound:
+            provider = owner.domain
+        title = provider if shared[owner.domain] == 1 else f"{provider} ({owner.title})"
+        subentry = entry.subentries[subentry_id]
+        if subentry.title != title:
+            hass.config_entries.async_update_subentry(entry, subentry, title=title)
+
+
 @callback
 def _async_drop_old_entities(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:
     """Remove what the per-area Uploads selects replaced, and what the old select did.
@@ -188,10 +220,13 @@ def _async_tell_uploads_moved(hass: HomeAssistant, entry: StaminaConfigEntry) ->
     """
     registry = er.async_get(hass)
     selects = []
-    for key, subentry in sorted(area_subentries(entry).items(), key=lambda i: i[1].title):
+    areas = entry.runtime_data.manager.areas
+    for key, title in sorted(areas.items(), key=lambda item: item[1]):
         unique_id = f"{entry.entry_id}_area_{key}_uploads"
         entity_id = registry.async_get_entity_id("select", DOMAIN, unique_id)
-        selects.append(entity_id or f"select.stamina_{slug_of(subentry).replace('-', '_')}_uploads")
+        selects.append(
+            entity_id or f"select.stamina_{slug_of(key, title).replace('-', '_')}_uploads"
+        )
     ir.async_create_issue(
         hass,
         DOMAIN,
@@ -205,30 +240,21 @@ def _async_tell_uploads_moved(hass: HomeAssistant, entry: StaminaConfigEntry) ->
 
 
 def _reload_key(entry: ConfigEntry) -> tuple[Any, ...]:
-    """Return what a reload depends on: everything but the area subentries.
-
-    Those the integration manages itself while running; adding or renaming one must not
-    restart the link.
-    """
+    """Return what a reload depends on: the data, the options and the destinations."""
     return (
         dict(entry.data),
         dict(entry.options),
         {
             subentry_id: (subentry.subentry_type, subentry.title, dict(subentry.data))
             for subentry_id, subentry in entry.subentries.items()
-            if subentry.subentry_type != SUBENTRY_TYPE_AREA
         },
     )
 
 
 async def _async_reload(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:
-    """Reload when options or destinations change; re-sync when only areas did.
-
-    An area subentry deleted by hand comes back at once.
-    """
+    """Reload when the options or the destinations change, not on an update to nothing."""
     data = getattr(entry, "runtime_data", None)
     if data is not None and data.reload_key == _reload_key(entry):
-        data.manager.async_sync_areas()
         return
     await hass.config_entries.async_reload(entry.entry_id)
 

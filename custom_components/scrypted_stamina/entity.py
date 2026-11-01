@@ -4,7 +4,7 @@ Per-camera entities sit on a Stamina device per camera, named like the camera an
 its `scrypted_mqtt` device when there is one (see `devices.py`). Integration-wide entities
 sit on one "Scrypted Stamina" service device; each destination's on a device of its own,
 named after the destination and filed under its subentry; and each area's (its Uploads
-select and quota) on a device named after the area, filed under the area's
+select and quota) on a device named after the area, filed under the first destination's
 subentry (`areas.py`).
 """
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from homeassistant.config_entries import ConfigEntry, ConfigSubentry
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
@@ -20,7 +20,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .areas import area_identifier, area_subentries, slug_of
+from .areas import area_home, area_identifier, slug_of
 from .const import DOMAIN, signal_areas, signal_camera, signal_cameras, signal_update
 from .devices import async_ensure_device
 from .manager import CameraStatus, StaminaManager
@@ -61,11 +61,11 @@ def destination_device(entry: ConfigEntry, subentry_id: str, title: str, hub_id:
     )
 
 
-def area_device(entry: ConfigEntry, subentry: ConfigSubentry, hub_id: str) -> DeviceInfo:
+def area_device(entry: ConfigEntry, key: str, title: str, hub_id: str) -> DeviceInfo:
     """Return one area's device, under the hub."""
     return DeviceInfo(
-        identifiers={area_identifier(entry.entry_id, str(subentry.unique_id))},
-        name=subentry.title,
+        identifiers={area_identifier(entry.entry_id, key)},
+        name=title,
         manufacturer="Scrypted",
         model="Stamina area",
         entry_type=DeviceEntryType.SERVICE,
@@ -134,15 +134,15 @@ class AreaEntity(StaminaEntity):
     key: str = ""
     platform_domain: str = ""
 
-    def __init__(self, manager: StaminaManager, subentry: ConfigSubentry, hub_id: str) -> None:
+    def __init__(self, manager: StaminaManager, key: str, title: str, hub_id: str) -> None:
         """Bind to an area."""
         super().__init__(manager)
-        self.area = str(subentry.unique_id)
-        self._attr_unique_id = f"{manager.entry.entry_id}_area_{self.area}_{self.key}"
-        self._attr_device_info = area_device(manager.entry, subentry, hub_id)
+        self.area = key
+        self._attr_unique_id = f"{manager.entry.entry_id}_area_{key}_{self.key}"
+        self._attr_device_info = area_device(manager.entry, key, title, hub_id)
         self._attr_translation_key = self.key
         # A suggestion, `<domain>.stamina_<area>_<key>`: the id stays if the area is renamed.
-        slug = slug_of(subentry).replace("-", "_")
+        slug = slug_of(key, title).replace("-", "_")
         self.entity_id = f"{self.platform_domain}.stamina_{slug}_{self.key}"
 
 
@@ -151,28 +151,36 @@ def async_setup_per_area(
     hass: HomeAssistant,
     manager: StaminaManager,
     add: AddConfigEntryEntitiesCallback,
-    build: Callable[[ConfigSubentry, str], list[Entity]],
+    build: Callable[[str, str, str], list[Entity]],
     on_remove: Callable[[Callable[[], None]], None],
 ) -> None:
-    """Add entities for every area subentry now, and for those added later.
+    """Add entities for every area holding a camera now, and follow the areas after.
 
-    A removed subentry takes its devices and entities with it (Home Assistant clears them);
-    they are waited for before the same area's entities are added again, as when a
-    subentry deleted by hand comes back.
+    An area that comes is added, filed under `area_home`; one renamed renames its device; one
+    no camera is in any more goes, its device and entities with it.
     """
     entry = manager.entry
     known: dict[str, list[Entity]] = {}
 
     async def _async_sync() -> None:
-        current = {subentry.subentry_id: subentry for subentry in area_subentries(entry).values()}
-        for subentry_id in [s for s in known if s not in current]:
-            for entity in known.pop(subentry_id):
+        current = dict(manager.areas)
+        devices = dr.async_get(hass)
+        for key in [k for k in known if k not in current]:
+            for entity in known.pop(key):
                 await entity.async_remove(force_remove=True)
+            identifier = area_identifier(entry.entry_id, key)
+            if device := devices.async_get_device_by_identifier(identifier, entry.entry_id):
+                devices.async_remove_device(device.id)
         hub_id = async_hub_device_id(hass, entry)
-        for subentry_id, subentry in current.items():
-            if subentry_id not in known:
-                known[subentry_id] = build(subentry, hub_id)
-                add(known[subentry_id], config_subentry_id=subentry_id)
+        for key, title in current.items():
+            if key not in known:
+                known[key] = build(key, title, hub_id)
+                add(known[key], config_subentry_id=area_home(entry))
+                continue
+            identifier = area_identifier(entry.entry_id, key)
+            device = devices.async_get_device_by_identifier(identifier, entry.entry_id)
+            if device is not None and device.name != title:
+                devices.async_update_device(device.id, name=title)
 
     @callback
     def _schedule() -> None:

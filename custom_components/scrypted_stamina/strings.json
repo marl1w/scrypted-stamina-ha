@@ -93,10 +93,6 @@
         "no_destination": "No storage integration is set up, or each is already a destination. Set up Synology DSM, WebDAV, SFTP Storage, OneDrive or Google Drive first.",
         "reconfigure_successful": "The destination was updated."
       }
-    },
-    "area": {
-      "title": "Area",
-      "entry_type": "Area"
     }
   },
   "options": {

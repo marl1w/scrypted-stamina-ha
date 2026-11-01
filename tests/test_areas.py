@@ -1,8 +1,11 @@
-"""Area subentries: one per area with a camera, each with its own Uploads and quota."""
+"""Area devices: one per area with a camera, under the destination, with Uploads and quota."""
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 from homeassistant.components.media_source import async_browse_media
+from homeassistant.config_entries import ConfigSubentry
 from homeassistant.helpers import (
     area_registry as ar,
     device_registry as dr,
@@ -15,7 +18,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.scrypted_stamina.const import (
     DOMAIN,
     INDEX_FILENAME,
-    SUBENTRY_TYPE_AREA,
+    SUBENTRY_TYPE_DESTINATION,
     UPLOADS_CLASSES,
     UPLOADS_OFF,
 )
@@ -54,29 +57,34 @@ def two_areas(hass, stamina):
     return garden, driveway, front, gate
 
 
-def areas_of(entry) -> dict[str, str]:
-    return {s.unique_id: s.title for s in entry.get_subentries_of_type(SUBENTRY_TYPE_AREA)}
+def destination_id(entry) -> str:
+    return entry.get_subentries_of_type(SUBENTRY_TYPE_DESTINATION)[0].subentry_id
 
 
-async def test_one_subentry_and_device_per_area(hass, stamina, setup) -> None:
-    garden, driveway, _, _ = two_areas(hass, stamina)
+def area_device_names(hass, entry) -> set[str]:
+    return {
+        device.name
+        for device in dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id)
+        if device.model == "Stamina area"
+    }
+
+
+async def test_one_device_per_area_under_the_destination(hass, stamina, setup) -> None:
+    two_areas(hass, stamina)
     entry = await setup()
-    assert areas_of(entry) == {garden.id: "Garden", driveway.id: "Driveway"}
-    # Managed by the integration: there is no flow to add one by hand.
-    assert SUBENTRY_TYPE_AREA not in entry.supported_subentry_types
+    # The destination is the only subentry: the areas are its devices, not entries.
+    assert [s.subentry_type for s in entry.subentries.values()] == [SUBENTRY_TYPE_DESTINATION]
+    assert area_device_names(hass, entry) == {"Garden", "Driveway"}
 
     devices, entities = dr.async_get(hass), er.async_get(hass)
     hub = devices.async_get_device_by_identifier((DOMAIN, entry.entry_id), entry.entry_id)
-    subentry = next(
-        s for s in entry.get_subentries_of_type(SUBENTRY_TYPE_AREA) if s.title == "Garden"
-    )
     for entity_id in (GARDEN, GARDEN_QUOTA):
         item = entities.async_get(entity_id)
         assert item is not None, entity_id
-        assert item.config_subentry_id == subentry.subentry_id
+        assert item.config_subentry_id == destination_id(entry)
         device = devices.async_get(item.device_id)
         assert device.name == "Garden"
-        assert device.config_subentry_id == subentry.subentry_id
+        assert device.config_subentry_id == destination_id(entry)
         assert device.via_device_id == hub.id
     assert hass.states.get(GARDEN).state == UPLOADS_CLASSES
     assert float(hass.states.get(GARDEN_QUOTA).state) == 0
@@ -152,21 +160,23 @@ async def test_a_camera_moved_to_another_area_regroups(hass, stamina, setup) -> 
         "select", "select_option", {"entity_id": DRIVEWAY, "option": "off"}, blocking=True
     )
 
-    # Both cameras in Driveway: Garden's subentry goes, with its device and entities.
+    # Both cameras in Driveway: Garden's device goes, with its entities.
     dr.async_get(hass).async_update_device(front.id, area_id=driveway.id)
     await hass.async_block_till_done()
-    assert areas_of(entry) == {driveway.id: "Driveway"}
+    assert manager.areas == {driveway.id: "Driveway"}
+    assert area_device_names(hass, entry) == {"Driveway"}
     assert er.async_get(hass).async_get(GARDEN) is None
+    assert hass.states.get(GARDEN) is None
     assert manager.cameras["38"].device.area_id == driveway.id
     eid = event_id(510)
     stamina.start(eid, camera="38", subjects=[subject("s1")])
     await until(lambda: eid in manager.records)
     assert manager.records[eid].upload_mode == "off"
 
-    # A renamed area renames its subentry and device; the entity ids stay.
+    # A renamed area renames its device; the entity ids stay.
     ar.async_get(hass).async_update(driveway.id, name="Front yard")
     await hass.async_block_till_done()
-    assert areas_of(entry) == {driveway.id: "Front yard"}
+    assert manager.areas == {driveway.id: "Front yard"}
     device = dr.async_get(hass).async_get(er.async_get(hass).async_get(DRIVEWAY).device_id)
     assert device.name == "Front yard"
 
@@ -175,19 +185,53 @@ async def test_a_camera_moved_to_another_area_regroups(hass, stamina, setup) -> 
     await hass.config_entries.async_unload(entry.entry_id)
 
 
-async def test_a_hand_deleted_area_comes_back(hass, stamina, setup) -> None:
+async def test_old_area_subentries_fold_into_the_destination(hass, stamina, setup) -> None:
+    """An upgrade moves each area's device and entities, then deletes its subentry."""
     garden, _, _, _ = two_areas(hass, stamina)
-    entry = await setup()
-    manager = entry.runtime_data.manager
-    await manager.async_set_uploads("off", garden.id)
-    subentry = next(
-        s for s in entry.get_subentries_of_type(SUBENTRY_TYPE_AREA) if s.title == "Garden"
+    entry = make_entry(hass, stamina)
+    old = ConfigSubentry(
+        data=MappingProxyType({"area_id": garden.id}),
+        subentry_type="area",
+        title="Garden",
+        unique_id=garden.id,
     )
-    hass.config_entries.async_remove_subentry(entry, subentry.subentry_id)
-    await hass.async_block_till_done()
-    await until(lambda: garden.id in areas_of(entry))
-    await until(lambda: (state := hass.states.get(GARDEN)) is not None and state.state == "off")
-    assert entry.runtime_data.manager is manager
+    hass.config_entries.async_add_subentry(entry, old)
+    devices, entities = dr.async_get(hass), er.async_get(hass)
+    device = devices.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        config_subentry_id=old.subentry_id,
+        identifiers={(DOMAIN, f"{entry.entry_id}_area_{garden.id}")},
+        name="Garden",
+    )
+    select = entities.async_get_or_create(
+        "select",
+        DOMAIN,
+        f"{entry.entry_id}_area_{garden.id}_uploads",
+        config_entry=entry,
+        config_subentry_id=old.subentry_id,
+        device_id=device.id,
+        suggested_object_id="stamina_garden_uploads",
+    )
+    entities.async_update_entity(select.entity_id, name="Garden alarm uploads")
+
+    await setup(entry=entry)
+    assert [s.subentry_type for s in entry.subentries.values()] == [SUBENTRY_TYPE_DESTINATION]
+    item = entities.async_get(GARDEN)
+    assert item.id == select.id and item.name == "Garden alarm uploads"
+    assert item.config_subentry_id == destination_id(entry)
+    assert item.device_id == device.id
+    assert devices.async_get(device.id).config_subentry_id == destination_id(entry)
+    assert hass.states.get(GARDEN) is not None
+    assert area_device_names(hass, entry) == {"Garden", "Driveway"}
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_without_a_destination_the_areas_sit_on_the_entry(hass, stamina, setup) -> None:
+    two_areas(hass, stamina)
+    entry = await setup(destinations=0)
+    item = er.async_get(hass).async_get(GARDEN)
+    assert item.config_subentry_id is None
+    assert dr.async_get(hass).async_get(item.device_id).config_subentry_id is None
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -242,14 +286,14 @@ async def test_the_old_area_sensors_are_removed(hass, stamina, setup) -> None:
     entry = await setup()
     registry = er.async_get(hass)
     garden = next(
-        s for s in entry.get_subentries_of_type(SUBENTRY_TYPE_AREA) if s.title == "Garden"
+        key for key, title in entry.runtime_data.manager.areas.items() if title == "Garden"
     )
     old = registry.async_get_or_create(
         "sensor",
         DOMAIN,
-        f"{entry.entry_id}_area_{garden.unique_id}_status",
+        f"{entry.entry_id}_area_{garden}_status",
         config_entry=entry,
-        config_subentry_id=garden.subentry_id,
+        config_subentry_id=destination_id(entry),
     )
     await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done()

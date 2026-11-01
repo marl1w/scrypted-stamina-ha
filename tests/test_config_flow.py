@@ -131,7 +131,7 @@ async def test_destination_subentry_from_a_loaded_storage_integration(hass, stam
     )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     (subentry,) = entry.get_subentries_of_type(SUBENTRY_TYPE_DESTINATION)
-    assert subentry.title == "SFTP Storage — Backup box"
+    assert subentry.title == "SFTP Storage"
     assert subentry.data[CONF_QUOTA_GB] == 20
 
     # The same storage cannot be added twice.

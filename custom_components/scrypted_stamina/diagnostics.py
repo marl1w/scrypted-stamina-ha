@@ -15,7 +15,6 @@ from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
 from . import StaminaConfigEntry
-from .areas import area_subentries
 from .const import CONF_TOKEN, CONF_URL
 from .redact import scrub_credentials
 
@@ -68,10 +67,7 @@ async def async_get_config_entry_diagnostics(
         },
         "uploads": {
             "default": manager.default_uploads,
-            "areas": {
-                subentry.title: manager.uploads_for(key)
-                for key, subentry in area_subentries(entry).items()
-            },
+            "areas": {title: manager.uploads_for(key) for key, title in manager.areas.items()},
         },
         "uploader": {
             "queue": manager.uploader.queue,

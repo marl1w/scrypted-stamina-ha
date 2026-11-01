@@ -1,6 +1,6 @@
 """Each area's Uploads select: what that area's cameras upload (architecture §3.7).
 
-One per area subentry (`areas.py`), e.g. `select.stamina_garden_uploads`, so each area's
+One per area that holds a camera (`areas.py`), e.g. `select.stamina_garden_uploads`, so each area's
 own alarm automation can switch it. Three positions. "Chosen classes": unusual events, and
 ordinary events with a confirmed subject of a class chosen in the options. "Unusual only".
 "Off": nothing is uploaded and no upload starts, not even to `pending/`; events are still
@@ -9,7 +9,7 @@ alone.
 
 Each event takes its camera's area's position at its start, so a change applies to new
 events only; an event already under way finishes its normal decision. The positions are
-kept in the index (by area id), so they survive restarts and an area's subentry coming and
+kept in the index (by area id), so they survive restarts and an area's device coming and
 going; an area never set takes the old integration-wide select's position.
 """
 
@@ -35,7 +35,7 @@ async def async_setup_entry(
         hass,
         manager,
         async_add_entities,
-        lambda subentry, hub_id: [UploadsSelect(manager, subentry, hub_id)],
+        lambda key, title, hub_id: [UploadsSelect(manager, key, title, hub_id)],
         entry.async_on_unload,
     )
 

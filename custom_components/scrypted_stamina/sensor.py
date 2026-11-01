@@ -18,10 +18,10 @@ On each destination's device (filed under its subentry):
 * health: `ok`, or `failing` after `HEALTH_FAILURES` failed operations in a row (uploads,
   commits, evictions), with the last error as an attribute.
 
-On each area's device (filed under its subentry, `areas.py`), quota used: the bytes the
-area's events hold on the destination (by the area each was filed under at its start), with
-the share of the quota, what the area has uploading and held for the follow-up window, and
-the last error. Health stays on the destinations: a failure is not per area.
+On each area's device (filed under the first destination's subentry, `areas.py`), quota
+used: the bytes the area's events hold on the destination (by the area each was filed under
+at its start), with the share of the quota, what the area has uploading and held for the
+follow-up window, and the last error. Health stays on the destinations: a failure is not per area.
 """
 
 from __future__ import annotations
@@ -94,7 +94,7 @@ async def async_setup_entry(
         hass,
         manager,
         async_add_entities,
-        lambda subentry, hub_id: [cls(manager, subentry, hub_id) for cls in AREA_SENSORS],
+        lambda key, title, hub_id: [cls(manager, key, title, hub_id) for cls in AREA_SENSORS],
         entry.async_on_unload,
     )
 

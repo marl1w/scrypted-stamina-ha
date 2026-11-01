@@ -97,11 +97,6 @@ DEFAULT_HISTORY_SIZE_MB: Final = 200
 # ------------------------------------------------------------------ destinations
 
 SUBENTRY_TYPE_DESTINATION: Final = "destination"
-# One per area that holds a camera, managed by the integration (`areas.py`); unique id: the
-# area id, or `NO_AREA` for cameras without one.
-SUBENTRY_TYPE_AREA: Final = "area"
-CONF_AREA_ID: Final = "area_id"
-NO_AREA_TITLE: Final = "No area"
 CONF_DESTINATION_ENTRY: Final = "destination_entry"
 CONF_FOLDER: Final = "folder"
 CONF_QUOTA_GB: Final = "quota_gb"
@@ -249,5 +244,5 @@ def signal_cameras(entry_id: str) -> str:
 
 
 def signal_areas(entry_id: str) -> str:
-    """Return the dispatcher signal fired when the area subentries change."""
+    """Return the dispatcher signal fired when the areas holding a camera change."""
     return f"{DOMAIN}_{entry_id}_areas"

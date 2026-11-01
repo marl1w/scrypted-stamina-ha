@@ -72,7 +72,7 @@ async def test_without_scrypted_mqtt_a_device_per_camera_is_created(hass, setup)
     assert state.attributes["learning"] is True
     assert hass.states.get("binary_sensor.front_door_unusual").state == "off"
     assert hass.states.get("select.stamina_no_area_uploads").state == "classes"
-    assert float(hass.states.get("sensor.webdav_nas_0_quota_used").state) == 0
+    assert float(hass.states.get("sensor.webdav_quota_used").state) == 0
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -128,7 +128,8 @@ async def test_hub_and_destination_devices(hass, setup) -> None:
         device = devices.async_get_device_by_identifier(
             (DOMAIN, f"{entry.entry_id}_{subentry_id}"), entry.entry_id
         )
-        assert device.name == f"WebDAV — NAS {n}"
+        # Two of one provider: each titled with its account too.
+        assert device.name == f"WebDAV (NAS {n})"
         assert device.via_device_id == hub.id
         # Filed under the subentry, so Home Assistant lists them with the destination.
         assert device.config_entry_id == entry.entry_id
@@ -164,7 +165,9 @@ async def test_the_quota_sensor_keeps_its_id_and_history(hass, stamina, setup) -
     assert item.entity_id == "sensor.stamina_quota_used_webdav_nas_0"
     assert item.config_subentry_id == subentry_id
     device = dr.async_get(hass).async_get(item.device_id)
-    assert device.name == "WebDAV — NAS 0"
+    # Titled by provider alone: the old "WebDAV — NAS 0" title is migrated.
+    assert entry.subentries[subentry_id].title == "WebDAV"
+    assert device.name == "WebDAV"
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -183,13 +186,13 @@ async def test_health_turns_failing_on_repeated_failures(
     target = next(iter(manager.uploader.targets.values()))
     await until(lambda: not target.healthy)
     manager._changed()
-    await until(lambda: hass.states.get(DESTINATION[3]).state == "failing")
-    state = hass.states.get(DESTINATION[3])
+    await until(lambda: hass.states.get("sensor.webdav_health").state == "failing")
+    state = hass.states.get("sensor.webdav_health")
     assert "refused" in state.attributes["last_error"]
     assert state.attributes["failures_in_a_row"] >= 3
 
     # Any operation that goes through again makes it healthy (the breaker closing).
     target.succeeded()
     manager._changed()
-    await until(lambda: hass.states.get(DESTINATION[3]).state == "ok")
+    await until(lambda: hass.states.get("sensor.webdav_health").state == "ok")
     await hass.config_entries.async_unload(entry.entry_id)

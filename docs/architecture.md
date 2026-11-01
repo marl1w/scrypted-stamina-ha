@@ -254,7 +254,7 @@ Since Home Assistant 2026.8 a device belongs to exactly one config entry, so Sta
 | `binary_sensor.<cam>_unusual` | On while an unusual event is open; pulses on for a late unusual |
 | `sensor.<cam>_last_event_score` | Latest score, 0 to 1 |
 
-Integration-wide entities sit on a "Scrypted Stamina" service device; each destination and each area has a service device of its own under it, filed under its subentry (`config_subentry_id`). Each area with a camera has a subentry of type `area`, keyed by area id ("No area" for cameras without one), which the integration adds, renames and removes as cameras move between areas (there is no flow to add one; one deleted by hand comes back). Changes to area subentries do not reload the entry.
+Integration-wide entities sit on a "Scrypted Stamina" service device; each destination and each area has a service device of its own under it. A destination's device is filed under its subentry (`config_subentry_id`), titled by provider alone ("OneDrive"), with the account added when two destinations share a provider. Each area with a camera has a device keyed by area id ("No area" for cameras without one), filed under the first destination's subentry (on the entry itself when there is none), which the integration adds, renames and removes as cameras move between areas, without reloading the entry. Earlier versions gave each area a subentry of its own; setup moves those devices and entities onto the destination, keeping their entity ids, and deletes the subentries.
 
 | Device | Entities | Meaning |
 |---|---|---|
