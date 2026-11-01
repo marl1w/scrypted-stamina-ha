@@ -9,7 +9,10 @@
  *   2. otherwise Home Assistant's own <ha-hls-player> (hls.js, shipped with the frontend);
  *   3. otherwise it says so, rather than showing a black box.
  *
- * Muted autoplay with `playsinline`, so a tap on an event plays it at once on a phone too.
+ * Nothing streams until it is asked for: playing pulls the video from the camera's recorder,
+ * so an event opens on its thumbnail with a play button, and only a press (`play: true` once
+ * the viewer has pressed it for this event) fetches anything. Then muted autoplay with
+ * `playsinline`, so the press is all it takes on a phone too.
  */
 
 import { el, icon, replace } from "./dom.js";
@@ -77,24 +80,13 @@ function message(box, posterUrl, iconName, title, body) {
 }
 
 /**
- * Play `url` in `box`. Returns a function that stops playback and releases the stream.
- *
- * `url` null shows `unavailable` ({title, body}) over the poster instead. When playback
- * fails, `onError()` is called first; if it returns true it has taken over (for example by
- * playing the cloud copy), otherwise the failure is shown.
+/**
+ * Stream `url` into `box` at once. Returns a function that stops it; `isStopped()` tells a
+ * late callback that the box has moved on.
  */
-export function mountPlayer(box, { hass, url, posterUrl, unavailable, onError }) {
-  let stopped = false;
-  let stop = () => {};
-  box.classList.add("player");
-
-  if (!url) {
-    message(box, posterUrl, "mdi:video-off-outline", unavailable?.title || "No video", unavailable?.body);
-    return () => {};
-  }
-
+function stream(box, { hass, url, posterUrl, onError }, isStopped) {
   const failed = () => {
-    if (stopped || onError?.()) return;
+    if (isStopped() || onError?.()) return;
     message(
       box,
       posterUrl,
@@ -118,40 +110,78 @@ export function mountPlayer(box, { hass, url, posterUrl, unavailable, onError })
     video.src = url;
     replace(box, video);
     video.play().catch(() => {});
-    stop = () => {
+    return () => {
       video.removeEventListener("error", failed);
       video.pause();
       video.removeAttribute("src");
       video.load();
     };
-  } else {
-    replace(box, poster(posterUrl), el("div", { class: "player__spinner spinner", role: "status", "aria-label": "Loading" }));
-    haHlsPlayer().then((ok) => {
-      if (stopped) return;
-      if (!ok) {
-        message(
-          box,
-          posterUrl,
-          "mdi:web-off",
-          "This browser cannot play the video here",
-          "Open the event from Home Assistant's media browser, or use the Companion app.",
-        );
-        return;
-      }
-      const player = document.createElement("ha-hls-player");
-      Object.assign(player, {
-        hass,
-        url,
+  }
+
+  let player = null;
+  replace(box, poster(posterUrl), el("div", { class: "player__spinner spinner", role: "status", "aria-label": "Loading" }));
+  haHlsPlayer().then((ok) => {
+    if (isStopped()) return;
+    if (!ok) {
+      message(
+        box,
         posterUrl,
-        controls: true,
-        muted: true,
-        autoPlay: true,
-        playsInline: true,
-      });
-      player.className = "player__video";
-      replace(box, player);
-      stop = () => player.remove();
+        "mdi:web-off",
+        "This browser cannot play the video here",
+        "Open the event from Home Assistant's media browser, or use the Companion app.",
+      );
+      return;
+    }
+    player = document.createElement("ha-hls-player");
+    Object.assign(player, {
+      hass,
+      url,
+      posterUrl,
+      controls: true,
+      muted: true,
+      autoPlay: true,
+      playsInline: true,
     });
+    player.className = "player__video";
+    replace(box, player);
+  });
+  return () => player?.remove();
+}
+
+/**
+ * Play `url` in `box`. Returns a function that stops playback and releases the stream.
+ *
+ * `url` null shows `unavailable` ({title, body}) over the poster instead. Without `play` the
+ * poster waits under a play button and `onPlay()` is called when it is pressed. When playback
+ * fails, `onError()` is called first; if it returns true it has taken over (for example by
+ * playing the cloud copy), otherwise the failure is shown.
+ */
+export function mountPlayer(box, options) {
+  const { url, posterUrl, unavailable, play = false, onPlay } = options;
+  let stopped = false;
+  let stop = () => {};
+  box.classList.add("player");
+
+  if (!url) {
+    message(box, posterUrl, "mdi:video-off-outline", unavailable?.title || "No video", unavailable?.body);
+    return () => {};
+  }
+
+  const start = () => {
+    if (stopped) return;
+    onPlay?.();
+    stop = stream(box, options, () => stopped);
+  };
+  if (play) {
+    start();
+  } else {
+    const cover = posterUrl ? el("img", { class: "player__cover", src: posterUrl, alt: "" }) : null;
+    cover?.addEventListener("error", () => cover.remove(), { once: true });
+    replace(
+      box,
+      cover,
+      el("button", { class: "player__play", title: "Play", "aria-label": "Play the video", onclick: start }, icon("mdi:play")),
+    );
   }
 
   return () => {

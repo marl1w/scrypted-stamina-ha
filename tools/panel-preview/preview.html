@@ -87,7 +87,9 @@ for (let n = 0; n < (CAMERAS.length ? 140 : 0); n++) {
     started: t, ended: live ? null : t + duration, duration,
     classes: cls === "motion" ? ["motion"] : n % 11 === 0 ? [cls, "vehicle"] : [cls],
     unusual, score: unusual ? 0.6 + (n % 4) / 10 : 0.1 + ((n * 7) % 35) / 100,
-    state, reason: unusual ? `Person at 03:1${n % 10} on ${cam.name}: first time in 2 weeks.` : "",
+    state, reason: unusual
+      ? `Person at 03:1${n % 10} on ${cam.name}: first time in 2 weeks.`
+      : `${cls[0].toUpperCase()}${cls.slice(1)} at ${new Date(t * 1000).toTimeString().slice(0, 5)}: usual for ${cam.name}.`,
     late: unusual && n === 9 ? 1 : 0, thumbnail: n % 13 === 12 ? null : thumb(n),
   });
   t -= 600 + ((n * 977) % 5400);
@@ -108,6 +110,8 @@ function detail(row) {
     verified_by: cam.live ? [VERIFIER] : [], seen_by: [PLUGIN],
     score: 0.82, dwell: Math.min(row.duration || 4, 14),
   }));
+  // The same thing reported by a second source: the panel shows it once.
+  if (subjects.length) subjects.push({ ...subjects[0], seen_by: ["@example/second-detector"], dwell: 3 });
   const reasons = row.unusual ? [
     { term: "clock", subject: null, label: "03:12", weight: 1.84 },
     { term: "predecessor", subject: null, label: "90s after Driveway", weight: 1.12 },

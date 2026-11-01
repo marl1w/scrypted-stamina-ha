@@ -222,3 +222,17 @@ export function usualness(score, unusual) {
   if (score >= 0.35) return { label: "Uncommon", tone: "mid", fill };
   return { label: "Usual", tone: "low", fill };
 }
+
+/**
+ * How unusual one signal was, from its share of the score: nats rarer than chance, only ever
+ * positive (the common ones are not sent). Half a nat is where the sentence starts naming a
+ * signal, so below it a signal reads "Usual".
+ */
+export function signalLevel(weight) {
+  const w = Math.max(0, Number(weight) || 0);
+  const fill = Math.max(0.04, Math.min(1, 1 - Math.exp(-w)));
+  if (w >= 2) return { label: "Very rare", tone: "high", fill };
+  if (w >= 1) return { label: "Rare", tone: "unusual", fill };
+  if (w >= 0.5) return { label: "Uncommon", tone: "mid", fill };
+  return { label: "Usual", tone: "low", fill };
+}

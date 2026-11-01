@@ -3,17 +3,21 @@
  *
  * One page, no navigation between views:
  *
- *   Wide (over WIDE_PX): master-detail. The event list is the main column; the selected event
- *   sits on the right at a capped width: it plays at once, with how unusual it was, the
- *   decision and what was seen beneath it. From ROOMY_PX the cameras get their own narrow
- *   column on the left, grouped by area; below that they fold into one line above the list. On open the latest unusual event is selected (else the latest), so
- *   "find the latest unusual and play it" takes no click; a row click or the arrow keys
- *   change only the right side.
+ *   Wide (over WIDE_PX): master-detail. The event list fills the main column; the selected
+ *   event sits on the right at a capped width: its thumbnail under a play button, how unusual
+ *   it was and why, signal by signal, and the details folded beneath. From ROOMY_PX the
+ *   cameras get their own narrow column on the left, grouped by area; below that they fold
+ *   into one line above the list. On open the latest unusual event is selected (else the
+ *   latest); a row click or the arrow keys change only the right side.
  *   Narrow (a phone): the list only. Tapping a row opens that event inline under it; tapping
  *   it again, or another row, closes it.
  *
- * The camera list says how each camera is doing (learning shows as a small bar) and filters
- * the list to a camera or a whole area. Every row carries a usual-to-unusual meter.
+ * Video plays only on a press: playing pulls it from the camera's recorder.
+ *
+ * The camera list says how each camera is doing (online, learning progress, last event) and
+ * filters the list to a camera or a whole area. Every row carries a usual-to-unusual meter,
+ * beside its thumbnail from 720 px (at the row's end on a phone), and the one-line why when
+ * the event was anything but usual.
  * The URL holds only the filters (`?unusual=1&camera=11`) and the selected event
  * (`/event/<id>`), replaced rather than pushed, so Back leaves the panel. Registered through `panel_custom`, so it runs inside Home Assistant's frontend with
  * the real `hass`. Plain ES modules, no build. `tools/panel-preview/` runs it on sample data.
@@ -37,6 +41,7 @@ import {
   joinWords,
   notKept,
   sensorsText,
+  signalLevel,
   sourceName,
   termName,
   usualness,
@@ -145,6 +150,41 @@ function meter(score, unusual, large = false) {
       ? el("span", { class: "meter__legend", "aria-hidden": "true" }, el("span", { text: "Usual" }), el("span", { text: "Unusual" }))
       : null,
   );
+}
+
+/** How unusual one signal was: the same meter, without the camera's line (it has none). */
+function signalMeter(weight) {
+  const level = signalLevel(weight);
+  const pct = Math.round(level.fill * 100);
+  const title = `${level.label}: ${weight.toFixed(2)} rarer than chance`;
+  return el(
+    "span",
+    { class: "meter meter--signal", dataset: { tone: level.tone }, title, role: "img", "aria-label": level.label },
+    el("span", { class: "meter__label", text: level.label }),
+    el("span", { class: "meter__track", "aria-hidden": "true" }, el("span", { class: "meter__fill", style: { width: `${pct}%` } })),
+  );
+}
+
+/**
+ * What was seen, one line per thing: the same class with the same verdict, reported by more
+ * than one source, reads once (with every source, and the longest it stayed).
+ */
+function mergeSubjects(subjects) {
+  const merged = new Map();
+  for (const subject of subjects) {
+    const check = verdictText(subject);
+    const key = `${subject.label || subject.class}|${check.text}`;
+    const known = merged.get(key);
+    if (!known) {
+      merged.set(key, { subject: { ...subject, seen_by: [...(subject.seen_by || [])] }, check });
+      continue;
+    }
+    for (const source of subject.seen_by || []) {
+      if (!known.subject.seen_by.includes(source)) known.subject.seen_by.push(source);
+    }
+    known.subject.dwell = Math.max(known.subject.dwell || 0, subject.dwell || 0) || null;
+  }
+  return [...merged.values()];
 }
 
 /** "Area · Camera" where the area is known and says something the name does not. */
@@ -966,7 +1006,10 @@ class ScryptedStaminaPanel extends HTMLElement {
           live ? badge("Live", "error", el("span", { class: "live-dot" })) : null,
           dropped ? badge("Not kept", "neutral") : null,
         ),
-        item.unusual && item.reason ? el("div", { class: "row__why", text: item.reason }) : null,
+        // Why, in a line, wherever it is not plain usual: the meter already says "Usual".
+        item.reason && usualness(item.score, item.unusual).tone !== "low"
+          ? el("div", { class: `row__why${item.unusual ? "" : " row__why--usual"}`, text: item.reason })
+          : null,
       ),
       meter(item.score, item.unusual),
     );
@@ -983,7 +1026,8 @@ class ScryptedStaminaPanel extends HTMLElement {
 
   _openEvent(id) {
     this._stopVideo();
-    this._event = { id, data: null, error: null, playingKey: undefined, media: null, choice: "auto", open: true };
+    // `pressed`: the viewer asked for the video; nothing streams from the recorder before that.
+    this._event = { id, data: null, error: null, playingKey: undefined, media: null, choice: "auto", open: true, pressed: false };
     this._renderEvent();
     this._loadEvent(id);
   }
@@ -1041,6 +1085,7 @@ class ScryptedStaminaPanel extends HTMLElement {
     replace(
       state.title,
       el("span", { class: "detail__camera", text: cameraLabel(data.area, data.camera_name) }),
+      el("span", { class: "detail__what", text: classList(data.classes) }),
       el("span", { class: "dim", text: `${formatDay(this._hass, data.started)}, ${formatTime(this._hass, data.started, true)}` }),
     );
     const url = state.choice === "cloud" ? data.play.cloud : data.play.url;
@@ -1061,6 +1106,8 @@ class ScryptedStaminaPanel extends HTMLElement {
       url,
       posterUrl: this._thumbs.get(data.id)?.url || data.thumbnail,
       unavailable: this._unavailable(data),
+      play: state.pressed,
+      onPlay: () => (state.pressed = true),
       onError: () => {
         // The recording failed: the cloud copy, when there is one, plays instead.
         if (state.choice === "cloud" || !state.data.play.cloud || this._event !== state) return false;
@@ -1093,7 +1140,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       "span",
       { class: "avails" },
       mark(Boolean(play.recorder), play.recorder ? "Recording" : "No recording"),
-      mark(Boolean(play.cloud), play.cloud ? "Offsite copy" : "No offsite copy"),
+      mark(Boolean(play.cloud), play.cloud ? "Cloud copy" : "No cloud copy"),
     );
     // A choice only between two sources that both have the event; the marks are status only.
     if (!(play.recorder && play.url && play.cloud)) {
@@ -1110,6 +1157,7 @@ class ScryptedStaminaPanel extends HTMLElement {
           class: "link-btn link-btn--small",
           onclick: () => {
             state.choice = toCloud ? "cloud" : "auto";
+            state.pressed = true;
             this._renderEvent();
           },
         },
@@ -1118,20 +1166,15 @@ class ScryptedStaminaPanel extends HTMLElement {
     );
   }
 
-  /** The one card under the player: the verdict, and why. */
+  /** The one card under the player: how unusual, why, and how unusual each signal was. */
   _summaryCard(data) {
     const now = Date.now() / 1000;
-    const reasons = data.unusual ? (data.reasons || []).filter((reason) => reason.label) : [];
-    const top = Math.max(...reasons.map((reason) => reason.weight || 0), 0.01);
+    // Only the signals that made it rarer come through; whatever is not listed was usual.
+    const reasons = (data.reasons || []).filter((reason) => reason.label);
     return el(
       "section",
       { class: "card", "aria-label": "Verdict" },
-      el(
-        "div",
-        { class: "verdict" },
-        meter(data.score, data.unusual, true),
-        el("span", { class: "dim", text: classList(data.classes) }),
-      ),
+      el("div", { class: "verdict" }, meter(data.score, data.unusual, true)),
       data.reason ? el("p", { class: "sentence", text: data.reason }) : null,
       reasons.length
         ? el(
@@ -1143,14 +1186,12 @@ class ScryptedStaminaPanel extends HTMLElement {
                 { class: "reason" },
                 el("span", { class: "reason__term", text: termName(reason) }),
                 el("span", { class: "reason__label", text: reason.label }),
-                reason.weight
-                  ? el("div", { class: "reason__bar", "aria-hidden": "true", style: { width: `${Math.max(4, (reason.weight / top) * 100)}%` } })
-                  : null,
+                typeof reason.weight === "number" ? signalMeter(reason.weight) : null,
               ),
             ),
+            el("p", { class: "reason__rest", text: "Everything else about it was usual for this camera." }),
           )
         : null,
-      data.state === "follow_up" ? el("p", { class: "note" }, icon("mdi:timer-sand", "icon--sm"), decision(data).text) : null,
       !data.finalized && data.follow_up_until && data.follow_up_until > now
         ? el(
             "p",
@@ -1174,7 +1215,7 @@ class ScryptedStaminaPanel extends HTMLElement {
   _detailsCard(data) {
     const state = this._event;
     const verdict = decision(data);
-    const subjects = data.subjects || [];
+    const subjects = mergeSubjects(data.subjects || []);
     const late = data.late_evidence || [];
     const notes = (data.notes || []).map((note) => NOTES[note]).filter(Boolean);
     if (data.gaps) notes.push(`${data.gaps} segment${data.gaps === 1 ? " is" : "s are"} missing from the copy.`);
@@ -1183,8 +1224,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       ? el(
           "div",
           { class: "items" },
-          subjects.map((subject) => {
-            const check = verdictText(subject);
+          subjects.map(({ subject, check }) => {
             const by = joinWords((subject.seen_by || []).map(sourceName));
             const sub = [by ? `Seen by ${by}` : null, subject.dwell ? `for ${formatDuration(subject.dwell)}` : null]
               .filter(Boolean)
@@ -1236,7 +1276,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       : null;
 
     const copies = (data.copies || []).map((copy) => {
-      const status = copy.deleted ? "Removed to free space" : copy.committed ? "Stored" : `Uploading, ${copy.files} files so far`;
+      const status = copy.deleted ? "Removed to free space" : copy.committed ? "Stored" : "Uploading";
       return el(
         "div",
         { class: "item" },
@@ -1259,7 +1299,7 @@ class ScryptedStaminaPanel extends HTMLElement {
         verdict.text ? el("p", { class: "sentence", style: { marginTop: "0" }, text: verdict.text }) : null,
         notes.map((note) => el("p", { class: "note" }, icon("mdi:information-outline", "icon--sm"), note)),
         data.cloud_path
-          ? [el("div", { class: "item__sub", style: { marginTop: "10px" }, text: "Path in each destination" }), el("code", { class: "path", text: data.cloud_path })]
+          ? [el("div", { class: "item__sub", style: { marginTop: "10px" }, text: "File" }), el("code", { class: "path", text: data.cloud_path })]
           : null,
         copies.length ? el("div", { class: "items", style: { marginTop: "12px" } }, copies) : null,
         el("p", { class: "event-id", text: `Event ${data.id}` }),
@@ -1301,7 +1341,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       const byDays = Math.min(1, days / needs.days);
       const byEvents = Math.min(1, events / needs.events);
       return {
-        short: "Learning",
+        short: `Learning ${Math.min(days, needs.days)}/${needs.days} d`,
         text: `Learning what is normal: ${days} of ${needs.days} days, ${events} of ${needs.events} events`,
         tone: "accent",
         progress: Math.min(byDays, byEvents),
@@ -1382,7 +1422,8 @@ class ScryptedStaminaPanel extends HTMLElement {
                   title: `Only ${group.area}`,
                   onclick: () => this._setFilter({ area: on ? "" : group.area, camera: "" }),
                 },
-                group.label,
+                el("span", { text: group.label }),
+                el("span", { class: "cam-group__count", text: String(group.cams.length) }),
               )
             : el("span", { class: "cam-group__label", text: group.label }),
           group.cams.map(row),

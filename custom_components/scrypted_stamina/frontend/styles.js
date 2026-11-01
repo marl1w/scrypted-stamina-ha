@@ -83,8 +83,10 @@ button { border: none; background: none; cursor: pointer; padding: 0; }
 .pane { min-height: 0; overflow: auto; overscroll-behavior: contain; position: relative; }
 .pane--list { flex: 1 1 auto; }
 /* The list is the main column; the event beside it never grows past a sane player width. */
-.split--wide { display: grid; grid-template-columns: minmax(0, 1fr) clamp(380px, 38%, 680px); }
-.split--wide.split--roomy { grid-template-columns: clamp(220px, 15%, 280px) minmax(0, 1fr) clamp(380px, 36%, 680px); }
+.split--wide { display: grid; grid-template-columns: minmax(0, 1fr) clamp(380px, 36%, 640px); }
+.split--wide.split--roomy { grid-template-columns: clamp(220px, 15%, 280px) minmax(0, 1fr) clamp(380px, 32%, 640px); }
+/* Beside the event the list fills its column: no centred gutters on a wide screen. */
+.split--wide .pane--list .page { max-width: none; }
 .split--wide .pane--list { border-right: 1px solid var(--ss-line); }
 .pane--cams { border-right: 1px solid var(--ss-line); background: var(--ss-bg); }
 .pane--detail { background: var(--ss-bg); }
@@ -176,6 +178,7 @@ select.chip {
 .row__camera { color: var(--ss-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 100%; }
 .row__what { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 0.9rem; }
 .row__why { font-size: 0.84rem; color: var(--ss-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row__why--usual { color: var(--ss-dim); }
 
 .badge {
   display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto;
@@ -238,6 +241,15 @@ select.chip {
 .player__title { font-weight: 600; }
 .player__body { font-size: 0.88rem; line-height: 1.45; }
 .player__spinner { position: relative; }
+.player__cover { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.player__play {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 72px; height: 72px; border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6); color: #fff; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+}
+.player__play .icon { --mdc-icon-size: 44px; width: 44px; height: 44px; }
+.player__play:hover { background: rgba(0, 0, 0, 0.75); }
+.player__play:focus-visible { outline-color: #fff; }
 .source-switch { display: flex; justify-content: flex-end; padding: 0 4px; margin-top: -4px; }
 
 .card {
@@ -247,14 +259,18 @@ select.chip {
 .card__title { margin: 16px 0 8px; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ss-dim); }
 .card__title:first-child { margin-top: 0; }
 .verdict { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.detail__what { color: var(--ss-dim); }
 .sentence { margin: 8px 0 0; line-height: 1.5; }
 .note { margin: 10px 0 0; font-size: 0.88rem; color: var(--ss-dim); line-height: 1.45; display: flex; gap: 6px; align-items: flex-start; }
 
 .reasons { display: grid; gap: 10px; margin-top: 14px; }
-.reason { display: grid; grid-template-columns: 6.5em 1fr; gap: 2px 10px; align-items: center; }
+.reason { display: grid; grid-template-columns: 6.5em minmax(0, 1fr) auto; gap: 2px 10px; align-items: center; }
 .reason__term { font-size: 0.82rem; color: var(--ss-dim); }
-.reason__label { font-weight: 500; }
-.reason__bar { grid-column: 2; height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--ss-unusual) 70%, transparent); }
+.reason__label { font-weight: 500; min-width: 0; overflow-wrap: anywhere; }
+.reason__rest { margin: 0; font-size: 0.84rem; color: var(--ss-dim); }
+/* Per signal: a word over a bar, no camera line (a signal has none). */
+.meter--signal { width: 84px; }
+.meter--signal .meter__track::after { display: none; }
 
 details.card { padding: 0; }
 details.card > summary {
@@ -302,19 +318,24 @@ details.card[open] > summary::after { transform: rotate(180deg); }
 .cam-all[aria-pressed="true"] { color: var(--ss-text); background: color-mix(in srgb, var(--ss-accent) 14%, transparent); }
 .cam-group { display: flex; flex-direction: column; min-width: 0; }
 .cam-group__label {
+  display: flex; justify-content: space-between; align-items: center;
   align-self: stretch; text-align: left; padding: 8px 10px 2px; border-radius: 8px;
   font-size: 0.72rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ss-dim);
 }
-button.cam-group__label:hover { color: var(--ss-text); }
+/* An area is a filter too: it looks like a row you can press. */
+button.cam-group__label { min-height: 32px; padding-top: 4px; padding-bottom: 4px; }
+button.cam-group__label:hover { color: var(--ss-text); background: color-mix(in srgb, var(--ss-accent) 6%, transparent); }
+.cam-group__count { font-weight: 500; letter-spacing: 0; font-variant-numeric: tabular-nums; }
 .cam-group__label[aria-pressed="true"] { color: var(--ss-text); background: color-mix(in srgb, var(--ss-accent) 14%, transparent); }
 .cam-chip {
-  display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 8px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px;
   width: 100%; min-height: 36px; padding: 4px 10px; border-radius: 8px; text-align: left;
 }
 .cam-chip:hover { background: color-mix(in srgb, var(--ss-accent) 6%, transparent); }
 .cam-chip[aria-pressed="true"] { background: color-mix(in srgb, var(--ss-accent) 18%, transparent); }
-.cam-chip__name { font-weight: 500; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cam-chip__state { display: inline-flex; align-items: center; gap: 6px; font-size: 0.76rem; color: var(--ss-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.cam-chip__name { flex: 1 1 auto; min-width: 0; font-weight: 500; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A long state drops under the name rather than cutting it short. */
+.cam-chip__state { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 0.76rem; color: var(--ss-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .cam-chip[data-tone="error"] .cam-chip__state { color: color-mix(in srgb, var(--ss-error) 70%, var(--ss-text)); }
 .mini { width: 28px; height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--ss-accent) 22%, transparent); overflow: hidden; }
 .mini > span { display: block; height: 100%; background: var(--ss-accent); }
@@ -345,13 +366,16 @@ button.cam-group__label:hover { color: var(--ss-text); }
   color: color-mix(in srgb, var(--tone) 45%, var(--ss-text));
 }
 .meter[data-tone="none"] .meter__label { font-weight: 500; color: var(--ss-dim); background: none; padding-left: 0; }
+/* Most events are usual: in the list that word stays plain, so only what is not stands out. */
+.meter:not(.meter--large)[data-tone="low"] .meter__label { font-weight: 500; color: var(--ss-dim); background: none; padding-left: 0; }
 .meter__track {
-  position: relative; height: 6px; border-radius: 3px; overflow: hidden;
+  position: relative; height: 6px; border-radius: 3px;
   background: color-mix(in srgb, var(--ss-text) 10%, transparent);
 }
+/* The camera's line: a tick that stands out of the track, not a cut through the fill. */
 .meter__track::after {
-  content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; margin-left: -1px;
-  background: var(--ss-surface); opacity: 0.9;
+  content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 2px; margin-left: -1px;
+  border-radius: 1px; background: var(--ss-dim);
 }
 .meter__fill { display: block; height: 100%; border-radius: 3px; background: var(--tone); }
 .meter--large { width: min(100%, 280px); gap: 6px; }
@@ -368,6 +392,8 @@ button.cam-group__label:hover { color: var(--ss-text); }
 .row.is-selected { background: color-mix(in srgb, var(--ss-accent) 14%, var(--ss-surface)); }
 .detail { background: var(--ss-bg); }
 .rows > .detail { padding: 8px 0 4px; }
+/* Under its row the event needs no title: the row right above says the same. */
+.rows > .detail .detail__title { display: none; }
 .detail__title { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 0 12px; }
 .detail__camera { font-weight: 600; font-size: 1.05rem; }
 .avails { display: inline-flex; gap: 12px; margin-right: auto; padding: 0 8px; flex-wrap: wrap; }
@@ -378,7 +404,7 @@ button.cam-group__label:hover { color: var(--ss-text); }
 
 /* ------------------------------------------------------------------ wide */
 
-.pane--detail .event { padding: 16px; gap: 16px; max-width: 680px; }
+.pane--detail .event { padding: 16px; gap: 16px; max-width: 640px; }
 .pane--detail .detail__title { padding: 0; }
 .pane--detail .event__media .player { border-radius: var(--ss-radius); }
 .pane--detail .event .card { margin: 0; }
@@ -386,7 +412,9 @@ button.cam-group__label:hover { color: var(--ss-text); }
 @media (min-width: 720px) {
   .thumb { width: 128px; }
   .row { gap: 14px; }
-  .row .meter { width: 104px; }
+  /* The meter sits by the thumbnail: one column to scan, never a long way from the row's text. */
+  .row .meter { width: 104px; order: -1; }
+  .row .thumb { order: -2; }
   .row { padding-left: 18px; }
   .rows { border-radius: var(--ss-radius); border: 1px solid var(--ss-line); overflow: hidden; margin: 0 12px; }
 }
