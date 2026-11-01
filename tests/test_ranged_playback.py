@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+from aiohttp import web
 import pytest
 
 from custom_components.scrypted_stamina import playback
@@ -12,6 +13,7 @@ from custom_components.scrypted_stamina.decider import EventState
 from custom_components.scrypted_stamina.destinations import (
     DestinationError,
     OneDriveDestination,
+    onedrive,
 )
 
 from .conftest import event_id, until
@@ -41,14 +43,14 @@ async def test_onedrive_reads_a_range_from_its_download_url_asked_once() -> None
         if url == URL:
             first, last = kwargs["headers"]["Range"][6:].split("-")
             return b"0123456789"[int(first) : int(last) + 1]
-        return {"id": "1", "@microsoft.graph.downloadUrl": URL}
+        return URL
 
     destination, calls = _onedrive(answer)
     assert await destination.async_read_range(VIDEO, 0, 3) == b"0123"
     assert await destination.async_read_range(VIDEO, 4, 9) == b"456789"
-    lookups = [kwargs for url, kwargs in calls if url != URL]
+    lookups = [(url, kwargs) for url, kwargs in calls if url != URL]
     assert len(lookups) == 1
-    assert lookups[0]["params"] == {"$select": "id,@microsoft.graph.downloadUrl"}
+    assert lookups[0][0].endswith(":/content") and lookups[0][1]["location"] is True
     ranged = [kwargs for url, kwargs in calls if url == URL]
     assert [k["headers"]["Range"] for k in ranged] == ["bytes=0-3", "bytes=4-9"]
     assert all(k["authorize"] is False for k in ranged)
@@ -64,7 +66,7 @@ async def test_onedrive_asks_again_for_a_url_that_stopped_working() -> None:
                 expired = False
                 raise DestinationError("HTTP 401")
             return b"ok"
-        return {"@microsoft.graph.downloadUrl": URL}
+        return URL
 
     destination, calls = _onedrive(answer)
     assert await destination.async_read_range(VIDEO, 0, 1) == b"ok"
@@ -78,7 +80,7 @@ async def test_cancelling_one_reader_does_not_fail_the_others() -> None:
         if url == URL:
             return b"data"
         await release.wait()
-        return {"@microsoft.graph.downloadUrl": URL}
+        return URL
 
     destination, calls = _onedrive(answer)
     first = asyncio.create_task(destination.async_read_range(VIDEO, 0, 3))
@@ -91,6 +93,38 @@ async def test_cancelling_one_reader_does_not_fail_the_others() -> None:
     assert await second == b"data"
     # The shared lookup survived the cancel and was made once.
     assert len([url for url, _ in calls if url != URL]) == 1
+
+
+async def test_onedrive_reads_a_range_where_content_redirects(
+    hass, socket_enabled, aiohttp_server, monkeypatch
+) -> None:
+    """A real HTTP exchange, shaped like a personal OneDrive.
+
+    Asked for `$select=@microsoft.graph.downloadUrl` it answers the item without the URL;
+    `/content` redirects to a pre-authenticated URL that serves ranges. Playback used the
+    first, so every range of a cloud copy failed.
+    """
+
+    async def item(request: web.Request) -> web.Response:
+        assert request.headers["Authorization"] == "Bearer token"
+        if request.path.endswith(":/content"):
+            return web.Response(status=302, headers={"Location": str(request.url.with_path("/dl"))})
+        return web.json_response({"id": "1"})
+
+    async def download(request: web.Request) -> web.Response:
+        assert "Authorization" not in request.headers
+        first, last = request.headers["Range"][6:].split("-")
+        return web.Response(status=206, body=b"0123456789"[int(first) : int(last) + 1])
+
+    app = web.Application()
+    app.router.add_get("/dl", download)
+    app.router.add_get("/{tail:.*}", item)
+    server = await aiohttp_server(app)
+    monkeypatch.setattr(onedrive, "APPROOT", str(server.make_url("/approot")))
+
+    destination = OneDriveDestination(hass, loaded("onedrive"))
+    destination._async_token = AsyncMock(return_value="token")
+    assert await destination.async_read_range(VIDEO, 2, 5) == b"2345"
 
 
 async def test_the_cloud_view_reads_only_the_range_asked_for(

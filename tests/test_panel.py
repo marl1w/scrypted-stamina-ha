@@ -396,7 +396,7 @@ async def test_event_detail(hass, hass_ws_client, stamina_entry) -> None:
     ]
     assert event["learning"] is False and event["notes"] == ["camera_offline"]
     play = event["play"]
-    assert play["recorder"] is True
+    assert "mode=recorder" in play["recorder"] and "sig=" in play["recorder"]
     assert "mode=auto" in play["url"] and "sig=" in play["url"]
     assert "mode=cloud" in play["cloud"]
 
@@ -407,7 +407,7 @@ async def test_event_without_any_video(hass, hass_ws_client, stamina_entry) -> N
     await stamina_entry.index.async_save(rec)
     client = await hass_ws_client(hass)
     event = (await call(client, type=f"{DOMAIN}/event", event_id=rec.id))["event"]
-    assert event["play"] == {"url": None, "recorder": False, "cloud": None, "order": "cloud_first"}
+    assert event["play"] == {"url": None, "recorder": None, "cloud": None, "order": "cloud_first"}
     assert event["cloud_path"] is None and event["learning"] is True
     assert event["subjects"][0]["verified_by"] == []
 
@@ -417,7 +417,7 @@ async def test_event_too_old_for_the_recorder(hass, hass_ws_client, stamina_entr
     await stamina_entry.index.async_save(rec)
     client = await hass_ws_client(hass)
     event = (await call(client, type=f"{DOMAIN}/event", event_id=rec.id))["event"]
-    assert event["play"]["recorder"] is False and event["play"]["url"] is None
+    assert event["play"]["recorder"] is None and event["play"]["url"] is None
 
 
 async def test_event_not_found(hass, hass_ws_client, stamina_entry) -> None:
@@ -603,7 +603,7 @@ async def test_a_slim_row_without_thumbnail_or_footage(hass, hass_ws_client, sta
     assert event["reason"] == "Person at 03:12." and event["classes"] == ["person"]
     assert event["late_evidence"] == [] and event["subjects"][0]["class"] == "person"
     event = (await call(client, type=f"{DOMAIN}/event", event_id=kept.id))["event"]
-    assert event["play"]["cloud"] is not None and event["play"]["recorder"] is False
+    assert event["play"]["cloud"] is not None and event["play"]["recorder"] is None
 
     source = StaminaMediaSource(hass)
     day = dt_util.as_local(dt_util.utc_from_timestamp(gone.facts.started)).date().isoformat()

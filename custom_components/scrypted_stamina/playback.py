@@ -33,6 +33,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 import hashlib
 import hmac
+import logging
 import posixpath
 import re
 import secrets
@@ -62,6 +63,8 @@ if TYPE_CHECKING:
     from .decider import EventRecord
     from .destinations import Destination
     from .index import Copy
+
+_LOGGER = logging.getLogger(__name__)
 
 PLAY_PREFIX = f"/api/{DOMAIN}/play"
 PROXY_PREFIX = f"/api/{DOMAIN}/proxy"
@@ -602,7 +605,8 @@ class CloudView(HomeAssistantView):
         # outright is a clean 502 rather than a cut response.
         try:
             first = await _async_chunk(destination, path, start, end)
-        except DestinationError:
+        except DestinationError as err:
+            _LOGGER.warning("Cannot play %s from %s: %s", event_id, destination.label, err)
             return _response(502)
         out = web.StreamResponse(status=status, headers=headers)
         out.content_length = end - start + 1

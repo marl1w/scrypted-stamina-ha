@@ -1239,7 +1239,8 @@ class ScryptedStaminaPanel extends HTMLElement {
       const order = data.play?.order || this._playbackOrder || "cloud_first";
       state.choice = order !== "recording_first" && data.play.cloud ? "cloud" : "auto";
     }
-    const url = state.choice === "cloud" ? data.play.cloud : data.play.url;
+    // The recording itself when there is one: `url` plays the cloud copy first by default.
+    const url = state.choice === "cloud" ? data.play.cloud : data.play.recorder || data.play.url;
     // Compared without the signature: a refresh re-signs the URL, which is no reason to
     // restart the video.
     if (state.playingKey !== playKey(url)) this._play(url);
@@ -1264,7 +1265,7 @@ class ScryptedStaminaPanel extends HTMLElement {
         if (this._event !== state) return false;
         state.tried.add(state.choice);
         const next = state.choice === "cloud" ? "auto" : "cloud";
-        const other = next === "cloud" ? state.data.play.cloud : state.data.play.recorder && state.data.play.url;
+        const other = next === "cloud" ? state.data.play.cloud : state.data.play.recorder;
         if (!other || state.tried.has(next)) return false;
         state.choice = next;
         queueMicrotask(() => this._renderEvent());

@@ -366,7 +366,9 @@ async def event_detail(
         "gaps": len(record.gaps),
         "play": {
             "url": play_url(hass, entry.entry_id, record.id) if recorder or cloud else None,
-            "recorder": recorder,
+            # Each source on its own, for the panel to fall back from one to the other:
+            # `url` (auto) plays the cloud copy first by default, so it is not the recording.
+            "recorder": play_url(hass, entry.entry_id, record.id, "recorder") if recorder else None,
             "cloud": play_url(hass, entry.entry_id, record.id, "cloud") if cloud else None,
             "order": playback_order(entry.options),
         },

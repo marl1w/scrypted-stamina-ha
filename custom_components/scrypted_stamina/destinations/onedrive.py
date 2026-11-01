@@ -176,8 +176,10 @@ class OneDriveDestination(OAuthDestination):
     async def async_read_range(self, path: str, start: int, end: int) -> bytes:
         """Return bytes `start..end` (inclusive), from the file's pre-authenticated URL.
 
-        The URL is asked of Graph once (`$select`) and kept for 50 minutes (Graph's last
-        about an hour), so each segment a player asks for costs one ranged GET. The lookup
+        The URL is where Graph redirects `/content` to, asked once and kept for 50 minutes
+        (they last about an hour), so each segment a player asks for costs one ranged GET.
+        Not `$select=@microsoft.graph.downloadUrl`: a personal OneDrive does not answer that
+        with the URL, and the redirect is how every account downloads. The lookup
         runs as a task of its own that concurrent readers share: one of them giving up does
         not cancel it for the others. A URL that stopped working is asked for once more.
         """
@@ -189,20 +191,15 @@ class OneDriveDestination(OAuthDestination):
                 for key in [key for key, (until, _) in urls.items() if until < now]:
                     del urls[key]
                 task = self._hass.async_create_task(
-                    self._async_request(
-                        "GET",
-                        self._item(path),
-                        params={"$select": "id,@microsoft.graph.downloadUrl"},
-                    ),
+                    self._async_request("GET", f"{self._item(path)}/content", location=True),
                     f"OneDrive download URL of {path}",
                 )
                 held = urls[path] = (now + 50 * 60, task)
             try:
-                item = await asyncio.shield(held[1])
+                url = await asyncio.shield(held[1])
             except DestinationError:
                 urls.pop(path, None)  # not kept: the next read asks again
                 raise
-            url = item.get("@microsoft.graph.downloadUrl") if isinstance(item, dict) else None
             if not url:
                 urls.pop(path, None)
                 raise DestinationError(f"OneDrive gave no download URL for {path}")
