@@ -123,7 +123,7 @@ from .const import (
     signal_quota,
     signal_update,
 )
-from .context import RecentChanges, entity_kind, late_change, snapshot
+from .context import RecentChanges, collapse, entity_kind, late_change, snapshot
 from .decider import (
     REASON_UNUSUAL,
     EventRecord,
@@ -247,7 +247,11 @@ class StaminaManager:
         self.uploader = uploader_factory(self)
         self.link: StaminaLink | None = None
         self._timers: dict[str, CALLBACK_TYPE] = {}
-        self._late_unsub: dict[str, CALLBACK_TYPE] = {}
+        # Per camera: its newest event, where the next one's look-back window stops; and the
+        # one event collecting late evidence, if any (`_linked_changed`). A change belongs to
+        # one event per camera, never two.
+        self._newest: dict[str, EventRecord] = {}
+        self._collecting: dict[str, EventRecord] = {}
         # Recent changes of every linked entity, for the look-back window at each start.
         self.recent = RecentChanges(LOOK_BACK_MAX_MINUTES * 60.0)
         self._unsub: list[CALLBACK_TYPE] = []
@@ -376,12 +380,11 @@ class StaminaManager:
         self._unsub.clear()
         for cancel in [
             *self._timers.values(),
-            *self._late_unsub.values(),
             *self._one_shots.values(),
         ]:
             cancel()
         self._timers.clear()
-        self._late_unsub.clear()
+        self._collecting.clear()
         self._one_shots.clear()
         self.analysis.async_cancel()
         if self.link is not None:
@@ -644,14 +647,18 @@ class StaminaManager:
             record.note(note)
         record.latency["ha_received"] = self.now()
         record.context_start = snapshot(self.hass, self.linked(facts.camera), facts.started)
-        record.early = self.recent.between(
-            self.linked_kinds(facts.camera),
-            started=facts.started,
-            since=facts.started - self.look_back_seconds(facts.camera),
-            # Up to its arrival, which is the moment late evidence could not yet be watched
-            # for; bounded, so an event recovered long after it began takes nothing later.
-            until=facts.started + min(max(0.0, self.now() - facts.started), START_GRACE_SECONDS),
+        record.early = collapse(
+            self.recent.between(
+                self.linked_kinds(facts.camera),
+                started=facts.started,
+                since=self._look_back_since(facts),
+                # Up to its arrival, which is the moment late evidence could not yet be watched
+                # for; bounded, so an event recovered long after it began takes nothing later.
+                until=facts.started
+                + min(max(0.0, self.now() - facts.started), START_GRACE_SECONDS),
+            )
         )
+        self._note_newest(record)
         self.records[facts.id] = record
         self._event_areas[record.id] = record.area_key
         # Registered at once, so an event on another camera that overlaps this one sees it
@@ -980,38 +987,78 @@ class StaminaManager:
 
     @callback
     def _linked_changed(self, event: Event[EventStateChangedData]) -> None:
-        """Remember a linked entity's change, for the look-back window of what comes next."""
-        self.recent.add(event.data["entity_id"], event.data["old_state"], event.data["new_state"])
+        """Remember a linked entity's change, and add it to the events collecting it.
+
+        Remembered for the look-back window of what comes next; late evidence of the one
+        event collecting on each camera the entity is linked to.
+        """
+        entity_id = event.data["entity_id"]
+        old, new = event.data["old_state"], event.data["new_state"]
+        self.recent.add(entity_id, old, new)
+        for record in self._collecting.values():
+            if record.finalized or entity_id not in self.linked(record.camera):
+                continue
+            item = late_change(
+                entity_id,
+                entity_kind(self.hass, entity_id),
+                old,
+                new,
+                started=record.facts.started,
+                ended=record.facts.ended or record.facts.started,
+            )
+            if item is not None:
+                record.late.append(item)
+                self._save(record)
+
+    def _note_newest(self, record: EventRecord) -> None:
+        """Remember an event as its camera's newest, unless a later one is known."""
+        newest = self._newest.get(record.camera)
+        if newest is None or newest.facts.started <= record.facts.started:
+            self._newest[record.camera] = record
+
+    def _newer_start(self, record: EventRecord) -> float | None:
+        """Return when the next event on the record's camera started, if one has."""
+        newest = self._newest.get(record.camera)
+        if newest is None or newest.facts.started <= record.facts.started:
+            return None
+        return newest.facts.started
+
+    def _look_back_since(self, facts: EventFacts) -> float:
+        """Return where a new event's look-back window starts, and take it from the last event.
+
+        Never before the previous event on the camera ended: what happened during it is its
+        own. One still in its follow-up stops collecting here, and gives up the changes the
+        new window covers, which are nearer this start than its end; one whose window has
+        closed keeps everything up to that close.
+        """
+        since = facts.started - self.look_back_seconds(facts.camera)
+        status = self.cameras.get(facts.camera)
+        previous = self._newest.get(facts.camera) or (status.last if status else None)
+        if previous is None or previous.facts.started >= facts.started:
+            return since
+        if self._collecting.get(facts.camera) is previous:
+            del self._collecting[facts.camera]
+        ended = previous.facts.ended
+        if ended is None:
+            return max(since, facts.started)
+        if previous.finalized:
+            return max(since, ended, previous.follow_up_until or ended)
+        since = max(since, ended)
+        cut = round(since - ended, 1)
+        kept = [item for item in previous.late if float(item.get("t_rel_s", 0.0)) < cut]
+        if len(kept) != len(previous.late):
+            previous.late = kept
+            self._save(previous)
+        return since
 
     @callback
     def _open_follow_up(self, record: EventRecord) -> None:
-        """Start collecting late evidence and arm the window's end."""
+        """Start collecting late evidence, unless a newer event has, and arm the window's end."""
         if record.follow_up_until is None or record.finalized:
             return
-        self._cancel_follow_up(record.id)
-        linked = self.linked(record.camera)
-        if linked:
-            started = record.facts.started
-            ended = record.facts.ended or started
-
-            @callback
-            def _changed(event: Event[EventStateChangedData]) -> None:
-                entity_id = event.data["entity_id"]
-                item = late_change(
-                    entity_id,
-                    entity_kind(self.hass, entity_id),
-                    event.data["old_state"],
-                    event.data["new_state"],
-                    started=started,
-                    ended=ended,
-                )
-                if item is not None and not record.finalized:
-                    record.late.append(item)
-                    self._save(record)
-
-            self._late_unsub[record.id] = async_track_state_change_event(
-                self.hass, linked, _changed
-            )
+        self._cancel_follow_up(record)
+        if self._newer_start(record) is None:
+            self._collecting[record.camera] = record
 
         @callback
         def _close(_now: Any) -> None:
@@ -1022,10 +1069,11 @@ class StaminaManager:
         self._timers[record.id] = async_call_later(self.hass, delay, _close)
 
     @callback
-    def _cancel_follow_up(self, event_id: str) -> None:
-        for store in (self._timers, self._late_unsub):
-            if (cancel := store.pop(event_id, None)) is not None:
-                cancel()
+    def _cancel_follow_up(self, record: EventRecord) -> None:
+        if (cancel := self._timers.pop(record.id, None)) is not None:
+            cancel()
+        if self._collecting.get(record.camera) is record:
+            del self._collecting[record.camera]
 
     def _catch_up_late(self, record: EventRecord) -> None:
         """Add linked-entity changes made while Home Assistant was not listening.
@@ -1036,6 +1084,8 @@ class StaminaManager:
         started = record.facts.started
         ended = record.facts.ended or started
         until = min(self.now(), record.follow_up_until or self.now())
+        if (newer := self._newer_start(record)) is not None:
+            until = min(until, newer)  # from there on, the newer event's
         seen = {(item.get("entity"), item.get("to")) for item in record.late}
         for entity_id in self.linked(record.camera):
             state = self.hass.states.get(entity_id)
@@ -1059,8 +1109,10 @@ class StaminaManager:
         """Compute the final score once the window has closed, then act on it."""
         if not follow_up_closed(record, self.now()):
             return
-        self._cancel_follow_up(record.id)
+        self._cancel_follow_up(record)
         result = self.analysis.score(record, now=self.now())
+        # Complete now, so stored as one item per entity; what scoring reads is unchanged.
+        record.late = collapse(record.late)
         was_unusual = record.unusual_provisional
         record.final_score = result.score
         record.unusual_final = result.unusual
@@ -1220,6 +1272,7 @@ class StaminaManager:
         now = self.now()
         for record in await self.index.async_unfinished():
             self.records[record.id] = record
+            self._note_newest(record)
         actions = await self.index.async_actions()
         # The spool holds segments for commits to come: only these events can still have one.
         await self.uploader.async_clean_spool({*self.records, *(eid for eid, _ in actions)})

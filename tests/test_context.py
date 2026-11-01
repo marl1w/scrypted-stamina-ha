@@ -7,8 +7,15 @@ import time
 from homeassistant.core import State
 from homeassistant.util import dt as dt_util
 
+from custom_components.scrypted_stamina.const import (
+    CONF_CAMERAS,
+    CONF_FOLLOW_UP_MINUTES,
+    CONF_LINKED,
+    CONF_LOOK_BACK_MINUTES,
+)
 from custom_components.scrypted_stamina.context import (
     RecentChanges,
+    collapse,
     default_weather,
     entity_kind,
     late_change,
@@ -16,7 +23,7 @@ from custom_components.scrypted_stamina.context import (
 )
 
 from .conftest import CAMERA, event_id, subject, until
-from .test_events import OPTIONS
+from .test_events import GATE, OPTIONS, run_event
 
 
 def changed(entity_id: str, old: str, new: str, at: float) -> tuple[State, State]:
@@ -144,4 +151,109 @@ async def test_changes_before_the_start_are_early_evidence(hass, stamina, setup)
     ]
     assert -120.0 <= early[0]["t_rel_s"] <= 30.0
     assert manager.look_back_seconds(CAMERA) == 120.0
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_collapse_keeps_the_change_scoring_reads_and_counts_the_rest() -> None:
+    """A flapping gate reads as its nearest change plus a count; triggered beats nearest."""
+    gate = {"entity": "binary_sensor.gate", "kind": "door"}
+    alarm = {"entity": "alarm_control_panel.yard", "kind": "alarm"}
+    late = [
+        {**gate, "from": "off", "to": "on", "t_rel_s": 360.0},
+        {**gate, "from": "on", "to": "off", "t_rel_s": 420.0},
+        {**alarm, "from": "armed_away", "to": "pending", "t_rel_s": 30.0},
+        {**alarm, "from": "pending", "to": "triggered", "t_rel_s": 60.0},
+        {**gate, "from": "off", "to": "on", "t_rel_s": 480.0},
+    ]
+    found = collapse(late)
+    assert found == [
+        {**alarm, "from": "pending", "to": "triggered", "t_rel_s": 60.0, "count": 2},
+        {**gate, "from": "off", "to": "on", "t_rel_s": 360.0, "count": 3},
+    ]
+    assert collapse(found) == found  # stored items go through it again unchanged
+    # Before the start, the nearest change is the last one.
+    early = [{**gate, "to": "on", "t_rel_s": -90.0}, {**gate, "to": "off", "t_rel_s": -10.0}]
+    assert collapse(early) == [{**gate, "to": "off", "t_rel_s": -10.0, "count": 2}]
+
+
+async def follow_up(manager, eid: str) -> None:
+    await until(lambda: eid in manager.records and manager.records[eid].follow_up_until)
+
+
+async def test_a_change_never_crosses_into_another_event(hass, stamina, setup) -> None:
+    """The next event on the camera takes over, and the earlier one stops collecting.
+
+    The changes in the new look-back window are the new event's early evidence only.
+    """
+    hass.states.async_set(GATE, "off", {"device_class": "door"})
+    entry = await setup(options=OPTIONS)
+    manager = entry.runtime_data.manager
+    first, second = event_id(81), event_id(82)
+    run_event(stamina, first, "vetoed")
+    await follow_up(manager, first)
+
+    hass.states.async_set(GATE, "on", {"device_class": "door"})
+    await hass.async_block_till_done()
+    assert [item["to"] for item in manager.records[first].late] == ["on"]
+
+    stamina.start(second, subjects=[subject("s2")])
+    await until(lambda: second in manager.records)
+    # Nearer the second start than the first end, and inside its look-back window.
+    assert manager.records[first].late == []
+    assert [(item["to"], item["count"]) for item in manager.records[second].early] == [("on", 1)]
+
+    for state in ("off", "on", "off"):
+        hass.states.async_set(GATE, state, {"device_class": "door"})
+        await hass.async_block_till_done()
+    assert manager.records[first].late == []
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_the_look_back_window_stops_at_what_the_previous_event_kept(
+    hass, stamina, setup
+) -> None:
+    """With no look-back, a change in the first event's follow-up stays the first's."""
+    hass.states.async_set(GATE, "off", {"device_class": "door"})
+    options = {
+        CONF_CAMERAS: {
+            CAMERA: {CONF_LINKED: [GATE], CONF_FOLLOW_UP_MINUTES: 10, CONF_LOOK_BACK_MINUTES: 0}
+        }
+    }
+    entry = await setup(options=options)
+    manager = entry.runtime_data.manager
+    first, second = event_id(83), event_id(84)
+    run_event(stamina, first, "vetoed")
+    await follow_up(manager, first)
+    hass.states.async_set(GATE, "on", {"device_class": "door"})
+    await hass.async_block_till_done()
+
+    stamina.start(second, subjects=[subject("s2")], start=time.time() + 1)
+    await until(lambda: second in manager.records)
+    hass.states.async_set(GATE, "off", {"device_class": "door"})
+    await hass.async_block_till_done()
+    assert [item["to"] for item in manager.records[first].late] == ["on"]
+    assert manager.records[second].early == []
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_a_shared_entity_counts_once_per_camera(hass, stamina, setup) -> None:
+    """A gate linked to two cameras is evidence for one event on each, not one overall."""
+    other = "39"
+    hass.states.async_set(GATE, "off", {"device_class": "door"})
+    linked = {CONF_LINKED: [GATE], CONF_FOLLOW_UP_MINUTES: 10}
+    entry = await setup(options={CONF_CAMERAS: {CAMERA: linked, other: linked}})
+    manager = entry.runtime_data.manager
+    first, second = event_id(85), event_id(86)
+    run_event(stamina, first, "vetoed")
+    await follow_up(manager, first)
+    hass.states.async_set(GATE, "on", {"device_class": "door"})
+    await hass.async_block_till_done()
+
+    stamina.start(second, camera=other, subjects=[subject("s2")])
+    await until(lambda: second in manager.records)
+    hass.states.async_set(GATE, "off", {"device_class": "door"})
+    await hass.async_block_till_done()
+    # Another camera's event takes nothing from this one, and sees the gate as well.
+    assert [item["to"] for item in manager.records[first].late] == ["on", "off"]
+    assert [item["to"] for item in manager.records[second].early] == ["on"]
     await hass.config_entries.async_unload(entry.entry_id)

@@ -383,6 +383,7 @@ async def test_event_detail(hass, hass_ws_client, stamina_entry) -> None:
             "from": "off",
             "to": "on",
             "t_rel_s": -20,
+            "count": 1,
         }
     ]
     subject = event["subjects"][0]

@@ -14,6 +14,11 @@ it last changed *relative to the event* ("door opened 5 s before"). During the f
 window, changes of the linked entities are collected as late evidence; and the changes in
 the look-back window before the start, kept in a small in-memory ring (`RecentChanges`), as
 early evidence ("gate opened 20 s before").
+
+A change belongs to one event per camera, never two: the next event on the camera closes
+the follow-up window's collecting, and its look-back window starts where the previous
+event's evidence ends (`manager.Manager._look_back_since`). Stored evidence is kept compact
+by `collapse`: one item per entity, with a `count` of its changes.
 """
 
 from __future__ import annotations
@@ -201,3 +206,28 @@ class RecentChanges:
         ]
         found.sort(key=lambda item: item["t_rel_s"])
         return found
+
+
+def collapse(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return evidence as one item per entity, with how many changes it made (`count`).
+
+    The item kept is the one scoring reads: a change into `triggered` if there is one,
+    otherwise the change nearest the event (`t_rel_s` nearest zero, which is the first one
+    after the end and the last one before the start). Collapsing what is already collapsed
+    changes nothing, so stored items, old or new, can go through it again.
+    """
+    kept: dict[str, dict[str, Any]] = {}
+    counts: dict[str, int] = {}
+    for item in items:
+        entity_id = str(item.get("entity", ""))
+        counts[entity_id] = counts.get(entity_id, 0) + int(item.get("count", 1))
+        current = kept.get(entity_id)
+        if current is None or _rank(item) < _rank(current):
+            kept[entity_id] = item
+    found = [{**item, "count": counts[entity_id]} for entity_id, item in kept.items()]
+    found.sort(key=lambda item: float(item.get("t_rel_s") or 0.0))
+    return found
+
+
+def _rank(item: dict[str, Any]) -> tuple[bool, float]:
+    return (str(item.get("to")) != "triggered", abs(float(item.get("t_rel_s") or 0.0)))

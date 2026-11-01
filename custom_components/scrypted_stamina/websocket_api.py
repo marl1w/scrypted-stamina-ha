@@ -40,6 +40,7 @@ from .const import (
     signal_event,
     signal_update,
 )
+from .context import collapse
 from .decider import EventRecord, EventState
 from .playback import play_url, thumbnail_url
 
@@ -341,9 +342,10 @@ async def event_detail(
         "finalized": record.finalized,
         "follow_up_until": record.follow_up_until,
         "watching": watching,
-        "late_evidence": [_late(hass, item) for item in record.late],
+        # One item per entity: the change nearest the event, and `count`, how many it made.
+        "late_evidence": [_late(hass, item) for item in collapse(record.late)],
         # The same shape, from the look-back window: `t_rel_s` from the start, negative.
-        "early_evidence": [_late(hass, item) for item in record.early],
+        "early_evidence": [_late(hass, item) for item in collapse(record.early)],
         "learning": manager.analysis.state(record.camera) == "learning",
         "keep_reason": record.keep_reason,
         "target": record.target,
@@ -379,6 +381,7 @@ def _late(hass: HomeAssistant, item: dict[str, Any]) -> dict[str, Any]:
         "from": item.get("from"),
         "to": item.get("to"),
         "t_rel_s": item.get("t_rel_s"),
+        "count": item.get("count", 1),
     }
 
 
