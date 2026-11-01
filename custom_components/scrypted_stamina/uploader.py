@@ -806,7 +806,13 @@ class Uploader:
                 data = pump.ring.get(key)
                 if data is None:
                     keys = pump.segment_keys()
-                    if key not in pump.fetched and self._pacing(pump, lane, keys):
+                    # The fetcher only fetches for a destination that can store now: a
+                    # degraded one (here with its probe) reads the segment for itself.
+                    if (
+                        key not in pump.fetched
+                        and not target.degraded
+                        and self._pacing(pump, lane, keys)
+                    ):
                         target.release(admission)
                         await self._wait(pump, 30.0)  # the fetcher brings it
                         continue

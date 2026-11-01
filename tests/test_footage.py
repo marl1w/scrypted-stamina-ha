@@ -115,6 +115,24 @@ async def test_the_playlist_lists_only_what_the_destination_holds(
     await hass.config_entries.async_unload(entry.entry_id)
 
 
+async def test_a_refusal_before_the_next_fetch_does_not_stall_the_upload(
+    hass, stamina, destinations, setup
+) -> None:
+    # The destination refuses 00000 while the fetcher, PREFETCH ahead, has not fetched 1 yet:
+    # the degraded lane must read 1 itself, not wait for a fetcher that waits for it.
+    destinations["storage0"].fail = {"00000.m4s"}
+    entry = await setup()
+    manager = await wire(entry, Clock())
+    eid = event_id(102)
+    run_event(stamina, eid, "confirmed", segments=3)
+    await until(
+        lambda: eid in manager.records and manager.records[eid].state is EventState.COMMITTED
+    )
+    [copy] = (await manager.index.async_copies(eid)).values()
+    assert set(copy.ranges) == {"init.mp4", "00001.m4s", "00002.m4s"}
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
 # ------------------------------------------------------------------ 2. no drop before the replay
 
 
