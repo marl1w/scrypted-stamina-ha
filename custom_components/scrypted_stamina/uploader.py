@@ -33,8 +33,11 @@ the pending folder into one video, `<kind>/<area>-<camera>-<YYMMDD_HHMMSS>.mp4`,
 from there in play order (init, then segments: a fragmented MP4, no re-encoding) — never
 read back from the destination, never held whole in memory. Only a segment the spool lost
 is read back, one at a time. A file joins only when its size is the one the index recorded;
-one the index does not know (listed in the folder) joins with a warning, so it is not
-deleted unjoined. Per destination:
+one the index does not know (listed in the folder, uploaded before a crash recorded it)
+joins only when the spool holds it at that same size, and never empty. A file not joined
+keeps its pending folder. One commit uploads at a time across the uploader (on a small box,
+one video's chunk in memory at once), and the pump stays stopped while it runs. Per
+destination:
 
 1. the name is chosen and reserved in the index (`copy.video`), under the destination's
    commit lock — the only step that holds it;
@@ -403,6 +406,12 @@ class Uploader:
         self._on_over_quota = on_over_quota or (lambda target, over: None)
         self._before_release_hook = before_release
         self._pumps: dict[str, Pump] = {}
+        # Events being committed: their pumps are not restarted until the commit is done,
+        # and those poked meanwhile are poked again then.
+        self._committing: set[str] = set()
+        self._poked_while_committing: set[str] = set()
+        # One commit uploads at a time, whatever the destination.
+        self._commit_upload = asyncio.Semaphore(1)
         self.spool = Spool(hass)
         self._sizes: deque[int] = deque(maxlen=50)
         self.capacity = "not yet measured"
@@ -488,6 +497,9 @@ class Uploader:
         if pump is None:
             return
         pump.poke()
+        if event_id in self._committing:
+            self._poked_while_committing.add(event_id)
+            return
         if not pump.wanted or not self.enabled:
             return
         pump.reported = False
@@ -903,7 +915,9 @@ class Uploader:
         async with target.committing:
             copy = (await self._index.async_copies(event_id)).get(target.subentry_id)
             if copy is not None and not copy.deleted:
-                for part in sorted({1, *copy.parts}):
+                # The part after the last recorded one too: uploaded, perhaps, but not
+                # recorded (a crash, or an eviction while it was uploading).
+                for part in sorted({1, *copy.parts, max(copy.parts, default=0) + 1}):
                     if (path := copy.part_path(part)) is not None:
                         await target.destination.async_delete(path)
                 await target.destination.async_delete_folder(copy.folder)
@@ -1010,6 +1024,16 @@ class Uploader:
         already committed (an orphan that received more after its first commit) gets what
         arrived since as a file of its own.
         """
+        self._committing.add(record.id)
+        try:
+            await self._async_commit(record)
+        finally:
+            self._committing.discard(record.id)
+            if record.id in self._poked_while_committing:
+                self._poked_while_committing.discard(record.id)
+                self.poke(record.id)  # what arrived meanwhile (an orphan's new segments)
+
+    async def _async_commit(self, record: EventRecord) -> None:
         await self.async_halt(record.id)
         copies = await self._async_copies(record)
         failures: list[str] = []
@@ -1069,7 +1093,14 @@ class Uploader:
         if copy.video is None:
             async with target.committing:
                 copy.video = await self._async_video_path(target, record)
-                if not await self._index.async_save_copy_header(record.id, subentry_id, copy):
+                try:
+                    reserved = await self._index.async_save_copy_header(
+                        record.id, subentry_id, copy
+                    )
+                except BaseException:
+                    copy.video = None  # not reserved: chosen again next time
+                    raise
+                if not reserved:
                     copy.deleted = True  # evicted meanwhile: nothing more to do here
                     return
         prefix = f"{copy.folder}/"
@@ -1085,9 +1116,10 @@ class Uploader:
             part = max(copy.parts, default=0) + 1
             path = str(copy.part_path(part))
             size = sum(length for _, length, _ in sources)
-            await destination.async_store_video(
-                path, size, self._async_chunks(target, record, copy, sources)
-            )
+            async with self._commit_upload:
+                await destination.async_store_video(
+                    path, size, self._async_chunks(target, record, copy, sources)
+                )
             ranges = dict(copy.ranges)
             offset = 0
             for name, length, _ in sources:
@@ -1108,7 +1140,7 @@ class Uploader:
                 return
         unjoined = [
             name
-            for name in copy.files
+            for name in {*copy.files, *(name for name, size in listed.items() if size)}
             if (key := file_key(name)) is not None
             and key not in copy.failed
             and name not in copy.ranges
@@ -1131,8 +1163,8 @@ class Uploader:
 
         Only good files: one the index knows joins when the spool or the destination holds
         it at exactly the size recorded; a segment this destination gave up on is left out;
-        one the index does not know (stored, but not recorded before a crash) joins at its
-        listed size, with a warning.
+        one the index does not know (stored, but not recorded before a crash) joins, with a
+        warning, only when the spool holds it at its listed size, and never an empty one.
         """
         spooled = await self.spool.async_sizes(record.id)
         sources: list[tuple[str, int, bool]] = []
@@ -1141,13 +1173,18 @@ class Uploader:
                 continue
             expected = copy.files.get(name)
             if expected is None:
+                size = listed[name]
+                joined = size > 0 and spooled.get(name) == size
                 _LOGGER.warning(
-                    "%s holds %s of %s, which the index does not know; joining it",
+                    "%s holds %s of %s (%s bytes), which the index does not know; %s",
                     target.label,
                     name,
                     record.id,
+                    size,
+                    "joining it" if joined else "not joining it",
                 )
-                sources.append((name, listed[name], spooled.get(name) == listed[name]))
+                if joined:
+                    sources.append((name, size, True))
             elif spooled.get(name) == expected:
                 sources.append((name, expected, True))
             elif listed.get(name) == expected:
@@ -1186,9 +1223,12 @@ class Uploader:
             if len(data) != size:
                 raise DestinationError(f"{name} of {record.id} is {len(data)} bytes, not {size}")
             buffer += data
+            del data
             while len(buffer) >= STREAM_CHUNK:
-                yield bytes(buffer[:STREAM_CHUNK])
+                with memoryview(buffer) as view:
+                    chunk = bytes(view[:STREAM_CHUNK])  # the one copy
                 del buffer[:STREAM_CHUNK]
+                yield chunk
         if buffer:
             yield bytes(buffer)
 

@@ -226,7 +226,7 @@ class StaminaManager:
         # The area key of every event with a copy somewhere, and what each area's events
         # hold, recounted when holdings change (`_recount_areas`), for the area sensors.
         self._event_areas: dict[str, str] = {}
-        self._area_totals: dict[str, dict[str, int]] = {}
+        self._area_totals: dict[str, dict[str, Any]] = {}
         self.latencies: deque[float] = deque(maxlen=LATENCY_SAMPLES)
         self.analysis = Analysis(
             hass,
@@ -486,8 +486,16 @@ class StaminaManager:
     async def async_handle(self, message: Message) -> None:
         """Apply one message from the plugin (quickly: heavy work is spawned)."""
         record = self.records.get(message.event_id or "")
-        if record is None and message.type == MSG_SEGMENT and message.event_id:
-            record = await self._async_reopen_orphan(message.event_id)
+        if (
+            message.type == MSG_SEGMENT
+            and message.event_id
+            and (
+                record is None
+                or (record.state is EventState.ORPHANED and ORPHAN_COMPLETE in record.notes)
+            )
+        ):
+            # An orphan committed already, in memory or not: more of it means reopening it.
+            record = await self._async_reopen_orphan(message.event_id, record) or record
         if record is None and message.type != MSG_START and message.event is not None:
             # Joined mid-event (e.g. after a long outage): treat the first message as a start.
             record = await self._async_started(message.event)
@@ -532,14 +540,17 @@ class StaminaManager:
         self._save_position_soon()
         self._changed(record.camera)
 
-    async def _async_reopen_orphan(self, event_id: str) -> EventRecord | None:
+    async def _async_reopen_orphan(
+        self, event_id: str, record: EventRecord | None = None
+    ) -> EventRecord | None:
         """Take back an orphan that was committed, because more of it has arrived.
 
         Its upload resumes into its pending folder, and it is committed again once the plugin
         says there is nothing more: what arrived since goes into a file of its own
         (`-part2.mp4`, …), so the video already committed is never rewritten.
         """
-        record = await self.index.async_get(event_id)
+        if record is None:
+            record = await self.index.async_get(event_id)
         if record is None or record.state is not EventState.ORPHANED:
             return None
         if ORPHAN_COMPLETE in record.notes:
@@ -1312,7 +1323,7 @@ class StaminaManager:
             for event_id, key in self._event_areas.items()
             if event_id in self.records or any(t.usage.get(event_id) for t in targets)
         }
-        totals: dict[str, dict[str, int]] = {}
+        totals: dict[str, dict[str, Any]] = {}
         for target in targets:
             mine: dict[str, list[int]] = {}
             for event_id, key in self._event_areas.items():
@@ -1322,7 +1333,7 @@ class StaminaManager:
                     counted[1] += 1
             for key, (used, events) in mine.items():
                 if key not in totals or used >= totals[key]["used"]:
-                    totals[key] = {"used": used, "events": events, "quota": target.quota}
+                    totals[key] = {"used": used, "events": events, "target": target.subentry_id}
         self._area_totals = totals
 
     def area_holdings(self, key: str) -> dict[str, Any]:
@@ -1331,8 +1342,13 @@ class StaminaManager:
         The holdings are the last recount's; the rest is read from the events in memory.
         """
         targets = list(self.uploader.targets.values())
-        quota = targets[-1].quota if targets else 0
-        held = self._area_totals.get(key) or {"used": 0, "events": 0, "quota": quota}
+        held = dict(self._area_totals.get(key) or {"used": 0, "events": 0})
+        # The quota is read live, of the destination the recount chose (else the one it
+        # would choose when nothing is held: the last), so an option change shows at once.
+        target = self.uploader.targets.get(str(held.pop("target", ""))) or (
+            targets[-1] if targets else None
+        )
+        held["quota"] = target.quota if target is not None else 0
         mine = [record for record in self.records.values() if record.area_key == key]
         pending = [record for record in mine if record.state is EventState.FOLLOW_UP]
         failing = [target for target in targets if not target.healthy]

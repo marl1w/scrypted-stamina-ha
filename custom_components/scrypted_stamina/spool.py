@@ -1,14 +1,20 @@
 """A local copy of each event's segments, so a commit never reads them back.
 
-    <config>/scrypted_stamina_spool/<event id>/init.mp4, 00000.m4s, …
+    <config>/.cache/scrypted_stamina_spool/<event id>/init.mp4, 00000.m4s, …
+
+Under `.cache`, because Home Assistant leaves `.cache/*` out of its backups (both the
+Supervisor's and Core's own): footage of the last hours has no place in a backup. A spool
+from before, at `<config>/scrypted_stamina_spool`, is moved here at startup.
 
 Every segment fetched from the plugin is written here as it goes to the destinations, and a
 commit streams the video from these files: no download from the destination, and never more
 than a chunk in memory. An event's folder goes once it is committed everywhere, or dropped.
 
 It is a cache, not the record: a segment missing here (the box was replaced, the spool was
-trimmed) is read back from the destination instead. So it is bounded — by size, oldest
-event first, and by age — and cleared at startup of every event the index no longer needs.
+trimmed) is read back from the destination instead. So it is bounded — by size (512 MB),
+oldest event first, and by age (two days) — and cleared at startup of every event the index
+no longer needs. A trim that cannot get under the size (one long event) is not repeated at
+every segment: the next waits for another quarter of the bound to be written.
 
 All file work runs in the executor; nothing here blocks the event loop.
 """
@@ -26,7 +32,9 @@ from .naming import safe_part
 
 _LOGGER = logging.getLogger(__name__)
 
-SPOOL_DIR = "scrypted_stamina_spool"
+SPOOL_DIR = ".cache/scrypted_stamina_spool"
+# Where the spool was before it moved under `.cache`, out of backups.
+OLD_SPOOL_DIR = "scrypted_stamina_spool"
 # About seven hours of footage at 70 MB an hour; events are minutes long.
 SPOOL_MAX_BYTES = 512 * 1024 * 1024
 # An event folder untouched this long belongs to something that will not commit.
@@ -44,10 +52,13 @@ class Spool:
         """Place the spool in Home Assistant's config directory; nothing is touched yet."""
         self._hass = hass
         self.root = Path(hass.config.path(SPOOL_DIR))
+        self._old_root = Path(hass.config.path(OLD_SPOOL_DIR))
         self.max_bytes = max_bytes
         self.max_age = max_age
-        # Bytes written since the size was last measured, plus that measure.
+        # Bytes written since the size was last measured, plus that measure; and the size at
+        # which the next trim runs (raised after a trim that could not get under the bound).
         self._bytes = 0
+        self._trim_at: int | None = None
 
     def folder(self, event_id: str) -> Path:
         """Return one event's folder."""
@@ -61,8 +72,13 @@ class Spool:
             _LOGGER.debug("Could not spool %s of %s: %s", name, event_id, err)
             return
         self._bytes += len(data)
-        if self._bytes > self.max_bytes:
-            self._bytes = await self._hass.async_add_executor_job(self._trim, None)
+        if self._bytes > (self._trim_at or self.max_bytes):
+            self._measured(await self._hass.async_add_executor_job(self._trim, None))
+
+    def _measured(self, total: int) -> None:
+        """Take a trim's result: what is left, and when the next trim is worth running."""
+        self._bytes = total
+        self._trim_at = None if total <= self.max_bytes * _TRIM_TO else total + self.max_bytes // 4
 
     def _write(self, event_id: str, name: str, data: bytes) -> None:
         folder = self.folder(event_id)
@@ -98,7 +114,19 @@ class Spool:
 
     async def async_clean(self, keep: set[str] | None = None) -> None:
         """Apply the size and age bounds and, given `keep`, remove every other event."""
-        self._bytes = await self._hass.async_add_executor_job(self._trim, keep)
+        self._measured(await self._hass.async_add_executor_job(self._trim, keep))
+
+    def _migrate(self) -> None:
+        """Move a spool from its old place, out of backups; remove it if it cannot move."""
+        try:
+            if self.root.exists():
+                raise OSError(f"{self.root} exists already")
+            self.root.parent.mkdir(parents=True, exist_ok=True)
+            self._old_root.rename(self.root)
+            _LOGGER.debug("Spool moved to %s", self.root)
+        except OSError as err:
+            _LOGGER.debug("Spool not moved (%s); removing %s", err, self._old_root)
+            shutil.rmtree(self._old_root, ignore_errors=True)
 
     def _trim(self, keep: set[str] | None) -> int:
         """Apply the bounds; with `keep`, remove every event not in it. Return what is left.
@@ -106,6 +134,8 @@ class Spool:
         Without `keep` (after a write) it bounds size and age only; a clean passes the events
         the index still needs, and the rest go.
         """
+        if self._old_root.is_dir():
+            self._migrate()
         if not self.root.is_dir():
             return 0
         known = {self.folder(event_id).name for event_id in keep or ()}

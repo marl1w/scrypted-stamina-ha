@@ -339,11 +339,29 @@ async def test_a_commit_joins_everything_in_the_pending_folder(hass) -> None:
     fake.files[f"{source}/00000.m4s"] = b"s"
     fake.files[f"{source}/init.mp4"] = b"i"
     fake.files[f"{source}/notes.txt"] = b"?"  # not footage: not joined
+    fake.files[f"{source}/00002.m4s"] = b""  # empty: nothing to join, nothing lost
     copy = Copy(folder=source, files={"init.mp4": 1, "00000.m4s": 1}, video=video)
-    await bare_uploader(hass, index)._async_commit_copy(fake_target(fake), record, copy)
+    uploader = bare_uploader(hass, index)
+    await uploader.spool.async_write("e", "00001.m4s", b"t")  # what the box itself fetched
+    await uploader._async_commit_copy(fake_target(fake), record, copy)
     assert fake.files[video] == b"ist" and not fake.under(source)
     assert copy.files["00001.m4s"] == 1 and copy.committed and copy.video == video
     assert index.saved[-1].ranges == copy.ranges  # recorded before the folder went
+
+
+async def test_an_unknown_file_the_spool_does_not_hold_is_not_joined(hass) -> None:
+    fake = FakeDestination()
+    record = EventRecord(facts=EventFacts(id="e", camera=CAMERA, started=1.0, ended=2.0))
+    source, video = "f/pending/a/x", "f/events/a-cam-261031_211349.mp4"
+    fake.files[f"{source}/init.mp4"] = b"i"
+    fake.files[f"{source}/00000.m4s"] = b"s"
+    fake.files[f"{source}/00001.m4s"] = b"tt"  # unknown, and the spool has it at 1 byte
+    copy = Copy(folder=source, files={"init.mp4": 1, "00000.m4s": 1}, video=video)
+    uploader = bare_uploader(hass, SavedCopies())
+    await uploader.spool.async_write("e", "00001.m4s", b"t")
+    await uploader._async_commit_copy(fake_target(fake), record, copy)
+    assert fake.files[video] == b"is" and "00001.m4s" not in copy.ranges
+    assert fake.under(source)  # kept: footage that is in no video is never deleted
 
 
 async def test_a_commit_repeated_after_a_crash_does_not_join_twice(hass) -> None:

@@ -193,11 +193,6 @@ class Copy:
         )
 
     @property
-    def video_size(self) -> int:
-        """Return the length of the committed video's first file, as recorded."""
-        return self.part_size(1)
-
-    @property
     def playable(self) -> bool:
         """Whether a committed video of this copy is on its destination."""
         return self.committed and not self.deleted and self.video is not None
@@ -946,7 +941,7 @@ class EventIndex:
         return await self._run(_read)
 
     async def async_copy_areas(self) -> dict[str, tuple[str, str]]:
-        """Return `(area key, area folder)` of every event with a copy on some destination.
+        """Return `(area key, area folder)` of every event with a live copy on some destination.
 
         The key is empty for an event recorded before records kept it.
         """
@@ -955,7 +950,8 @@ class EventIndex:
                 str(event_id): (str(key or ""), str(area))
                 for event_id, key, area in db.execute(
                     "SELECT DISTINCT e.id, json_extract(e.record, '$.area_key'), e.area "
-                    "FROM copies c JOIN events e ON e.id = c.event_id"
+                    "FROM copies c JOIN events e ON e.id = c.event_id "
+                    "WHERE NOT COALESCE(json_extract(c.copy, '$.deleted'), 0)"
                 )
             }
         )

@@ -22,8 +22,14 @@ from custom_components.scrypted_stamina.destinations import (
 from custom_components.scrypted_stamina.destinations.base import gather
 from custom_components.scrypted_stamina.index import Copy, EventIndex
 from custom_components.scrypted_stamina.protocol import EventFacts
-from custom_components.scrypted_stamina.spool import Spool
-from custom_components.scrypted_stamina.uploader import Target, Uploader, video_playlist
+from custom_components.scrypted_stamina.spool import OLD_SPOOL_DIR, Spool
+from custom_components.scrypted_stamina.uploader import (
+    Lane,
+    Pump,
+    Target,
+    Uploader,
+    video_playlist,
+)
 
 from .conftest import CAMERA, FakeDestination
 from .test_destinations import loaded
@@ -298,6 +304,93 @@ async def test_an_eviction_deletes_every_file_of_a_video(hass, index) -> None:
     assert not fake.videos("f/events/")
 
 
+async def test_an_eviction_also_deletes_a_part_uploaded_but_not_recorded(hass, index) -> None:
+    fake = FakeDestination()
+    uploader = await prepared(hass, index, {"a": fake})
+    await uploader.async_commit(make_record())
+    part2 = VIDEO.removesuffix(".mp4") + "-part2.mp4"
+    fake.files[part2] = b"seg2"  # stored, then a crash before it was recorded
+    await uploader._async_evict(uploader.targets["a"], EVENT)
+    assert not fake.videos("f/events/")
+
+
+async def test_a_name_not_reserved_is_chosen_again(hass, index) -> None:
+    fake = FakeDestination()
+    uploader = await prepared(hass, index, {"a": fake})
+    record, copy = make_record(), await copy_of(index)
+    save = index.async_save_copy_header
+
+    async def failing(*args) -> bool:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    index.async_save_copy_header = failing
+    with pytest.raises(sqlite3.OperationalError):
+        await uploader._async_commit_copy(uploader.targets["a"], record, copy)
+    assert copy.video is None
+    index.async_save_copy_header = save
+    await uploader._async_commit_copy(uploader.targets["a"], record, copy)
+    assert copy.video == VIDEO and fake.files[VIDEO] == b"initseg0seg1"
+
+
+async def test_one_commit_uploads_at_a_time(hass, index) -> None:
+    first, second = Gate(), Gate()
+    uploader = await prepared(hass, index, {"a": first, "b": second})
+    record = make_record()
+    one = asyncio.create_task(
+        uploader._async_commit_copy(uploader.targets["a"], record, await copy_of(index, "a"))
+    )
+    two = asyncio.create_task(
+        uploader._async_commit_copy(uploader.targets["b"], record, await copy_of(index, "b"))
+    )
+    await first.started.wait()
+    await asyncio.sleep(0.05)
+    assert not second.started.is_set()  # waiting for the first upload, not beside it
+    first.release.set()
+    second.release.set()
+    await asyncio.gather(one, two)
+    assert first.files[VIDEO] == second.files[VIDEO] == b"initseg0seg1"
+
+
+async def test_a_poke_during_a_commit_starts_nothing_until_it_is_done(hass, index) -> None:
+    fake = Gate()
+    uploader = await prepared(hass, index, {"a": fake})
+    record = make_record()
+    record.state = EventState.ORPHANED
+    started: list[str] = []
+
+    async def fetch(pump) -> None:
+        started.append("fetch")
+
+    async def lane(pump, lane) -> None:
+        started.append("lane")
+
+    uploader._async_fetch_loop = fetch
+    uploader._async_lane = lane
+    uploader._pumps[EVENT] = Pump(
+        record=record, lanes={"a": Lane(subentry_id="a", copy=await copy_of(index))}
+    )
+    commit = asyncio.create_task(uploader.async_commit(record))
+    await fake.started.wait()
+    uploader.poke(EVENT)  # a new segment of the orphan, mid-commit
+    await asyncio.sleep(0)
+    assert started == []  # nothing restarted while the commit runs
+    fake.release.set()
+    await commit
+    await asyncio.sleep(0)
+    assert sorted(started) == ["fetch", "lane"]  # and the poke is honoured once it is done
+
+
+async def test_a_commit_without_a_poke_restarts_nothing(hass, index) -> None:
+    uploader = await prepared(hass, index, {"a": FakeDestination()})
+    record = make_record()
+    uploader._pumps[EVENT] = Pump(
+        record=record, lanes={"a": Lane(subentry_id="a", copy=await copy_of(index))}
+    )
+    await uploader.async_commit(record)
+    pump = uploader._pumps[EVENT]
+    assert pump.fetcher is None and pump.lanes["a"].task is None
+
+
 # ------------------------------------------------------------------ good segments only
 
 
@@ -311,8 +404,9 @@ async def test_a_short_or_failed_segment_is_not_joined(hass, index, caplog) -> N
     copy = await copy_of(index)
     copy.failed.append(1)
     await index.async_save_copy_header(EVENT, "a", copy)
-    # And one the index never heard of.
+    # And one the index never heard of, which the spool holds at the same size.
     fake.files[f"{PENDING}/00002.m4s"] = b"seg2"
+    await uploader.spool.async_write(EVENT, "00002.m4s", b"seg2")
 
     await uploader.async_commit(make_record())
     assert fake.files[VIDEO] == b"initseg2"
@@ -344,6 +438,37 @@ async def test_the_spool_is_bounded_and_cleaned(hass, tmp_path) -> None:
         await spool.async_write("ev_d", f"{n:05d}.m4s", b"y" * 30)
     assert not spool.folder("ev_c").exists()
     assert (await spool.async_sizes("ev_d")) == {f"{n:05d}.m4s": 30 for n in range(4)}
+
+
+async def test_a_trim_that_cannot_get_under_the_bound_backs_off(hass) -> None:
+    spool = Spool(hass, max_bytes=100)
+    trims = 0
+    trim = spool._trim
+
+    def counted(keep):
+        nonlocal trims
+        trims += 1
+        return trim(keep)
+
+    spool._trim = counted
+    for n in range(20):  # one event, never trimmed: it is the newest
+        await spool.async_write("ev_long", f"{n:05d}.m4s", b"y" * 10)
+    # Over the bound at 110 bytes, then only once another quarter of it (25 bytes) is
+    # written: at 140, 170 and 200 — not at each of the ten writes past the bound.
+    assert trims == 4
+    assert len(await spool.async_sizes("ev_long")) == 20
+
+
+async def test_the_spool_lives_out_of_backups_and_moves_there(hass) -> None:
+    spool = Spool(hass)
+    assert spool.root.relative_to(hass.config.path()).parts[0] == ".cache"
+    old = spool._old_root / "ev_old"
+    old.mkdir(parents=True)
+    (old / "init.mp4").write_bytes(b"init")
+    assert spool._old_root.name == OLD_SPOOL_DIR
+    await spool.async_clean({"ev_old"})
+    assert not spool._old_root.exists()
+    assert (spool.folder("ev_old") / "init.mp4").read_bytes() == b"init"
 
 
 # ------------------------------------------------------------------ the index
@@ -391,7 +516,7 @@ async def test_an_old_index_gains_the_video_column(hass, tmp_path) -> None:
     assert await index.async_video_taken("a", "e1.mp4", "x")
     assert not await index.async_video_taken("a", "e2.mp4", "x")
     copy = (await index.async_copies("e1"))["a"]
-    assert copy.parts == [] and copy.video_size == 0
+    assert copy.parts == [] and copy.part_size(1) == 0
     await index.async_close()
 
 
