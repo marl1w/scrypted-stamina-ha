@@ -12,40 +12,14 @@ from custom_components.scrypted_stamina.decider import EventState
 from custom_components.scrypted_stamina.destinations import (
     DestinationError,
     OneDriveDestination,
-    WebDavDestination,
 )
 
-from .conftest import FakeDestination, event_id, until
+from .conftest import event_id, until
 from .test_destinations import loaded
 from .test_events import run_event
 
 VIDEO = "scrypted-stamina/events/garden-front-door-261031_210509.mp4"
 URL = "https://download.example/abc"
-
-
-async def test_the_default_range_reads_and_slices() -> None:
-    fake = FakeDestination()
-    fake.files[VIDEO] = b"0123456789"
-    assert await super(FakeDestination, fake).async_read_range(VIDEO, 2, 5) == b"2345"
-
-
-async def test_webdav_streams_a_range_and_stops_after_it() -> None:
-    pulled: list[bytes] = []
-
-    async def chunks():
-        for chunk in (b"0123", b"4567", b"89ab", b"cdef"):
-            pulled.append(chunk)
-            yield chunk
-
-    client = MagicMock()
-
-    async def download_iter(path):
-        return chunks()
-
-    client.download_iter = download_iter
-    destination = WebDavDestination(MagicMock(), loaded("webdav", client))
-    assert await destination.async_read_range(VIDEO, 3, 9) == b"3456789"
-    assert len(pulled) == 3  # the last chunk was never asked for
 
 
 def _onedrive(answer):

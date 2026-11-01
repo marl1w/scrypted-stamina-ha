@@ -3,13 +3,13 @@
 Ported from Reolink Stamina, where a destination stored, deleted and listed whole clips.
 Scrypted Stamina writes one file per segment into a pending folder while the event lasts,
 then commits it as one video, streamed from the box's local spool of those segments, and
-deletes the folder. Every provider implements five members — `label`, `async_store`,
-`async_delete`, `async_list` and `async_read` (a segment back when the spool is gone; a
-committed video for playback) — and the rest have defaults it overrides when it can do
-better:
+deletes the folder. Every provider implements six members — `label`, `async_store`,
+`async_delete`, `async_list`, `async_read` (a segment back when the spool lost it) and
+`async_store_stream` (one file from chunks, never held whole: an upload session, a streamed
+`PUT` or write). The rest have defaults a provider overrides when it can do better:
 
-* `async_store_stream` — write one file from chunks, without holding it whole: an upload
-  session where the provider has one; the default buffers, up to `BUFFER_LIMIT`;
+* `async_read_range` — part of a file, for playback; the default reads the whole file, so
+  it refuses one over `RANGE_READ_LIMIT`;
 * `async_store_video` — `async_store_stream`, then confirm the size with `async_size`;
 * `async_size` — one file's size, by listing its folder unless the provider can ask;
 * `async_delete_folder` — remove a pending folder and everything in it.
@@ -38,9 +38,9 @@ MAX_BACKOFF_SECONDS = 30.0
 
 # A committed video goes up in chunks of this size: a multiple of both OneDrive's 320 KiB
 # and Google Drive's 256 KiB, and small enough to hold one in memory on a small box.
-STREAM_CHUNK = 10 * 1024 * 1024
-# What a provider without a streaming upload may buffer to store one file.
-BUFFER_LIMIT = 64 * 1024 * 1024
+STREAM_CHUNK = 5 * 1024 * 1024
+# The largest file the default `async_read_range` reads whole to slice a range out of it.
+RANGE_READ_LIMIT = 8 * 1024 * 1024
 
 # How many attempts an operation gets, when the caller does its own retrying. The uploader
 # sets it to one for segment stores, so a destination's backoff never sleeps while holding
@@ -84,6 +84,9 @@ async def rechunk(chunks: AsyncIterable[bytes], size: int = STREAM_CHUNK) -> Asy
     """Yield `chunks` again as pieces of exactly `size` bytes, the last one shorter."""
     buffer = bytearray()
     async for chunk in chunks:
+        if not buffer and len(chunk) == size:
+            yield chunk  # already the right size: passed on, not copied
+            continue
         buffer += chunk
         while len(buffer) >= size:
             yield bytes(buffer[:size])
@@ -190,18 +193,13 @@ class Destination(ABC):
         folder, _, _ = path.rpartition("/")
         return (await self.async_list(folder)).get(path)
 
+    @abstractmethod
     async def async_store_stream(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
         """Write one file of `size` bytes from `chunks`, creating any folders it needs.
 
-        A stream cannot be read twice, so a failure is the caller's to retry, whole. The
-        default buffers it for `async_store`, up to `BUFFER_LIMIT`; providers with an upload
-        session or a streaming write override it.
+        Never holding the file whole: one chunk at a time. A stream cannot be read twice, so
+        a failure is the caller's to retry, whole.
         """
-        if size > BUFFER_LIMIT:
-            raise UploadTooLargeError(
-                f"{self.label} cannot stream; {size} bytes exceeds {BUFFER_LIMIT} buffered"
-            )
-        await self.async_store(path, await gather(chunks, size))
 
     async def async_store_video(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
         """Store one file of a committed video, and confirm the destination holds all of it."""
@@ -225,8 +223,15 @@ class Destination(ABC):
     async def async_read_range(self, path: str, start: int, end: int) -> bytes:
         """Return bytes `start..end` (inclusive) of one file, to play it by range.
 
-        The default reads the file and slices it, which every provider can do; the ones that
-        can ask for a range (or stream and stop) override it, so playback never fetches a
-        whole video for one segment.
+        The default reads the file and slices it, so it refuses a file over
+        `RANGE_READ_LIMIT` rather than hold a whole video for one segment. Every provider
+        here overrides it with a ranged request, or a stream that stops after `end`.
         """
+        size = await self.async_size(path)
+        if size is None:
+            raise DestinationError(f"{self.label} has no {path}")
+        if size > RANGE_READ_LIMIT:
+            raise DestinationError(
+                f"{self.label} cannot read part of {path}: {size} bytes is too large to read whole"
+            )
         return bytes(memoryview(await self.async_read(path))[start : end + 1])

@@ -25,6 +25,9 @@ from .base import Destination, DestinationError, TransientError, async_attempt
 
 _LOGGER = logging.getLogger(__name__)
 
+# How much of a download is read at a time, when a server sends a whole file for a range.
+_READ_CHUNK = 256 * 1024
+
 
 def _size(raw: object) -> int | None:
     """Return one WebDAV size as a number, or None when the server did not give one."""
@@ -208,20 +211,40 @@ class WebDavDestination(Destination):
         await self.async_delete(folder)
 
     async def async_read_range(self, path: str, start: int, end: int) -> bytes:
-        """Return bytes `start..end` (inclusive) of one file, streaming it only that far."""
+        """Return bytes `start..end` (inclusive) of one file, with a `Range` request.
+
+        A server that ignores the range answers 200 with the whole file: that is read from
+        the start and let go of as soon as `end` has arrived.
+        """
 
         async def attempt() -> bytes:
             client = self._client
-            chunks = await self._async_call(f"download of {path}", client.download_iter(path))
-            data = bytearray()
-            offset = 0
-            async for chunk in chunks:
-                view = memoryview(chunk)
-                if offset + len(view) > start:
-                    data += view[max(0, start - offset) : end + 1 - offset]
-                offset += len(view)
-                if offset > end:
-                    break
-            return bytes(data)
+            response = await self._async_call(
+                f"download of {path}",
+                client.execute_request(
+                    action="download",
+                    path=f"/{path.lstrip('/')}",  # what `download_iter` sends
+                    headers_ext={"Range": f"bytes={start}-{end}"},
+                ),
+            )
+            try:
+                if response.status == 206:
+                    return bytes(await self._async_call(f"read of {path}", response.read()))
+                data = bytearray()
+                offset = 0
+                while offset <= end:
+                    chunk = await self._async_call(
+                        f"read of {path}", response.content.read(_READ_CHUNK)
+                    )
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    if offset + len(view) > start:
+                        data += view[max(0, start - offset) : end + 1 - offset]
+                    offset += len(view)
+                return bytes(data)
+            finally:
+                # Not released for reuse: what was left unread would have to be drained.
+                response.close()
 
         return await async_attempt(f"WebDAV read of {path}", attempt)

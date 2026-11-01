@@ -19,6 +19,9 @@ import logging
 import time
 from urllib.parse import quote
 
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+
 from .base import STREAM_CHUNK, DestinationError, content_type, gather, rechunk, streamed
 from .oauth import OAuthDestination
 
@@ -41,6 +44,12 @@ class OneDriveDestination(OAuthDestination):
     """Event folders in Home Assistant's OneDrive app folder."""
 
     service = "OneDrive"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        """Start with no download URL known."""
+        super().__init__(hass, entry)
+        # Pre-authenticated download URLs, by path: until when each is used, and its lookup.
+        self._download_urls: dict[str, tuple[float, asyncio.Task[object]]] = {}
 
     @staticmethod
     def _item(path: str) -> str:
@@ -172,9 +181,7 @@ class OneDriveDestination(OAuthDestination):
         runs as a task of its own that concurrent readers share: one of them giving up does
         not cancel it for the others. A URL that stopped working is asked for once more.
         """
-        urls: dict[str, tuple[float, asyncio.Task[object]]] = self.__dict__.setdefault(
-            "_download_urls", {}
-        )
+        urls = self._download_urls
         for attempt in (1, 2):
             now = time.monotonic()
             held = urls.get(path)

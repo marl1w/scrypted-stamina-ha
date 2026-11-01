@@ -35,6 +35,9 @@ SIMPLE_UPLOAD_LIMIT = 4 * 1024 * 1024
 
 _JSON = {"Content-Type": "application/json"}
 
+# How many file ids ranged reads keep; past it the cache starts again.
+_FILE_CACHE = 64
+
 
 def _quoted(value: str) -> str:
     """Escape one string for a Drive query literal.
@@ -68,6 +71,8 @@ class GoogleDriveDestination(OAuthDestination):
         """Start with no folder resolved."""
         super().__init__(hass, entry)
         self._folders: dict[str, str] = {}
+        # Committed videos' ids, for ranged reads: a player asks for one range per segment.
+        self._files: dict[str, str] = {}
 
     async def _async_children(self, parent: str, query: str) -> list[dict]:
         """Return the non-trashed children of one folder matching an extra clause."""
@@ -241,6 +246,7 @@ class GoogleDriveDestination(OAuthDestination):
     async def async_delete(self, path: str) -> None:
         """Remove one file, treating an already-missing file as success."""
         folder, name = self._split(path)
+        self._files.pop(path, None)
         file_id = await self._async_file_id(folder, name, create=False)
         if file_id is None:
             return
@@ -276,10 +282,9 @@ class GoogleDriveDestination(OAuthDestination):
 
     def _forget(self, folder: str) -> None:
         """Drop cached ids at and under a folder that has gone."""
-        for known in [
-            path for path in self._folders if path == folder or path.startswith(f"{folder}/")
-        ]:
-            del self._folders[known]
+        for cache in (self._folders, self._files):
+            for known in [p for p in cache if p == folder or p.startswith(f"{folder}/")]:
+                del cache[known]
 
     async def async_read(self, path: str) -> bytes:
         """Return one file's content."""
@@ -301,17 +306,30 @@ class GoogleDriveDestination(OAuthDestination):
         await self._async_request("DELETE", f"{DRIVE}/files/{folder_id}", allow_missing=True)
 
     async def async_read_range(self, path: str, start: int, end: int) -> bytes:
-        """Return bytes `start..end` (inclusive) of one file, with a `Range` request."""
-        folder, name = self._split(path)
-        file_id = await self._async_file_id(folder, name, create=False)
+        """Return bytes `start..end` (inclusive) of one file, with a `Range` request.
+
+        The file's id is looked up once and kept, so each segment a player asks for costs one
+        request; an id that stopped working is forgotten, and the next read looks it up again.
+        """
+        file_id = self._files.get(path)
         if file_id is None:
-            raise DestinationError(f"Google Drive has no {path}")
-        data = await self._async_request(
-            "GET",
-            f"{DRIVE}/files/{file_id}",
-            params={"alt": "media"},
-            headers={"Range": f"bytes={start}-{end}"},
-        )
+            folder, name = self._split(path)
+            file_id = await self._async_file_id(folder, name, create=False)
+            if file_id is None:
+                raise DestinationError(f"Google Drive has no {path}")
+            if len(self._files) >= _FILE_CACHE:
+                self._files.clear()
+            self._files[path] = file_id
+        try:
+            data = await self._async_request(
+                "GET",
+                f"{DRIVE}/files/{file_id}",
+                params={"alt": "media"},
+                headers={"Range": f"bytes={start}-{end}"},
+            )
+        except DestinationError:
+            self._files.pop(path, None)
+            raise
         if isinstance(data, (bytes, bytearray)):
             return bytes(data)
         return json.dumps(data).encode()

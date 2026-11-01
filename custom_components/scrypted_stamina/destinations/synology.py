@@ -36,6 +36,9 @@ PAGE = 500
 
 _DELETE = "SYNO.FileStation.Delete"
 
+# How much of a download is read at a time, while streaming up to a range.
+_READ_CHUNK = 256 * 1024
+
 # What DSM answers when the thing being deleted is not there: a File Station error (900)
 # whose detail is "no such file or directory" (408).
 _NO_SUCH_FILE = 900
@@ -232,6 +235,35 @@ class SynologyDestination(Destination):
             if reader is None or reader is True:
                 raise DestinationError(f"Synology returned nothing for {path}")
             return bytes(await self._async_call(f"read of {path}", reader.read()))
+
+        return await async_attempt(f"Synology read of {path}", attempt)
+
+    async def async_read_range(self, path: str, start: int, end: int) -> bytes:
+        """Return bytes `start..end` (inclusive) of one file, streaming it only that far.
+
+        File Station's download answers 200 or fails, so a `Range` request is not an option:
+        the download is read from the start, and let go of as soon as `end` has arrived.
+        """
+        folder, name = self._split(path)
+
+        async def attempt() -> bytes:
+            reader = await self._async_call(
+                f"download of {path}",
+                self._file_station.download_file(path=folder, filename=name),
+            )
+            if reader is None or reader is True:
+                raise DestinationError(f"Synology returned nothing for {path}")
+            data = bytearray()
+            offset = 0
+            while offset <= end:
+                chunk = await self._async_call(f"read of {path}", reader.read(_READ_CHUNK))
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                if offset + len(view) > start:
+                    data += view[max(0, start - offset) : end + 1 - offset]
+                offset += len(view)
+            return bytes(data)
 
         return await async_attempt(f"Synology read of {path}", attempt)
 

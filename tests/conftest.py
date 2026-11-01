@@ -9,7 +9,7 @@ messages and watching what the integration does.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterable, Awaitable, Callable
 import json
 import re
 import time
@@ -35,6 +35,7 @@ from custom_components.scrypted_stamina.const import (
     SUBENTRY_TYPE_DESTINATION,
 )
 from custom_components.scrypted_stamina.destinations import Destination, DestinationError
+from custom_components.scrypted_stamina.destinations.base import gather
 
 pytest_plugins = "pytest_homeassistant_custom_component"
 
@@ -451,6 +452,9 @@ class FakeDestination(Destination):
             raise DestinationError(f"refused {path}")
         self.ops.append(("store", path))
         self.files[path] = data
+
+    async def async_store_stream(self, path: str, size: int, chunks: AsyncIterable[bytes]) -> None:
+        await self.async_store(path, await gather(chunks, size))
 
     async def async_delete(self, path: str) -> None:
         self.ops.append(("delete", path))
