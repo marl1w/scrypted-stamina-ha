@@ -1,9 +1,10 @@
-// Events (episodes) per camera: start at the first trigger (or verifier) observation, end a margin after the last observation
-// (or after the last held signal turns off), capped. Subjects inside an event, with a verdict each.
+// Events (episodes) per camera: start at the first trigger observation, or at a verifier's confirmation of what a trigger saw
+// moments before (a verifier alone never starts one), end a margin after the last observation (or after the last held signal
+// turns off), capped. Subjects inside an event, with a verdict each.
 
 import { addTo, enrich, Enrichment, FusionConfig, DEFAULT_FUSION, iou, match, matchEnricher, newSubject, publicSubject, Subject, Verdict } from './fusion';
 import { Observation } from './normalize';
-import { familyOf } from './roles';
+import { compatible, Family, familyOf } from './roles';
 import { Clock, randomId } from './util';
 
 export interface EpisodeConfig {
@@ -20,6 +21,17 @@ export interface EpisodeConfig {
 
 export const DEFAULT_EPISODE: EpisodeConfig = { marginMs: 10_000, capMs: 10 * 60_000, verifyWindowMs: 5_000 };
 export const DEFAULT_MAX_HOLD_MS = 5 * 60_000;
+/**
+ * A verifier repeats its confirmation while it still holds a subject (Coral Guard: every 10 s). A repeat of the same class from
+ * the same verifier within this gap joins that subject and the open event waits this long for it, so a held subject is one
+ * subject in one event, not a new event (or subject) per repeat (ms).
+ */
+export const VERIFIER_REPEAT_GAP_MS = 15_000;
+/**
+ * A verifier observation opens an event only with trigger evidence of a compatible class family (the camera's motion or AI,
+ * including a split camera's whole-frame AI, which cannot open one itself) received within this long before it (ms).
+ */
+export const VERIFIER_TRIGGER_MS = 15_000;
 
 /** A verifier observation confirms only with a concrete class, or as a classless signal of a gated source. */
 export function confirms(o: Observation): boolean {
@@ -115,6 +127,18 @@ export class EpisodeTracker {
     private stopped = false;
     /** the last event closed by the cap, remembered for the margin so the next event continues it */
     private capped: { id: string; at: number } | undefined;
+    /** the open event waits at least until then for a verifier's repeated confirmation (receive time, ms) */
+    private repeatUntil = 0;
+    /** receive time of the last trigger observation per class family (evidence a verifier needs to open an event) */
+    private lastTrigger = new Map<Family, number>();
+
+    /** a trigger of a family compatible with the verifier's observation was received within VERIFIER_TRIGGER_MS */
+    private triggered(o: Observation): boolean {
+        const fam = familyOf(o.class);
+        for (const [f, at] of this.lastTrigger)
+            if (compatible(f, fam) && o.recv - at <= VERIFIER_TRIGGER_MS) return true;
+        return false;
+    }
 
     constructor(public cfg: EpisodeConfig, private env: EpisodeEnv, private hooks: EpisodeHooks) { }
 
@@ -164,6 +188,10 @@ export class EpisodeTracker {
     observe(o: Observation) {
         if (this.stopped || o.role === 'ignore')
             return;
+        if (o.role === 'trigger') {
+            const fam = familyOf(o.class);
+            this.lastTrigger.set(fam, Math.max(this.lastTrigger.get(fam) ?? -Infinity, o.recv));
+        }
         if (o.ambiguous) { this.observeAmbiguous(o); return; }
         if (o.role === 'enricher') {
             const ev = this.current;
@@ -175,6 +203,10 @@ export class EpisodeTracker {
             this.queueUpdate(o);
             return;
         }
+        // a verifier only confirms what a trigger saw: alone it never starts an event. Coral Guard repeats a held confirmation
+        // every 10 s; after the event that saw the subject had closed, those repeats opened one event each.
+        if (!this.current && o.role === 'verifier' && !this.triggered(o))
+            return;
         let ev = this.current;
         const starting = !ev;
         if (!ev)
@@ -182,6 +214,8 @@ export class EpisodeTracker {
         this.count(ev, o);
         ev.last_observation = Math.max(ev.last_observation, o.t);
         ev.lastRecv = Math.max(ev.lastRecv, o.recv);
+        if (o.role === 'verifier' && familyOf(o.class) !== 'any')
+            this.repeatUntil = Math.max(this.repeatUntil, o.recv + VERIFIER_REPEAT_GAP_MS);
         const decided = this.place(ev, o);
         if (starting) {
             ev.latency.event_start_sent = this.now();
@@ -200,6 +234,8 @@ export class EpisodeTracker {
     hold(key: string, on: boolean, o?: Observation) {
         if (this.stopped) return;
         if (on && o) {
+            // a verifier's signal alone never starts an event (see observe), nor holds one that is not open
+            if (o.role === 'verifier' && !this.current && !this.triggered(o)) return;
             const prev = this.holds.get(key);
             if (prev) this.env.clock.clearTimeout(prev.timer);
             const timer = this.env.clock.setTimeout(() => {
@@ -269,6 +305,7 @@ export class EpisodeTracker {
             startRecv: now, lastRecv: o.recv,
         };
         this.capped = undefined;
+        this.repeatUntil = 0;
         this.current = ev;
         this.lastUpdateAt = now;
         this.capTimer = this.env.clock.setTimeout(() => this.close('cap'), this.cfg.capMs);
@@ -295,7 +332,7 @@ export class EpisodeTracker {
         }
         else {
             s = match(ev.subjects, o, this.fusion);
-            if (!s && confirming) s = this.pendingMatch(ev, o);
+            if (!s && confirming) s = this.pendingMatch(ev, o) ?? this.repeatMatch(ev, o);
         }
         if (!s) {
             if (ev.subjects.length >= MAX_SUBJECTS) {
@@ -340,6 +377,23 @@ export class EpisodeTracker {
         if (fam === 'any') return undefined;
         return ev.subjects.find(s => s.verdict === 'pending' && s.family === fam && o.recv - s.firstRecv <= this.cfg.verifyWindowMs
             && !(o.box && s.box && iou(o.box, s.box) < this.fusion.iou));
+    }
+
+    /**
+     * A verifier repeating its confirmation of a held subject: the same class family from the same verifier within
+     * VERIFIER_REPEAT_GAP_MS of that subject's last observation joins it (the 2 s class-and-time rule would start a new subject
+     * per repeat), unless both have boxes that do not overlap.
+     */
+    private repeatMatch(ev: EventRecord, o: Observation): Subject | undefined {
+        const fam = familyOf(o.class);
+        if (fam === 'any') return undefined;
+        let best: Subject | undefined;
+        for (const s of ev.subjects) {
+            if (s.family !== fam || s.verdict !== 'confirmed' || s.sources[o.source] === undefined || o.recv - s.lastRecv > VERIFIER_REPEAT_GAP_MS) continue;
+            if (o.box && s.box && iou(o.box, s.box) < this.fusion.iou) continue;
+            if (!best || s.lastRecv > best.lastRecv) best = s;
+        }
+        return best;
     }
 
     /** The verdict of a subject no verifier confirmed: vetoed when the verifier is alive, unverified when it went silent. */
@@ -388,7 +442,7 @@ export class EpisodeTracker {
         if (!ev) return;
         if (this.endTimer !== undefined) { this.env.clock.clearTimeout(this.endTimer); this.endTimer = undefined; }
         if (this.holds.size) return;
-        const wait = Math.max(0, ev.lastRecv + this.cfg.marginMs - this.now());
+        const wait = Math.max(0, ev.lastRecv + this.cfg.marginMs - this.now(), this.repeatUntil - this.now());
         this.endTimer = this.env.clock.setTimeout(() => { this.endTimer = undefined; if (this.current === ev) this.close('quiet'); }, wait);
     }
 
@@ -413,9 +467,10 @@ export class EpisodeTracker {
         if (reason === 'cap') this.capped = { id: ev.id, at: this.now() };
         this.hooks.onEnd(ev);
         // capped while a signal is still held: activity carries on in a new event at once
-        if (reason === 'cap' && this.holds.size && !this.stopped) {
+        // (a verifier's hold alone does not: a verifier never starts an event)
+        const first = [...this.holds.values()].map(h => h.o).find(x => x.role !== 'verifier');
+        if (reason === 'cap' && first && !this.stopped) {
             const now = this.now();
-            const first = [...this.holds.values()][0].o;
             this.observe({ ...first, t: now, recv: now });
         }
     }

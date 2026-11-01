@@ -102,7 +102,7 @@ There is no per-camera override. A **class map** per source normalises names (`p
 
 ### 2.2 Events (episodes) and subjects
 
-- An event starts at the first trigger, or at the first verifier observation if there is no trigger. It ends a configurable margin (default 10 s) after the last observation, and is capped at 10 min.
+- An event starts at the first trigger, or at a verifier's confirmation that follows a trigger of a compatible class within 15 s (on a split camera, the parent's ambiguous AI, which cannot open one itself). A verifier alone never starts an event. It ends a configurable margin (default 10 s) after the last observation, and is capped at 10 min. A verifier repeating its confirmation of a held subject (Coral Guard: every 10 s) within 15 s joins that subject and keeps the event open, rather than adding a subject or an event per repeat.
 - **Subjects** group observations of one physical object inside the event, by:
   1. the same track id;
   2. box overlap (IoU ≥ 0.3 after scaling to the same frame);

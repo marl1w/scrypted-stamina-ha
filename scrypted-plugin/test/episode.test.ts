@@ -85,14 +85,60 @@ test('event starts at the first trigger and ends a margin after the last observa
     assert.equal(tr.current, undefined);
 });
 
-test('a verifier observation starts an event when there is no trigger; enrichers alone do not', () => {
+test('a verifier alone never starts an event (detection or held signal); enrichers alone do not either', () => {
     const { clock, log, tr } = setup(true);
     tr.observe(obs(clock, { role: 'enricher', class: 'face' }));
+    tr.observe(obs(clock, { source: V, role: 'verifier' }));
+    tr.hold('cg-motion', true, obs(clock, { source: V, role: 'verifier', kind: 'motion', class: 'motion', gated: true }));
     assert.equal(log.length, 0);
+    assert.equal(tr.current, undefined);
+    assert.equal(tr.held('cg-motion'), false, 'no hold is kept for an event that was never opened');
+    // the camera's trigger opens it; the verifier then confirms
+    tr.observe(obs(clock));
     tr.observe(obs(clock, { source: V, role: 'verifier' }));
     assert.equal(log[0].type, 'start');
-    assert.equal(log[0].ev.trigger.role, 'verifier');
-    assert.equal(log[1].s!.verdict, 'confirmed');
+    assert.equal(log[0].ev.trigger.role, 'trigger');
+    assert.equal(tr.current!.subjects[0].verdict, 'confirmed');
+});
+
+test('a verifier repeating a held confirmation every 10 s extends the one event and its subject; afterwards it opens nothing', () => {
+    const { clock, log, tr } = setup(true);
+    tr.observe(obs(clock));                                           // the camera's person: the only trigger
+    clock.advance(1000);
+    tr.observe(obs(clock, { source: V, role: 'verifier' }));          // confirmed
+    for (let i = 0; i < 20; i++) {                                    // held: repeated every 10.5 s (the margin is 10 s)
+        clock.advance(10_500);
+        tr.observe(obs(clock, { source: V, role: 'verifier' }));
+    }
+    assert.equal(log.filter(l => l.type === 'start').length, 1);
+    assert.ok(!log.some(l => l.type === 'end'), 'still open while the repeats arrive');
+    assert.equal(tr.current!.subjects.length, 1, 'every repeat joins the confirmed subject');
+    clock.advance(15_000);
+    const end = log.find(l => l.type === 'end')!.ev;
+    assert.equal(end.end, end.last_observation + DEFAULT_EPISODE.marginMs, 'the end is still the margin after the last observation');
+    // late repeats after the end (the verifier still holding a subject nobody else sees) open nothing
+    for (let i = 0; i < 5; i++) { clock.advance(10_000); tr.observe(obs(clock, { source: V, role: 'verifier' })); }
+    assert.equal(log.filter(l => l.type === 'start').length, 1);
+});
+
+test('a verifier repeat beyond the gap, or of another class, starts a new subject', () => {
+    const { clock, tr } = setup(true);
+    tr.hold('m', true, obs(clock, { kind: 'motion', class: 'motion' }));
+    tr.observe(obs(clock));
+    tr.observe(obs(clock, { source: V, role: 'verifier' }));
+    clock.advance(16_000);
+    tr.observe(obs(clock, { source: V, role: 'verifier' }));
+    tr.observe(obs(clock, { source: V, role: 'verifier', class: 'car' }));
+    assert.deepEqual(tr.current!.subjects.map(s => s.class), ['person', 'person', 'car'], 'the held motion kept the event open');
+});
+
+test('a capped event is not continued by a verifier\'s hold alone', () => {
+    const { clock, log, tr } = setup(true);
+    tr.observe(obs(clock));
+    tr.hold('cg-motion', true, obs(clock, { source: V, role: 'verifier', kind: 'motion', class: 'motion', gated: true }));
+    for (let i = 0; i < 6; i++) { clock.advance(2 * 60_000); tr.hold('cg-motion', true, obs(clock, { source: V, role: 'verifier', kind: 'motion', class: 'motion', gated: true })); }
+    assert.equal(log.filter(l => l.type === 'end')[0].ev.end_reason, 'cap');
+    assert.equal(log.filter(l => l.type === 'start').length, 1);
 });
 
 test('held signals keep the event open; it ends a margin after the last one turns off', () => {

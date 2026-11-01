@@ -210,7 +210,7 @@ Message types:
 
 | `type` | When | Fields |
 |---|---|---|
-| `event.start` | first trigger (or verifier) observation of a camera with no open event | `event`, `observations` |
+| `event.start` | first trigger observation of a camera with no open event, or a verifier's confirmation within 15 s of a trigger of a compatible class (a verifier alone never starts one) | `event`, `observations` |
 | `event.update` | new observations, context changes, segment state changes; at most 1 per second per event | `event`, `observations` (only the new ones, at most 50) |
 | `subject.verdict` | a subject's verdict is decided or changes | `event_id`, `camera_id`, `subject` |
 | `event.segment` | `kind: cut`: a media segment was cut (the first one also means its init is ready); `kind: evicted`: segments were dropped for memory; `kind: last`: no more segments for this event | `event_id`, `camera_id`, `kind`, `last`, `segment` (or `null`), `evicted`, `next`, `state`, `reason` |

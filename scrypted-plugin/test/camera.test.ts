@@ -166,6 +166,7 @@ test('roles: ignore drops a source entirely', () => {
 
 test('verifier memory persists across restarts; stop closes the open event and unbinds', () => {
     const { sc, clock, core, out, roles } = setup();
+    sc.emit('7', 'ObjectDetector', { sourceId: CAMP, timestamp: clock.now(), detections: [{ className: 'people', score: 0.9 }] });
     sc.emit('7', 'ObjectDetector', { sourceId: '913', timestamp: clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
     core.stop();
     assert.equal(out[out.length - 1].type, 'event.end');
@@ -386,14 +387,31 @@ test('split: Coral Guard on the crop opens the event; the parent\'s AI within 2 
 
 test('split: the parent\'s AI of another family, or later than 2 s, does not join', () => {
     const x = splitSetup();
-    x.coralOnCrop();
+    x.ai();
+    x.clock.advance(900);
+    x.coralOnCrop();             // opens the event: the parent's AI is its trigger evidence and joins it
     x.clock.advance(2500);
     x.ai();
     x.sc.emit('501', 'ObjectDetector', { sourceId: CAMP, timestamp: x.clock.now(), detections: [{ className: 'vehicle', score: 0.9 }] });
     x.clock.advance(1000);
     const ev = x.out['502'].filter(m => m.type === 'event.update').pop()?.body.event ?? x.out['502'][0].body.event;
     assert.equal(ev.subjects.length, 1);
-    assert.equal(ev.subjects[0].sources[CAMP], undefined);
+    assert.equal(ev.subjects[0].sources[CAMP].count, 1, 'only the AI from before Coral Guard joined');
+});
+
+test('split: Coral Guard on the crop opens no event without the parent\'s AI shortly before (a held subject\'s repeats)', () => {
+    const x = splitSetup();
+    for (let i = 0; i < 6; i++) { x.coralOnCrop(); x.clock.advance(10_000); }
+    assert.equal(x.out['502'].filter(m => m.type === 'event.start').length, 0);
+    // a vehicle seen by the parent's AI is no evidence for a person
+    x.sc.emit('501', 'ObjectDetector', { sourceId: CAMP, timestamp: x.clock.now(), detections: [{ className: 'vehicle', score: 0.9 }] });
+    x.clock.advance(1000);
+    x.coralOnCrop();
+    assert.equal(x.out['502'].filter(m => m.type === 'event.start').length, 0);
+    x.ai();
+    x.clock.advance(4000);
+    x.coralOnCrop();
+    assert.equal(x.out['502'].filter(m => m.type === 'event.start').length, 1);
 });
 
 test('detections are taken from the plain, layer and system listeners, each payload once', () => {
