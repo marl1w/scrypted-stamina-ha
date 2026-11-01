@@ -314,6 +314,12 @@ export function formatTime(hass, epochS, seconds = false) {
   );
 }
 
+/** The local hour of a time, 0..23, in the zone the rest of the panel uses. */
+export function hourOf(hass, epochS) {
+  const text = formatter(hass, { hour: "2-digit", hourCycle: "h23" }).format(new Date(epochS * 1000));
+  return Number.parseInt(text, 10) % 24;
+}
+
 /** A key that is the same for two times on the same local day. */
 export function dayKey(hass, epochS) {
   return formatter(hass, { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(epochS * 1000));

@@ -91,12 +91,9 @@ button { border: none; background: none; cursor: pointer; padding: 0; }
 .split { flex: 1 1 auto; min-height: 0; display: flex; }
 .pane { min-height: 0; overflow: auto; overscroll-behavior: contain; position: relative; }
 .pane--list { flex: 1 1 auto; container: list / inline-size; }
-/* The list is the main column; the event beside it never grows past a sane player width. */
-/* The zero-width tracks hold the drag handles; a width set by hand comes in as a variable. */
-.split--wide { display: grid; grid-template-columns: minmax(0, 1fr) 0 var(--ss-detail-w, clamp(380px, 36%, 640px)); }
-.split--wide.split--roomy {
-  grid-template-columns: var(--ss-cams-w, clamp(220px, 15%, 280px)) 0 minmax(0, 1fr) 0 var(--ss-detail-w, clamp(380px, 32%, 640px));
-}
+/* The list is the main column; the event beside it keeps a sane player width unless dragged.
+   The zero-width track holds the drag handle; a width set by hand comes in as a variable. */
+.split--wide { display: grid; grid-template-columns: minmax(0, 1fr) 0 var(--ss-detail-w, clamp(380px, 34%, 640px)); }
 .resizer {
   position: relative; z-index: 4; width: 10px; margin-left: -3px;
   cursor: col-resize; touch-action: none;
@@ -111,7 +108,6 @@ button { border: none; background: none; cursor: pointer; padding: 0; }
 /* Beside the event the list fills its column: no centred gutters on a wide screen. */
 .split--wide .pane--list .page { max-width: none; }
 .split--wide .pane--list { border-right: 1px solid var(--ss-line); }
-.pane--cams { border-right: 1px solid var(--ss-line); background: var(--ss-bg); }
 .pane--detail { background: var(--ss-bg); }
 .page { max-width: 1040px; margin: 0 auto; padding: 0 0 calc(24px + env(safe-area-inset-bottom, 0px)); }
 
@@ -318,46 +314,8 @@ details.card[open] > summary::after { transform: rotate(180deg); }
 }
 .event-id { margin: 12px 0 0; font-size: 0.78rem; color: var(--ss-dim); overflow-wrap: anywhere; }
 
-/* ------------------------------------------------------------------ cameras */
+/* ------------------------------------------------------------------ small marks */
 
-/* Folded above the list (a phone, a narrow window): one line that says what needs a look. */
-.cams { margin: 10px 12px 0; border-radius: var(--ss-radius); background: var(--ss-surface); box-shadow: inset 0 0 0 1px var(--ss-line); }
-.cams__toggle {
-  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 44px; padding: 0 14px; text-align: left;
-}
-.cams__toggle::after { content: "▾"; margin-left: auto; color: var(--ss-dim); transition: transform 150ms; }
-.cams.is-open .cams__toggle::after { transform: rotate(180deg); }
-.cams__title { font-weight: 600; font-size: 0.9rem; }
-.cams__summary { display: inline-flex; align-items: center; gap: 6px; font-size: 0.84rem; color: var(--ss-dim); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cams__body {
-  display: none; padding: 0 8px 10px;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 4px 12px; align-items: start;
-}
-.cams.is-open .cams__body { display: grid; }
-.cam-all {
-  grid-column: 1 / -1; justify-self: start; min-height: 36px; padding: 0 10px; border-radius: 8px;
-  font-size: 0.84rem; font-weight: 500; color: var(--ss-dim);
-}
-.cam-all[aria-pressed="true"] { color: var(--ss-text); background: color-mix(in srgb, var(--ss-accent) 14%, transparent); }
-.cam-group { display: flex; flex-direction: column; min-width: 0; }
-.cam-group__label {
-  display: flex; justify-content: space-between; align-items: center;
-  align-self: stretch; text-align: left; padding: 8px 10px 2px; border-radius: 8px;
-  font-size: 0.72rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ss-dim);
-}
-/* An area is a filter too: it looks like a row you can press. */
-button.cam-group__label { min-height: 32px; padding-top: 4px; padding-bottom: 4px; }
-button.cam-group__label:hover { color: var(--ss-text); background: color-mix(in srgb, var(--ss-accent) 6%, transparent); }
-.cam-group__count { font-weight: 500; letter-spacing: 0; font-variant-numeric: tabular-nums; }
-.cam-group__label[aria-pressed="true"] { color: var(--ss-text); background: color-mix(in srgb, var(--ss-accent) 14%, transparent); }
-.cam-chip {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px;
-  width: 100%; min-height: 36px; padding: 4px 10px; border-radius: 8px; text-align: left;
-}
-.cam-chip:hover { background: color-mix(in srgb, var(--ss-accent) 6%, transparent); }
-.cam-chip[aria-pressed="true"] { background: color-mix(in srgb, var(--ss-accent) 18%, transparent); }
-.cam-chip__name { flex: 1 1 auto; min-width: 0; font-weight: 500; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* A long state drops under the name rather than cutting it short. */
 .mini { width: 28px; height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--ss-accent) 22%, transparent); overflow: hidden; }
 .mini > span { display: block; height: 100%; background: var(--ss-accent); }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; background: var(--tone, var(--ss-neutral)); }
@@ -367,16 +325,23 @@ button.cam-group__label:hover { color: var(--ss-text); background: color-mix(in 
 .dot[data-tone="accent"] { --tone: var(--ss-accent); }
 .dot[data-tone="none"] { --tone: transparent; }
 
-/* Its own column when roomy: always open, no fold. */
-.pane--cams .cams { margin: 0; border-radius: 0; background: none; box-shadow: none; padding: 8px 4px 24px; }
-.pane--cams .cams__toggle { display: none; }
-.pane--cams .cams__body { display: flex; flex-direction: column; gap: 6px; padding: 0; }
-
 /* ------------------------------------------------------------------ the Cameras tab */
 
 .cams-page { flex: 1 1 auto; min-height: 0; overflow: auto; container: camspage / inline-size; }
 .cams-page__inner { max-width: 1280px; margin: 0 auto; padding: 8px 12px calc(24px + env(safe-area-inset-bottom, 0px)); }
-.cams-page__summary { margin: 8px 4px 12px; color: var(--ss-dim); font-size: 0.9rem; }
+.cams-page__summary { margin: 8px 4px 2px; color: var(--ss-dim); font-size: 0.9rem; }
+.cams-page__note { margin: 0 4px 12px; color: var(--ss-dim); font-size: 0.8rem; }
+/* The week by hour: a strip of 24 hours per class, darker where busier. */
+.cam-recap {
+  flex: 1 0 100%; display: grid; grid-template-columns: 5.5em minmax(0, 1fr) 2.5em; gap: 3px 8px; align-items: center;
+  margin-top: 6px; font-size: 0.75rem; color: var(--ss-dim);
+}
+.cam-recap--empty { display: block; }
+.cam-recap__strip { display: grid; grid-template-columns: repeat(24, 1fr); gap: 1px; height: 12px; }
+.cam-recap__hour { background: var(--ss-accent); border-radius: 1px; }
+.cam-recap__hour[data-empty="true"] { background: color-mix(in srgb, var(--ss-text) 7%, transparent); }
+.cam-recap__total { text-align: right; font-variant-numeric: tabular-nums; }
+.cam-recap__axis { display: grid; grid-template-columns: repeat(4, 1fr); font-size: 0.68rem; }
 .cam-table { background: var(--ss-surface); border-radius: var(--ss-radius); box-shadow: inset 0 0 0 1px var(--ss-line); overflow: hidden; }
 .cam-area {
   margin: 0; padding: 14px 16px 6px; border-top: 1px solid var(--ss-line);
@@ -407,17 +372,18 @@ button.cam-group__label:hover { color: var(--ss-text); background: color-mix(in 
   }
   .cam-row__name { flex: none; }
   .cam-cell__label { display: none; }
+  .cam-recap { grid-column: 2 / -1; max-width: 640px; }
 }
 
 /* ------------------------------------------------------------------ learning */
 
 /* In place of the meter while a camera learns: neutral, and plainly not a verdict. */
 .learning-tag {
-  flex: 0 0 auto; align-self: center; max-width: 110px; padding: 2px 8px; border-radius: 6px;
+  flex: 0 0 auto; align-self: center; padding: 2px 8px; border-radius: 6px; white-space: nowrap;
   font-size: 0.72rem; font-weight: 500; line-height: 1.4; color: var(--ss-dim); text-align: center;
   background: color-mix(in srgb, var(--ss-text) 7%, transparent);
 }
-.learning-tag--large { max-width: none; font-size: 0.9rem; padding: 4px 10px; }
+.detail__title .learning-tag { align-self: baseline; }
 @container list (min-width: 640px) {
   .row .learning-tag { width: 104px; order: -1; }
 }

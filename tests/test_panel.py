@@ -538,7 +538,14 @@ def test_the_panel_is_two_tabs_and_no_history() -> None:
     source = (panel.FRONTEND_DIR / "scrypted-stamina-panel.js").read_text()
     assert "pushState" not in source  # the URL is only ever replaced: Back leaves the panel
     assert "_back(" not in source
-    for needed in ("WIDE_PX", "_preselect", "ArrowDown", "cam-chip", "aria-expanded", '"/cameras"'):
+    for needed in (
+        "WIDE_PX",
+        "_preselect",
+        "ArrowDown",
+        "All cameras",
+        "aria-expanded",
+        '"/cameras"',
+    ):
         assert needed in source, needed
 
 
