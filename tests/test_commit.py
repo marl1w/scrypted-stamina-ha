@@ -336,13 +336,10 @@ async def test_one_commit_uploads_at_a_time(hass, index) -> None:
     first, second = Gate(), Gate()
     uploader = await prepared(hass, index, {"a": first, "b": second})
     record = make_record()
-    one = asyncio.create_task(
-        uploader._async_commit_copy(uploader.targets["a"], record, await copy_of(index, "a"))
-    )
-    two = asyncio.create_task(
-        uploader._async_commit_copy(uploader.targets["b"], record, await copy_of(index, "b"))
-    )
-    await first.started.wait()
+    copy_a, copy_b = await copy_of(index, "a"), await copy_of(index, "b")
+    one = asyncio.create_task(uploader._async_commit_copy(uploader.targets["a"], record, copy_a))
+    await first.started.wait()  # the first is uploading before the second begins
+    two = asyncio.create_task(uploader._async_commit_copy(uploader.targets["b"], record, copy_b))
     await asyncio.sleep(0.05)
     assert not second.started.is_set()  # waiting for the first upload, not beside it
     first.release.set()
