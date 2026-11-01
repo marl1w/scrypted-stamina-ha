@@ -67,6 +67,7 @@ class FakeManager:
     analysis: FakeAnalysis = field(default_factory=FakeAnalysis)
     recorder_retention_days: float = 7.0
     link_healthy: bool = True
+    refreshes: int = 0
 
     def cloud_path(self, record: EventRecord) -> str | None:
         if record.state is EventState.DROPPED:
@@ -75,6 +76,9 @@ class FakeManager:
 
     def linked_kinds(self, camera: str) -> dict[str, str]:
         return {"binary_sensor.side_gate": "door", "binary_sensor.hall": "presence"}
+
+    async def async_refresh_cameras(self) -> None:
+        self.refreshes += 1
 
 
 class ScanOnlyIndex:
@@ -445,6 +449,8 @@ async def test_cameras(hass, hass_ws_client, stamina_entry) -> None:
     result = await call(client, type=f"{DOMAIN}/cameras")
 
     assert [cam["name"] for cam in result["cameras"]] == ["Front door", "Driveway", "Garden"]
+    # Capabilities are read again for each request, not only at startup.
+    assert stamina_entry.manager.refreshes == 1
     front = result["cameras"][0]
     assert front["online"] is True and front["verifier_live"] is True
     assert front["verifiers"] == [VERIFIER]

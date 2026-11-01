@@ -20,7 +20,9 @@ the signed views in `playback.py`.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+import contextlib
 from dataclasses import dataclass
 import math
 import re
@@ -543,10 +545,14 @@ async def ws_event(
     connection.send_result(msg["id"], {"event": await event_detail(hass, entry, data, record)})
 
 
+# The camera list waits this long for fresh capabilities, seconds.
+CAMERAS_REFRESH_TIMEOUT = 5.0
+
+
 @websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/cameras"})
 @websocket_api.require_admin
-@callback
-def ws_cameras(
+@websocket_api.async_response
+async def ws_cameras(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
     """Return each camera's status, capabilities and learning progress."""
@@ -554,6 +560,11 @@ def ws_cameras(
     if entry is None:
         return
     data: StaminaData = entry.runtime_data
+    # Capabilities change while running (verifier_live follows the verifier's beat): read them
+    # now, not only at startup. Slow or unreachable plugin: the last known ones.
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(CAMERAS_REFRESH_TIMEOUT):
+            await data.manager.async_refresh_cameras()
     connection.send_result(
         msg["id"],
         {
