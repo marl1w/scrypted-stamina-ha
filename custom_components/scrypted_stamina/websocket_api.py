@@ -342,6 +342,8 @@ async def event_detail(
         "follow_up_until": record.follow_up_until,
         "watching": watching,
         "late_evidence": [_late(hass, item) for item in record.late],
+        # The same shape, from the look-back window: `t_rel_s` from the start, negative.
+        "early_evidence": [_late(hass, item) for item in record.early],
         "learning": manager.analysis.state(record.camera) == "learning",
         "keep_reason": record.keep_reason,
         "target": record.target,

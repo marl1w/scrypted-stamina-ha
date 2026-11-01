@@ -11,11 +11,14 @@ Two sources, both read here and nowhere else:
 
 A snapshot is taken at `event.start` and `event.end`: each linked entity's state and when
 it last changed *relative to the event* ("door opened 5 s before"). During the follow-up
-window, changes of the linked entities are collected as late evidence.
+window, changes of the linked entities are collected as late evidence; and the changes in
+the look-back window before the start, kept in a small in-memory ring (`RecentChanges`), as
+early evidence ("gate opened 20 s before").
 """
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Any
 
 from homeassistant.const import ATTR_DEVICE_CLASS
@@ -139,3 +142,62 @@ def late_change(
         "t_rel_s": round(at - ended, 1),
         "t_from_start_s": round(at - started, 1),
     }
+
+
+# States that are not a reading: a change into or out of one is an integration starting,
+# stopping or losing its device, never something that happened outdoors.
+_NOT_READINGS = frozenset({"unknown", "unavailable"})
+# Changes kept per entity. A sensor flapping more than this within the look-back window says
+# nothing more by its twentieth change; the newest are the ones nearest the event.
+_RECENT_PER_ENTITY = 16
+
+
+class RecentChanges:
+    """The last few changes of every linked entity, for the look-back window.
+
+    In memory only, and that is deliberate: the window is minutes long, so a restart loses at
+    most one window's worth, while asking the recorder at every event start would be a
+    database query per event. Changes into or out of `unknown` and `unavailable` are not
+    kept, so the states settling after a restart are not read as activity.
+    """
+
+    def __init__(self, keep_seconds: float) -> None:
+        """Keep changes this long."""
+        self._keep = keep_seconds
+        self._changes: dict[str, deque[tuple[float, str, str]]] = {}
+
+    def add(self, entity_id: str, old: State | None, new: State | None) -> None:
+        """Remember one state change, when it is a real one."""
+        if old is None or new is None or old.state == new.state:
+            return
+        if old.state in _NOT_READINGS or new.state in _NOT_READINGS:
+            return
+        at = new.last_changed.timestamp()
+        changes = self._changes.setdefault(entity_id, deque(maxlen=_RECENT_PER_ENTITY))
+        while changes and changes[0][0] < at - self._keep:
+            changes.popleft()
+        changes.append((at, old.state, new.state))
+
+    def between(
+        self, kinds: dict[str, str], *, started: float, since: float, until: float
+    ) -> list[dict[str, Any]]:
+        """Return the changes of these entities from `since` to `until`, oldest first.
+
+        `kinds` maps each entity to its kind. Each item's `t_rel_s` is relative to the start:
+        negative before it ("gate opened 20 s before" is -20). A change a moment after the
+        start, made while the start was on its way to Home Assistant, is kept as well.
+        """
+        found = [
+            {
+                "entity": entity_id,
+                "kind": kind,
+                "from": old,
+                "to": new,
+                "t_rel_s": round(at - started, 1),
+            }
+            for entity_id, kind in kinds.items()
+            for at, old, new in self._changes.get(entity_id, ())
+            if since <= at <= until
+        ]
+        found.sort(key=lambda item: item["t_rel_s"])
+        return found

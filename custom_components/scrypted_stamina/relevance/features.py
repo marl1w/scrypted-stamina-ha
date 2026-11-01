@@ -16,7 +16,8 @@ What is counted, and where it goes in the model:
   conditioned on, so none of them divides the history. Numeric ones (dwell, wind, sun
   elevation) are banded by the model from their own history. They are the verdict mix, the
   sources, the subject count, dwell, night mode, tamper, audio, the weather, the sun, each
-  linked entity's state at the start, and the late evidence from the follow-up window.
+  linked entity's state at the start, the early evidence from the look-back window, and
+  the late evidence from the follow-up window.
 
 No explicit rules: nothing here says "a person at night is unusual". It only names what
 happened, and the model learns what is normal for it.
@@ -46,6 +47,25 @@ _HALF_DAY_MINUTES = _MINUTES_PER_DAY // 2
 
 # Late evidence, bucketed by how long after the event's end it came.
 LATE_BUCKETS = ((30.0, "<30s"), (120.0, "<2m"), (600.0, "<10m"))
+
+# Early and late evidence, as a person reads the bucket: "changed within 30 s before".
+_TIMING = {
+    "<30s": "within 30 s",
+    "<2m": "within 2 min",
+    "<10m": "within 10 min",
+    "later": "more than 10 min",
+}
+# What each kind of linked entity is called when its early or late evidence is a reason.
+_KIND_NAMES = {
+    "door": "Door sensors",
+    "motion": "Motion sensors",
+    "presence": "Presence",
+    "vibration": "Vibration sensors",
+    "sound": "Sound sensors",
+    "alarm": "Alarm",
+    "light": "Lights",
+    "lock": "Locks",
+}
 
 # Signal names, as the reason sentence spells them.
 LABELS = {
@@ -171,6 +191,50 @@ def late_signals(late: list[dict[str, Any]]) -> dict[str, str]:
     return signals
 
 
+def early_signals(early: list[dict[str, Any]]) -> dict[str, str]:
+    """Return the early-evidence signals: per entity kind, the change nearest the start.
+
+    The mirror of `late_signals`, bucketed the same way by how long before the start it
+    came. Every kind with a linked entity but no change reads `none`; an alarm that was
+    triggered says so instead.
+    """
+    found: dict[str, str] = {}
+    for item in sorted(early, key=lambda change: abs(float(change.get("t_rel_s", 0.0)))):
+        kind = str(item.get("kind") or "other")
+        key = f"early:{kind}"
+        if str(item.get("to")) == "triggered":
+            found[key] = "triggered"
+            continue
+        found.setdefault(key, late_bucket(abs(float(item.get("t_rel_s", 0.0)))))
+    return found
+
+
+def evidence_name(name: str) -> str | None:
+    """Return what an early or late signal is called in a reason, or None for any other."""
+    side, _, kind = name.partition(":")
+    if side not in ("early", "late") or not kind:
+        return None
+    return _KIND_NAMES.get(kind, "Linked sensors")
+
+
+def evidence_reading(name: str, value: str) -> str:
+    """Return an early or late signal's value as a person reads it; any other as it is.
+
+    Display only: the model counts the raw value, and this never reaches it.
+    """
+    side, _, kind = name.partition(":")
+    if side not in ("early", "late") or not kind:
+        return value
+    edge = "before" if side == "early" else "after"
+    if value == "none":
+        return f"no change {edge}"
+    if value == "triggered":
+        return f"triggered {edge}"
+    if value in _TIMING:
+        return f"changed {_TIMING[value]} {edge}"
+    return value
+
+
 # What a split camera's whole-frame AI counts as: a source of its own, so it is learned as
 # weak evidence and never mistaken for the view's own camera AI.
 WHOLE_FRAME = "whole-frame"
@@ -217,6 +281,12 @@ def signals(
         if entity_id.startswith("_") or not isinstance(item, dict):
             continue
         found[entity_id] = str(item.get("state", "unknown"))
+
+    # Known from the start, so counted by the live score too.
+    early = early_signals(record.early)
+    for kind in sorted(set((linked_kinds or {}).values())):
+        found.setdefault(f"early:{kind}", early.get(f"early:{kind}", "none"))
+    found.update(early)
 
     if include_late:
         late = late_signals(record.late)

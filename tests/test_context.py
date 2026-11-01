@@ -5,8 +5,10 @@ from __future__ import annotations
 import time
 
 from homeassistant.core import State
+from homeassistant.util import dt as dt_util
 
 from custom_components.scrypted_stamina.context import (
+    RecentChanges,
     default_weather,
     entity_kind,
     late_change,
@@ -15,6 +17,12 @@ from custom_components.scrypted_stamina.context import (
 
 from .conftest import CAMERA, event_id, subject, until
 from .test_events import OPTIONS
+
+
+def changed(entity_id: str, old: str, new: str, at: float) -> tuple[State, State]:
+    """A state change at a given moment."""
+    stamp = dt_util.utc_from_timestamp(at)
+    return State(entity_id, old), State(entity_id, new, last_changed=stamp)
 
 
 async def test_snapshot_states_and_changes_relative_to_the_event(hass) -> None:
@@ -84,4 +92,56 @@ async def test_context_is_taken_at_start_and_end(hass, stamina, setup) -> None:
     await until(lambda: bool(manager.records[eid].context_end))
     assert manager.records[eid].context_end["binary_sensor.gate"]["state"] == "on"
     assert CAMERA in manager.cameras
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_recent_changes_cover_the_look_back_window() -> None:
+    """The ring keeps real changes only, and answers relative to the start."""
+    start = 1_000_000.0
+    recent = RecentChanges(600.0)
+    recent.add("binary_sensor.gate", *changed("binary_sensor.gate", "off", "on", start - 20))
+    recent.add("binary_sensor.gate", *changed("binary_sensor.gate", "on", "off", start - 5))
+    recent.add("light.porch", *changed("light.porch", "off", "on", start - 300))
+    # Not activity: an integration coming back, or nothing changing at all.
+    recent.add("binary_sensor.shed", *changed("binary_sensor.shed", "unavailable", "on", start))
+    recent.add("binary_sensor.shed", *changed("binary_sensor.shed", "on", "on", start))
+
+    kinds = {"binary_sensor.gate": "door", "light.porch": "light", "binary_sensor.shed": "door"}
+    found = recent.between(kinds, started=start, since=start - 120, until=start + 3)
+    gate = {"entity": "binary_sensor.gate", "kind": "door"}
+    assert found == [
+        {**gate, "from": "off", "to": "on", "t_rel_s": -20.0},
+        {**gate, "from": "on", "to": "off", "t_rel_s": -5.0},
+    ]
+    # A wider window reaches the light; an entity not asked for is never returned.
+    wider = recent.between({"light.porch": "light"}, started=start, since=start - 600, until=start)
+    assert [item["t_rel_s"] for item in wider] == [-300.0]
+
+
+def test_recent_changes_forget_what_is_older_than_they_keep() -> None:
+    start = 1_000_000.0
+    recent = RecentChanges(60.0)
+    recent.add("binary_sensor.gate", *changed("binary_sensor.gate", "off", "on", start - 500))
+    recent.add("binary_sensor.gate", *changed("binary_sensor.gate", "on", "off", start))
+    found = recent.between({"binary_sensor.gate": "door"}, started=start, since=0, until=start)
+    assert [item["to"] for item in found] == ["off"]
+
+
+async def test_changes_before_the_start_are_early_evidence(hass, stamina, setup) -> None:
+    """A gate opened just before the camera saw someone is linked to the event."""
+    hass.states.async_set("binary_sensor.gate", "off", {"device_class": "door"})
+    entry = await setup(options=OPTIONS)
+    manager = entry.runtime_data.manager
+    hass.states.async_set("binary_sensor.gate", "on", {"device_class": "door"})
+    await hass.async_block_till_done()
+
+    eid = event_id(71)
+    stamina.start(eid, subjects=[subject("s1")])
+    await until(lambda: eid in manager.records)
+    early = manager.records[eid].early
+    assert [(item["entity"], item["kind"], item["from"], item["to"]) for item in early] == [
+        ("binary_sensor.gate", "door", "off", "on")
+    ]
+    assert -120.0 <= early[0]["t_rel_s"] <= 30.0
+    assert manager.look_back_seconds(CAMERA) == 120.0
     await hass.config_entries.async_unload(entry.entry_id)

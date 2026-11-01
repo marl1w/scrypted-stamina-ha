@@ -34,7 +34,15 @@ from ..const import (
 )
 from ..decider import EventRecord, Policy
 from ..index import record_from_dict
-from .features import LABELS, Event, SolarClock, event_from_json, event_to_json, to_event
+from .features import (
+    LABELS,
+    Event,
+    SolarClock,
+    event_from_json,
+    event_to_json,
+    evidence_name,
+    to_event,
+)
 from .rates import Model, build, group_key
 from .score import Score, calibrate, ready, score
 
@@ -251,8 +259,9 @@ class Analysis:
         names = self._names()
         labels = dict(LABELS)
         for entity_id in dict(event.context):
-            state = self._hass.states.get(entity_id)
-            if state is not None:
+            if (name := evidence_name(entity_id)) is not None:
+                labels[entity_id] = name
+            elif (state := self._hass.states.get(entity_id)) is not None:
                 labels[entity_id] = state.name
         result: Score = score(event, self._model, previous=previous, names=names, labels=labels)
         line = result.threshold if result.threshold is not None else self._model.floor

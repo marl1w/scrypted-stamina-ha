@@ -334,6 +334,15 @@ async def test_event_detail(hass, hass_ws_client, stamina_entry) -> None:
                 "t_rel_s": 40,
             }
         ],
+        early=[
+            {
+                "entity": "binary_sensor.side_gate",
+                "kind": "door",
+                "from": "off",
+                "to": "on",
+                "t_rel_s": -20,
+            }
+        ],
         notes=["camera_offline"],
     )
     await stamina_entry.index.async_save(rec)
@@ -365,6 +374,17 @@ async def test_event_detail(hass, hass_ws_client, stamina_entry) -> None:
         "weight": None,
     }
     assert event["late_evidence"][0]["name"] == "Side gate"
+    # The gate opened 20 s before the start, linked to the event as well.
+    assert event["early_evidence"] == [
+        {
+            "entity": "binary_sensor.side_gate",
+            "name": "Side gate",
+            "kind": "door",
+            "from": "off",
+            "to": "on",
+            "t_rel_s": -20,
+        }
+    ]
     subject = event["subjects"][0]
     assert subject["verified_by"] == [VERIFIER] and subject["seen_by"] == [TRIGGER]
     assert subject["dwell"] == 6.0

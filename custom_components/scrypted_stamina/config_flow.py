@@ -50,6 +50,7 @@ from .const import (
     CONF_FOLLOW_UP_MINUTES,
     CONF_HISTORY_SIZE_MB,
     CONF_LINKED,
+    CONF_LOOK_BACK_MINUTES,
     CONF_ORPHAN_RETENTION_DAYS,
     CONF_QUOTA_GB,
     CONF_RECORDER_RETENTION_DAYS,
@@ -66,6 +67,7 @@ from .const import (
     DEFAULT_FOLLOW_UP_CAP_GB,
     DEFAULT_FOLLOW_UP_MINUTES,
     DEFAULT_HISTORY_SIZE_MB,
+    DEFAULT_LOOK_BACK_MINUTES,
     DEFAULT_ORPHAN_RETENTION_DAYS,
     DEFAULT_QUOTA_GB,
     DEFAULT_RECORDER_RETENTION_DAYS,
@@ -79,6 +81,7 @@ from .const import (
     DEFAULT_VERIFY_SSL,
     DOMAIN,
     LEGACY_UNUSUAL_OVERRIDES,
+    LOOK_BACK_MAX_MINUTES,
     RELEVANCE_SCOPES,
     RELEVANCE_SENSITIVITY_FLOORS,
     SUBENTRY_TYPE_DESTINATION,
@@ -429,11 +432,14 @@ class StaminaOptionsFlow(OptionsFlow):
         return sorted(found)
 
     async def async_step_camera(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Ask one camera's linked entities and follow-up window."""
+        """Ask one camera's linked entities, and its look-back and follow-up windows."""
         if user_input is not None:
             camera, _, _ = self._cameras[self._at]
             self._pending[CONF_CAMERAS][camera] = {
                 CONF_LINKED: list(user_input.get(CONF_LINKED) or []),
+                CONF_LOOK_BACK_MINUTES: float(
+                    user_input.get(CONF_LOOK_BACK_MINUTES, DEFAULT_LOOK_BACK_MINUTES)
+                ),
                 CONF_FOLLOW_UP_MINUTES: float(
                     user_input.get(CONF_FOLLOW_UP_MINUTES, DEFAULT_FOLLOW_UP_MINUTES)
                 ),
@@ -447,6 +453,7 @@ class StaminaOptionsFlow(OptionsFlow):
         # A camera starts with nothing linked: the user picks what matters, nothing is guessed.
         linked = list((current or {}).get(CONF_LINKED) or [])
         minutes = (current or {}).get(CONF_FOLLOW_UP_MINUTES, DEFAULT_FOLLOW_UP_MINUTES)
+        before = (current or {}).get(CONF_LOOK_BACK_MINUTES, DEFAULT_LOOK_BACK_MINUTES)
         return self.async_show_form(
             step_id="camera",
             last_step=self._at == len(self._cameras) - 1,
@@ -455,6 +462,15 @@ class StaminaOptionsFlow(OptionsFlow):
                 {
                     vol.Optional(CONF_LINKED, default=linked): selector.EntitySelector(
                         selector.EntitySelectorConfig(multiple=True)
+                    ),
+                    vol.Required(CONF_LOOK_BACK_MINUTES, default=before): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=0,
+                            max=LOOK_BACK_MAX_MINUTES,
+                            step=1,
+                            unit_of_measurement="min",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     ),
                     vol.Required(CONF_FOLLOW_UP_MINUTES, default=minutes): selector.NumberSelector(
                         selector.NumberSelectorConfig(

@@ -255,6 +255,7 @@ _RECORD_FIELDS = (
     "context_start",
     "context_end",
     "late",
+    "early",
     "follow_up_until",
     "finalized",
     "gaps",
@@ -286,7 +287,7 @@ def record_from_dict(data: dict[str, Any]) -> EventRecord:
 
 # What a slim row's record keeps: the decision, the scores and the sentence, the path pieces
 # (`cloud_path`), and the notes (`orphan_complete` decides retention). Context snapshots,
-# late evidence, latency and gaps go.
+# late and early evidence, latency and gaps go.
 _SLIM_FIELDS = (
     "target",
     "admitted",
@@ -364,7 +365,7 @@ def thin_kind(state: str, unusual: bool, features: str | None) -> str | None:
 
     Only ordinary dropped events are thinned. Never: an event kept, committed or orphaned;
     one flagged unusual; or one with a rare context — tamper, an alarm armed or triggered,
-    snow, a storm or exceptional weather, or any late evidence. Whether its kind is common
+    snow, a storm or exceptional weather, or any late or early evidence. Whether its kind is common
     on its camera is decided when thinning (`THIN_COMMON_EVENTS`).
     """
     if state != str(EventState.DROPPED) or unusual or not features:
@@ -382,7 +383,7 @@ def thin_kind(state: str, unusual: bool, features: str | None) -> str | None:
             return None
         if name.startswith("alarm_control_panel.") and value.startswith(("armed", "triggered")):
             return None
-        if name.startswith("late:") and value != "none":
+        if name.startswith(("late:", "early:")) and value != "none":
             return None
     return kind
 

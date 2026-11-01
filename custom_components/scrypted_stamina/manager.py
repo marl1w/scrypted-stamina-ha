@@ -78,6 +78,7 @@ from .const import (
     CONF_FOLLOW_UP_MINUTES,
     CONF_HISTORY_SIZE_MB,
     CONF_LINKED,
+    CONF_LOOK_BACK_MINUTES,
     CONF_RECORDER_RETENTION_DAYS,
     CONF_RELEVANCE_SCOPE,
     CONF_RELEVANCE_SENSITIVITY,
@@ -86,6 +87,7 @@ from .const import (
     CONF_UPLOAD_CLASSES,
     DEFAULT_FOLLOW_UP_MINUTES,
     DEFAULT_HISTORY_SIZE_MB,
+    DEFAULT_LOOK_BACK_MINUTES,
     DEFAULT_RECORDER_RETENTION_DAYS,
     DEFAULT_RELEVANCE_SCOPE,
     DEFAULT_RELEVANCE_SENSITIVITY,
@@ -98,6 +100,7 @@ from .const import (
     FRESH_DAYS,
     LATENCY_SAMPLES,
     LEGACY_UNUSUAL_OVERRIDES,
+    LOOK_BACK_MAX_MINUTES,
     META_AREA_UPLOADS,
     META_UPLOADS,
     POSITION_SAVE_SECONDS,
@@ -120,7 +123,7 @@ from .const import (
     signal_quota,
     signal_update,
 )
-from .context import entity_kind, late_change, snapshot
+from .context import RecentChanges, entity_kind, late_change, snapshot
 from .decider import (
     REASON_UNUSUAL,
     EventRecord,
@@ -159,6 +162,8 @@ _LOGGER = logging.getLogger(__name__)
 THUMBNAIL_DELAY = 3.0
 RETENTION_INTERVAL = dt.timedelta(hours=1)
 PRUNE_FIRST_SECONDS = 300.0
+# Early evidence runs up to a start's arrival, at most this long after the start itself.
+START_GRACE_SECONDS = 30.0
 PRUNE_HOUR = 3
 PRUNE_MINUTE = 41
 # How long a failed commit or drop waits before it is tried again.
@@ -243,6 +248,8 @@ class StaminaManager:
         self.link: StaminaLink | None = None
         self._timers: dict[str, CALLBACK_TYPE] = {}
         self._late_unsub: dict[str, CALLBACK_TYPE] = {}
+        # Recent changes of every linked entity, for the look-back window at each start.
+        self.recent = RecentChanges(LOOK_BACK_MAX_MINUTES * 60.0)
         self._unsub: list[CALLBACK_TYPE] = []
         self._thumbnails: set[str] = set()
         self._final_thumbnails: set[str] = set()
@@ -281,6 +288,16 @@ class StaminaManager:
         minutes = self.camera_options(camera).get(CONF_FOLLOW_UP_MINUTES, DEFAULT_FOLLOW_UP_MINUTES)
         return max(0.0, float(minutes)) * 60.0
 
+    def look_back_seconds(self, camera: str) -> float:
+        """Return a camera's look-back window, at most what the ring keeps."""
+        minutes = self.camera_options(camera).get(CONF_LOOK_BACK_MINUTES, DEFAULT_LOOK_BACK_MINUTES)
+        return min(max(0.0, float(minutes)), float(LOOK_BACK_MAX_MINUTES)) * 60.0
+
+    def _all_linked(self) -> list[str]:
+        """Return every camera's linked entities, once each."""
+        cameras = self.entry.options.get(CONF_CAMERAS) or {}
+        return sorted({entity_id for camera in cameras for entity_id in self.linked(camera)})
+
     def camera_names(self) -> dict[str, str]:
         """Return each camera's name, for the reason sentence."""
         return {camera: status.device.name for camera, status in self.cameras.items()}
@@ -297,6 +314,11 @@ class StaminaManager:
             if mode in UPLOAD_MODES
         }
         await self.async_refresh_cameras()
+        if linked := self._all_linked():
+            # Before anything can start an event: the look-back window reads this ring.
+            self._unsub.append(
+                async_track_state_change_event(self.hass, linked, self._linked_changed)
+            )
         await self.uploader.async_start()
         slugs = {slug_of(sub): key for key, sub in area_subentries(self.entry).items()}
         self._event_areas = {
@@ -622,6 +644,14 @@ class StaminaManager:
             record.note(note)
         record.latency["ha_received"] = self.now()
         record.context_start = snapshot(self.hass, self.linked(facts.camera), facts.started)
+        record.early = self.recent.between(
+            self.linked_kinds(facts.camera),
+            started=facts.started,
+            since=facts.started - self.look_back_seconds(facts.camera),
+            # Up to its arrival, which is the moment late evidence could not yet be watched
+            # for; bounded, so an event recovered long after it began takes nothing later.
+            until=facts.started + min(max(0.0, self.now() - facts.started), START_GRACE_SECONDS),
+        )
         self.records[facts.id] = record
         self._event_areas[record.id] = record.area_key
         # Registered at once, so an event on another camera that overlaps this one sees it
@@ -947,6 +977,11 @@ class StaminaManager:
             self._capping = False
 
     # ------------------------------------------------------------------ follow-up
+
+    @callback
+    def _linked_changed(self, event: Event[EventStateChangedData]) -> None:
+        """Remember a linked entity's change, for the look-back window of what comes next."""
+        self.recent.add(event.data["entity_id"], event.data["old_state"], event.data["new_state"])
 
     @callback
     def _open_follow_up(self, record: EventRecord) -> None:

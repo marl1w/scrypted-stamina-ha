@@ -17,6 +17,7 @@ from custom_components.scrypted_stamina.const import (
     CONF_FOLLOW_UP_CAP_GB,
     CONF_FOLLOW_UP_MINUTES,
     CONF_LINKED,
+    CONF_LOOK_BACK_MINUTES,
     CONF_QUOTA_GB,
     CONF_RELEVANCE_SCOPE,
     CONF_RETENTION_DAYS,
@@ -187,6 +188,7 @@ async def test_options_have_a_page_per_camera_starting_empty(hass, stamina, setu
     }
     assert defaults[CONF_LINKED] == []  # nothing is guessed, even with a door in the area
     assert defaults[CONF_FOLLOW_UP_MINUTES] == 10
+    assert defaults[CONF_LOOK_BACK_MINUTES] == 2
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {CONF_LINKED: [door.entity_id], CONF_FOLLOW_UP_MINUTES: 5}
@@ -195,6 +197,7 @@ async def test_options_have_a_page_per_camera_starting_empty(hass, stamina, setu
     assert entry.options[CONF_RELEVANCE_SCOPE] == "area"
     assert entry.options[CONF_CAMERAS]["38"] == {
         CONF_LINKED: [door.entity_id],
+        CONF_LOOK_BACK_MINUTES: 2.0,
         CONF_FOLLOW_UP_MINUTES: 5.0,
     }
     await hass.async_block_till_done()

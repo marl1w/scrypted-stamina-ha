@@ -64,6 +64,12 @@ DEFAULT_UNVERIFIED_SCORE: Final = 0.5
 # scoring this long, and linked entities' changes are attached as late evidence. Per camera.
 CONF_FOLLOW_UP_MINUTES: Final = "follow_up_minutes"
 DEFAULT_FOLLOW_UP_MINUTES: Final = 10
+# The look-back window, its mirror: linked entities' changes this long before `event.start`
+# are attached as early evidence (a gate opened, then the camera saw who came through). Per
+# camera, at most LOOK_BACK_MAX_MINUTES: the changes are kept in memory only that long.
+CONF_LOOK_BACK_MINUTES: Final = "look_back_minutes"
+DEFAULT_LOOK_BACK_MINUTES: Final = 2
+LOOK_BACK_MAX_MINUTES: Final = 10
 # Per-camera options live under this key, by Scrypted camera id.
 CONF_CAMERAS: Final = "cameras"
 # How long `binary_sensor.<cam>_unusual` pulses on for a late unusual.

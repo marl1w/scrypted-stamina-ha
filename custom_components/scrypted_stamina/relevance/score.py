@@ -31,7 +31,7 @@ from ..const import (
     SCORE_MIN_EVENTS,
     SCORE_QUANTILE,
 )
-from .features import Event
+from .features import Event, evidence_reading
 from .rates import (
     Categorical,
     Model,
@@ -358,7 +358,8 @@ def _terms(
             Term(
                 name="signal",
                 subject=labels.get(entity_id, entity_id),
-                label=value,
+                # "changed within 30 s before" rather than "<30s" for early and late evidence.
+                label=evidence_reading(entity_id, value),
                 contribution=_surprisal(
                     # Bound as defaults, not captured: a lambda built in a loop that reads
                     # the loop variable sees whatever it holds when the lambda finally runs,

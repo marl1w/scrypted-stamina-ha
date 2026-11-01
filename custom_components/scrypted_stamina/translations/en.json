@@ -119,10 +119,14 @@
       },
       "camera": {
         "title": "{camera}",
-        "description": "Entities whose state is recorded with every event of this camera, and whose changes after an event count as late evidence. Empty until you add some.",
+        "description": "Entities whose state is recorded with every event of this camera, and whose changes shortly before an event count as early evidence and after it as late evidence. Empty until you add some.",
         "data": {
           "linked_entities": "Linked entities",
+          "look_back_minutes": "Look-back window",
           "follow_up_minutes": "Follow-up window"
+        },
+        "data_description": {
+          "look_back_minutes": "Changes of the linked entities this long before an event starts are linked to it, such as a gate opening just before the camera sees someone."
         }
       }
     }

@@ -114,6 +114,8 @@ class EventRecord:
     context_start: dict[str, Any] = field(default_factory=dict)
     context_end: dict[str, Any] = field(default_factory=dict)
     late: list[dict[str, Any]] = field(default_factory=list)
+    # Linked-entity changes in the look-back window before the start, `t_rel_s` negative.
+    early: list[dict[str, Any]] = field(default_factory=list)
     follow_up_until: float | None = None
     finalized: bool = False
     gaps: list[int] = field(default_factory=list)

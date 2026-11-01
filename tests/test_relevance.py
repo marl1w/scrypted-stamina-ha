@@ -16,6 +16,9 @@ from custom_components.scrypted_stamina.protocol import EventFacts, Subject
 from custom_components.scrypted_stamina.relevance import normalised
 from custom_components.scrypted_stamina.relevance.features import (
     SolarClock,
+    early_signals,
+    evidence_name,
+    evidence_reading,
     late_signals,
     signals,
     to_event,
@@ -212,3 +215,58 @@ async def test_whole_frame_ai_is_its_own_weak_source(hass) -> None:
     item = make(dt_util.now().replace(hour=12))
     item.facts.subjects["s1"] = parsed
     assert signals(item, POLICY)["sources"] == "scrypted-coral-guard+whole-frame"
+
+
+async def test_changes_before_the_start_are_signals_from_the_start(hass) -> None:
+    """Early evidence is the mirror of late: per kind, the change nearest the start."""
+    item = make(dt_util.now().replace(hour=2, minute=40))
+    item.early = [
+        {"entity": "light.porch", "kind": "light", "from": "off", "to": "on", "t_rel_s": -95.0},
+        {"entity": "binary_sensor.gate", "kind": "door", "from": "off", "to": "on", "t_rel_s": -80},
+        {"entity": "binary_sensor.gate", "kind": "door", "from": "on", "to": "off", "t_rel_s": -20},
+        {"entity": "alarm_control_panel.x", "kind": "alarm", "to": "triggered", "t_rel_s": -60},
+    ]
+    kinds = {"binary_sensor.gate": "door", "light.porch": "light", "binary_sensor.yard": "motion"}
+    # Known at the start, so the live score counts it too.
+    found = signals(item, POLICY, linked_kinds=kinds, include_late=False)
+    assert found["early:door"] == "<30s"
+    assert found["early:light"] == "<2m"
+    assert found["early:alarm"] == "triggered"
+    assert found["early:motion"] == "none"
+    assert early_signals([]) == {}
+
+    assert evidence_name("early:door") == "Door sensors"
+    assert evidence_name("late:other") == "Linked sensors"
+    assert evidence_name("binary_sensor.gate") is None
+    assert evidence_reading("early:door", "<30s") == "changed within 30 s before"
+    assert evidence_reading("late:door", "<2m") == "changed within 2 min after"
+    assert evidence_reading("early:motion", "none") == "no change before"
+    assert evidence_reading("binary_sensor.gate", "<30s") == "<30s"
+
+
+async def test_a_gate_opened_just_before_is_a_reason(hass) -> None:
+    """Rare early evidence scores, and the reason says it as a person would."""
+    kinds = {"binary_sensor.gate": "door"}
+    records = history(hass)
+    for n, record in enumerate(records):
+        if n % 10 == 0:
+            record.early = [{"entity": "binary_sensor.gate", "kind": "door", "t_rel_s": -90.0}]
+    clock = SolarClock(hass)
+    events = [
+        to_event(r, clock, POLICY, linked_kinds=kinds)
+        for r in sorted(records, key=lambda r: r.facts.started)
+    ]
+    model = build(events, now=dt_util.now().timestamp())
+    calibrate(model, events)
+
+    item = make(dt_util.now().replace(hour=12, minute=30))
+    item.early = [{"entity": "binary_sensor.gate", "kind": "door", "to": "on", "t_rel_s": -20.0}]
+    result = score(
+        to_event(item, clock, POLICY, linked_kinds=kinds),
+        model,
+        previous=None,
+        labels={"early:door": "Door sensors"},
+    )
+    term = next(term for term in result.terms if term.subject == "Door sensors")
+    assert term.label == "changed within 30 s before"
+    assert term.contribution > 0
