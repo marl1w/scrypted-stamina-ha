@@ -274,7 +274,7 @@ def _terms(
     # What the other cameras were doing. The absent case is the interesting one: something at
     # the back that never appeared at the front did not use the approach route.
     #
-    # Said with the time between them, because "after Balcone Nord" on its own is not
+    # Said with the time between them, because "after Garden" on its own is not
     # checkable. The reader goes looking for that camera in the timeline and finds its
     # nearest row forty minutes earlier — because the detection that actually preceded this
     # was motion, and the timeline hides motion unless asked. The gap is what turns a claim
@@ -464,7 +464,7 @@ def _phrase(term: Term, *, lead: bool = True) -> str:
     """
     if term.name == "kind":
         # The sentence already opens with the kind, so repeating it reads as a stutter.
-        # "Person at all on the Balcone Nord" is the claim, and it is the right one — but
+        # "Person at all on the Garden" is the claim, and it is the right one — but
         # ", and at all" appended to another clause is too clipped to parse.
         return "at all" if lead else "rarely seen here"
     if term.name == "clock":
