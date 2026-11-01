@@ -86,6 +86,15 @@ def test_late_change_records_delay_from_end_and_start() -> None:
     assert late_change("x.y", "other", new, State("x.y", "on"), started=0, ended=0) is None
 
 
+def test_late_change_ignores_an_entity_appearing_or_coming_back() -> None:
+    """At startup or on a reload a sensor appears in the state it was in: nothing happened."""
+    off = State("binary_sensor.shed", "off")
+    for old in (None, State("binary_sensor.shed", "unavailable")):
+        assert late_change("binary_sensor.shed", "motion", old, off, started=0, ended=0) is None
+    gone = State("binary_sensor.shed", "unknown")
+    assert late_change("binary_sensor.shed", "motion", off, gone, started=0, ended=0) is None
+
+
 async def test_context_is_taken_at_start_and_end(hass, stamina, setup) -> None:
     hass.states.async_set("binary_sensor.gate", "off", {"device_class": "door"})
     entry = await setup(options=OPTIONS)

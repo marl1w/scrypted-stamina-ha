@@ -131,17 +131,34 @@ def snapshot(hass: HomeAssistant, linked: list[str], at: float) -> dict[str, Any
     return found
 
 
+# States that are not a reading: a change into or out of one is an integration starting,
+# stopping or losing its device, never something that happened outdoors.
+_NOT_READINGS = frozenset({"unknown", "unavailable"})
+
+
+def real_change(old: State, new: State) -> bool:
+    """Return whether a state change is one reading turning into another.
+
+    Callers drop a missing old state first: an entity appearing, as at startup or on a
+    reload, is not a change. Neither is a change of attributes only, nor one into or out of
+    `unknown` or `unavailable`.
+    """
+    if old.state == new.state:
+        return False
+    return old.state not in _NOT_READINGS and new.state not in _NOT_READINGS
+
+
 def late_change(
     entity_id: str, kind: str, old: State | None, new: State | None, *, started: float, ended: float
 ) -> dict[str, Any] | None:
     """Return one late-evidence item, or None when nothing really changed."""
-    if new is None or (old is not None and old.state == new.state):
+    if old is None or new is None or not real_change(old, new):
         return None
     at = new.last_changed.timestamp()
     return {
         "entity": entity_id,
         "kind": kind,
-        "from": old.state if old is not None else None,
+        "from": old.state,
         "to": new.state,
         # After the end, which is what the window is about; and from the start, for the reader.
         "t_rel_s": round(at - ended, 1),
@@ -149,9 +166,6 @@ def late_change(
     }
 
 
-# States that are not a reading: a change into or out of one is an integration starting,
-# stopping or losing its device, never something that happened outdoors.
-_NOT_READINGS = frozenset({"unknown", "unavailable"})
 # Changes kept per entity. A sensor flapping more than this within the look-back window says
 # nothing more by its twentieth change; the newest are the ones nearest the event.
 _RECENT_PER_ENTITY = 16
@@ -173,9 +187,7 @@ class RecentChanges:
 
     def add(self, entity_id: str, old: State | None, new: State | None) -> None:
         """Remember one state change, when it is a real one."""
-        if old is None or new is None or old.state == new.state:
-            return
-        if old.state in _NOT_READINGS or new.state in _NOT_READINGS:
+        if old is None or new is None or not real_change(old, new):
             return
         at = new.last_changed.timestamp()
         changes = self._changes.setdefault(entity_id, deque(maxlen=_RECENT_PER_ENTITY))

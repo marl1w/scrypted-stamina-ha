@@ -416,6 +416,25 @@ async def test_changes_while_restarting_count_as_late_evidence(
     await hass.config_entries.async_unload(entry.entry_id)
 
 
+async def test_a_restart_alone_is_not_late_evidence(
+    hass, stamina, destinations, setup, reload
+) -> None:
+    """After a restart every sensor's `last_changed` is new; one in its old state did nothing."""
+    clock = Clock()
+    hass.states.async_set(GATE, "off", {"device_class": "door"})
+    entry = await setup(options=OPTIONS)
+    manager = await wire(entry, clock)
+    eid = event_id(171)
+    run_event(stamina, eid, "vetoed")
+    await until(state_is(manager, eid, EventState.FOLLOW_UP))
+    await hass.config_entries.async_unload(entry.entry_id)
+    hass.states.async_remove(GATE)  # its integration restarting: back, in the same state
+    hass.states.async_set(GATE, "off", {"device_class": "door"})
+    await reload(entry)
+    assert entry.runtime_data.manager.records[eid].late == []
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
 # ------------------------------------------------------------------ 12. predecessor
 
 

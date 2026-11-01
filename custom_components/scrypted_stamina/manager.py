@@ -50,7 +50,14 @@ import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CALLBACK_TYPE, Event, EventStateChangedData, HomeAssistant, callback
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    State,
+    callback,
+)
 from homeassistant.helpers import (
     area_registry as ar,
     device_registry as dr,
@@ -1106,6 +1113,8 @@ class StaminaManager:
 
         After a restart, the state machine only reports what changes from now on; anything
         that changed during the window before the restart is only visible as `last_changed`.
+        But at startup every entity's `last_changed` is the moment it came back, so that alone
+        says nothing: a change counts only when the state now differs from the one at the end.
         """
         started = record.facts.started
         ended = record.facts.ended or started
@@ -1119,10 +1128,13 @@ class StaminaManager:
                 continue
             if not ended <= state.last_changed.timestamp() <= until:
                 continue
+            at_end = record.context_end.get(entity_id) or {}
+            if "state" not in at_end:
+                continue  # linked since: nothing to compare with
             item = late_change(
                 entity_id,
                 entity_kind(self.hass, entity_id),
-                None,
+                State(entity_id, str(at_end["state"])),
                 state,
                 started=started,
                 ended=ended,
