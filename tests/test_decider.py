@@ -164,3 +164,13 @@ def test_best_current_score() -> None:
     assert not item.unusual and item.score == 0.3
     item.final_score, item.unusual_final = 0.9, True
     assert item.unusual and item.score == 0.9
+
+
+def test_preroll_is_read_kept_and_restored() -> None:
+    raw = {"id": "ev1", "camera": "11", "start": 1_730_370_000_000}
+    first = EventFacts.parse({**raw, "segments": {"next": 0, "preroll_ms": 0}})
+    first.merge(EventFacts.parse({**raw, "segments": {"next": 5, "preroll_ms": 9500}}))
+    first.merge(EventFacts.parse(raw))
+    assert first.preroll == 9.5
+    assert EventFacts.restore(first.as_dict()).preroll == 9.5
+    assert EventFacts.parse({**raw, "segments": {"preroll_ms": "x"}}).preroll is None

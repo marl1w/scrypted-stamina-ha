@@ -43,7 +43,7 @@ from .const import (
 )
 from .context import collapse
 from .decider import EventRecord, EventState
-from .playback import play_url, playback_order, thumbnail_url
+from .playback import PLAYBACK_LEAD, play_url, playback_order, thumbnail_url
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -331,6 +331,9 @@ async def event_detail(
                 "seen_by": [s for s in subject.sources if s not in verifiers],
                 "score": round(subject.score, 3),
                 "dwell": round(subject.dwell, 1),
+                # Epoch seconds, None when the source did not say: the player's markers.
+                "first_seen": subject.first_seen,
+                "last_seen": subject.last_seen,
             }
             for subject in record.facts.subjects.values()
         ],
@@ -371,6 +374,8 @@ async def event_detail(
             "recorder": play_url(hass, entry.entry_id, record.id, "recorder") if recorder else None,
             "cloud": play_url(hass, entry.entry_id, record.id, "cloud") if cloud else None,
             "order": playback_order(entry.options),
+            # Seconds of video before the start in each copy, None while not known.
+            "lead": {"recorder": PLAYBACK_LEAD, "cloud": record.facts.preroll},
         },
     }
 

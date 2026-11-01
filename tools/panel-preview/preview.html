@@ -104,11 +104,12 @@ const stamp = (t) => {
 
 function detail(row) {
   const cam = CAMERAS.find((c) => c.id === row.camera);
-  const subjects = row.classes.filter((c) => c !== "motion").map((cls) => ({
+  const subjects = row.classes.filter((c) => c !== "motion").map((cls, i) => ({
     class: cls, label: null,
     verdict: row.state === "dropped" ? "vetoed" : cam.live ? "confirmed" : "unverified",
     verified_by: cam.live ? [VERIFIER] : [], seen_by: [PLUGIN],
     score: 0.82, dwell: Math.min(row.duration || 4, 14),
+    first_seen: row.started + 1.5 + i * 4, last_seen: row.started + 1.5 + i * 4 + Math.min(row.duration || 4, 14),
   }));
   // The same thing reported by a second source: the panel shows it once.
   if (subjects.length) subjects.push({ ...subjects[0], seen_by: ["@example/second-detector"], dwell: 3 });
@@ -127,16 +128,21 @@ function detail(row) {
     finalized: row.state !== "follow_up" && row.state !== "pending",
     follow_up_until: row.state === "follow_up" ? NOW + 420 : null,
     watching: ["door", "presence"],
-    early_evidence: row.unusual ? [{ entity: "binary_sensor.front_gate", name: "Front gate", kind: "door", from: "off", to: "on", t_rel_s: -20 }] : [],
-    late_evidence: row.late ? [{ entity: "binary_sensor.side_gate", name: "Side gate", kind: "door", from: null, to: "off", t_rel_s: 130, count: 3 }] : [],
+    early_evidence: row.unusual ? [{ entity: "binary_sensor.front_gate", name: "Front gate", kind: "door", from: "off", to: "on", t_rel_s: -4 }] : [],
+    late_evidence: row.late ? [
+      { entity: "light.porch", name: "Porch light", kind: "light", from: "off", to: "on", t_rel_s: 2 },
+      { entity: "binary_sensor.side_gate", name: "Side gate", kind: "door", from: null, to: "off", t_rel_s: 130, count: 3 },
+    ] : [],
     learning: cam.learn[0] < 7, keep_reason: row.unusual ? "unusual" : `classes: ${row.classes[0]}`, target: "events",
     cloud_path: kept ? `events/${slug(cam.area || "no-area")}-${slug(cam.name)}-${stamp(row.started)}.mp4` : null,
     copies: kept ? [{ destination: "WebDAV: NAS", committed: row.state === "committed", deleted: false, files: 12 }] : [],
     notes: row.state === "orphaned" ? ["camera_offline"] : [], gaps: 0,
     play: {
       url: cam.recorder || kept ? `/no-video.m3u8?mode=auto&exp=${Date.now()}&sig=x` : null,
-      recorder: cam.recorder,
+      recorder: cam.recorder ? `/no-video.m3u8?mode=recorder&exp=${Date.now()}&sig=x` : null,
       cloud: row.state === "committed" ? `/no-video.m3u8?mode=cloud&exp=${Date.now()}&sig=x` : null,
+      // Seconds of video before the start: the recording's lead-in, the cloud copy's pre-roll.
+      lead: { recorder: 5, cloud: 9.5 },
     },
   };
 }

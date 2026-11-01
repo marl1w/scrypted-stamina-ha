@@ -53,6 +53,7 @@ import {
   verdictText,
 } from "./format.js";
 import { mountPlayer, playKey } from "./player.js";
+import { eventMarkers, mountControls } from "./controls.js";
 
 const DOMAIN = "scrypted_stamina";
 const PAGE = 50;
@@ -1220,8 +1221,10 @@ class ScryptedStaminaPanel extends HTMLElement {
     if (!state.media) {
       state.title = el("div", { class: "detail__title" });
       state.box = el("div", { class: "player" });
+      // What goes full screen: the video with its control bar over it.
+      state.wrap = el("div", { class: "player-wrap" }, state.box);
       state.switch = el("div", { class: "source-switch" });
-      state.media = el("div", { class: "event__media" }, state.title, state.box, state.switch);
+      state.media = el("div", { class: "event__media" }, state.title, state.wrap, state.switch);
       state.details = el("div", { class: "event__details" });
       replace(view, el("div", { class: "event" }, state.media, state.details));
     }
@@ -1241,6 +1244,9 @@ class ScryptedStaminaPanel extends HTMLElement {
     }
     // The recording itself when there is one: `url` plays the cloud copy first by default.
     const url = state.choice === "cloud" ? data.play.cloud : data.play.recorder || data.play.url;
+    // `auto` plays the recording wherever the recorder has the event, else the cloud copy.
+    const fromCloud = state.choice === "cloud" || !data.play.recorder;
+    state.markers = eventMarkers(data, data.play.lead?.[fromCloud ? "cloud" : "recorder"]);
     // Compared without the signature: a refresh re-signs the URL, which is no reason to
     // restart the video.
     if (state.playingKey !== playKey(url)) this._play(url);
@@ -1253,7 +1259,8 @@ class ScryptedStaminaPanel extends HTMLElement {
     const data = state.data;
     this._stopVideo();
     state.playingKey = playKey(url);
-    this._stopPlayer = mountPlayer(state.box, {
+    const stopControls = mountControls(state.wrap, state.box, () => state.markers);
+    const stopPlayer = mountPlayer(state.box, {
       hass: this._hass,
       url,
       posterUrl: this._thumbs.get(data.id)?.url || data.thumbnail,
@@ -1272,6 +1279,10 @@ class ScryptedStaminaPanel extends HTMLElement {
         return true;
       },
     });
+    this._stopPlayer = () => {
+      stopControls();
+      stopPlayer();
+    };
   }
 
   _unavailable(data) {

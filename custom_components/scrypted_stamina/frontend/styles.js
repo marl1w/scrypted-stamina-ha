@@ -271,6 +271,58 @@ select.chip {
 .player__play:focus-visible { outline-color: #fff; }
 .source-switch { display: flex; justify-content: flex-end; padding: 0 4px; margin-top: -4px; }
 
+/* The player's own control bar over the video, the event marked on its scrub bar (controls.js). */
+.player-wrap { position: relative; overflow: hidden; outline: none; }
+.player-wrap:fullscreen { display: flex; align-items: center; background: #000; }
+.player-wrap:fullscreen .player { height: 100%; aspect-ratio: auto; border-radius: 0; }
+.controls {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 1; padding: 28px 12px 4px;
+  display: flex; flex-direction: column; color: #fff;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.7)); transition: opacity 0.2s;
+}
+.player-wrap.is-idle .controls { opacity: 0; pointer-events: none; }
+.player-wrap.is-idle { cursor: none; }
+.controls__row { display: flex; align-items: center; gap: 4px; }
+.controls__gap { flex: 1; }
+.controls__btn {
+  display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px;
+  padding: 0; border: 0; border-radius: 50%; background: none; color: inherit; cursor: pointer;
+}
+.controls__btn svg { width: 24px; height: 24px; fill: currentColor; }
+.controls__btn:hover { background: rgba(255, 255, 255, 0.15); }
+.controls__time { font-size: 0.82rem; font-variant-numeric: tabular-nums; padding: 0 4px; }
+.controls__scrub { position: relative; height: 24px; cursor: pointer; touch-action: none; }
+.controls__rail {
+  position: absolute; left: 0; right: 0; top: 50%; height: 4px; margin-top: -2px;
+  border-radius: 2px; background: rgba(255, 255, 255, 0.3);
+}
+.controls__band { position: absolute; top: -2px; bottom: -2px; border-radius: 4px; background: rgba(3, 169, 244, 0.55); }
+.controls__fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; background: rgba(255, 255, 255, 0.85); }
+.controls__knob {
+  position: absolute; top: 50%; width: 12px; height: 12px; margin: -6px 0 0 -6px; z-index: 2;
+  border-radius: 50%; background: #fff; pointer-events: none; box-shadow: 0 0 2px rgba(0, 0, 0, 0.6);
+}
+.controls__mark {
+  position: absolute; top: 50%; transform: translate(-50%, -50%); padding: 0; border: 0;
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: #fff; background: none;
+}
+.controls__mark--subject {
+  width: 18px; height: 18px; border-radius: 50%; background: var(--ss-accent);
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55);
+}
+.controls__icon { --mdc-icon-size: 12px; width: 12px; height: 12px; }
+/* A sensor: a slim tick, with room around it to press. */
+.controls__mark--sensor { width: 14px; height: 22px; }
+.controls__mark--sensor::before { content: ""; width: 3px; height: 14px; border-radius: 2px; background: var(--ss-unusual); }
+.controls__mark::after {
+  content: attr(data-tip); position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+  padding: 4px 8px; border-radius: 6px; background: rgba(0, 0, 0, 0.85); color: #fff;
+  font-size: 0.78rem; white-space: nowrap; pointer-events: none; opacity: 0; transition: opacity 0.1s;
+}
+.controls__mark--start::after { left: 0; transform: none; }
+.controls__mark--end::after { left: auto; right: 0; transform: none; }
+.controls__mark:hover::after, .controls__mark:focus-visible::after { opacity: 1; }
+
 .card {
   background: var(--ss-surface); border-radius: var(--ss-radius); box-shadow: var(--ss-shadow);
   margin: 0 12px; padding: 14px 16px;
@@ -444,7 +496,7 @@ details.card[open] > summary::after { transform: rotate(180deg); }
 
 .pane--detail .event { padding: 16px; gap: 16px; }
 .pane--detail .detail__title { padding: 0; }
-.pane--detail .event__media .player { border-radius: var(--ss-radius); }
+.pane--detail .event__media .player-wrap { border-radius: var(--ss-radius); }
 .pane--detail .event .card { margin: 0; }
 
 /* By the list's own width, not the window's: a column dragged narrow gets the phone rows. */

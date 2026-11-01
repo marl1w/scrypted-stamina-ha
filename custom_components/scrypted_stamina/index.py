@@ -321,6 +321,7 @@ _SLIM_FACTS = (
     "segments",
     "init",
     "segments_final",
+    "preroll",
     "signals",
     "camera_offline",
     "end_reason",

@@ -99,7 +99,7 @@ function stream(box, { hass, url, posterUrl, onError }, isStopped) {
   if (nativeHls()) {
     const video = el("video", {
       class: "player__video",
-      controls: true,
+      controls: false, // controls.js draws its own, with the event on it
       playsinline: true,
       autoplay: true,
       muted: true,
@@ -137,7 +137,7 @@ function stream(box, { hass, url, posterUrl, onError }, isStopped) {
       hass,
       url,
       posterUrl,
-      controls: true,
+      controls: false, // controls.js draws its own, with the event on it
       muted: true,
       autoPlay: true,
       playsInline: true,

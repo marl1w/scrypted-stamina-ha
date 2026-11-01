@@ -389,6 +389,7 @@ async def test_event_detail(hass, hass_ws_client, stamina_entry) -> None:
     subject = event["subjects"][0]
     assert subject["verified_by"] == [VERIFIER] and subject["seen_by"] == [TRIGGER]
     assert subject["dwell"] == 6.0
+    assert subject["last_seen"] - subject["first_seen"] == 6.0
     assert event["watching"] == ["door", "presence"]
     assert event["cloud_path"] == f"events/garden/{rec.id}"
     assert event["copies"] == [
@@ -399,6 +400,7 @@ async def test_event_detail(hass, hass_ws_client, stamina_entry) -> None:
     assert "mode=recorder" in play["recorder"] and "sig=" in play["recorder"]
     assert "mode=auto" in play["url"] and "sig=" in play["url"]
     assert "mode=cloud" in play["cloud"]
+    assert play["lead"] == {"recorder": 5.0, "cloud": None}
 
 
 async def test_event_without_any_video(hass, hass_ws_client, stamina_entry) -> None:
@@ -407,7 +409,13 @@ async def test_event_without_any_video(hass, hass_ws_client, stamina_entry) -> N
     await stamina_entry.index.async_save(rec)
     client = await hass_ws_client(hass)
     event = (await call(client, type=f"{DOMAIN}/event", event_id=rec.id))["event"]
-    assert event["play"] == {"url": None, "recorder": None, "cloud": None, "order": "cloud_first"}
+    assert event["play"] == {
+        "url": None,
+        "recorder": None,
+        "cloud": None,
+        "order": "cloud_first",
+        "lead": {"recorder": 5.0, "cloud": None},
+    }
     assert event["cloud_path"] is None and event["learning"] is True
     assert event["subjects"][0]["verified_by"] == []
 

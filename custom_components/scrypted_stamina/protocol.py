@@ -210,6 +210,9 @@ class EventFacts:
     # True once the segmenter has stopped: no more segments will be cut.
     segments_final: bool = False
     durations: dict[int, float] = field(default_factory=dict)
+    # Seconds of pre-roll before the start in the cut video (`segments.preroll_ms`), None
+    # until the plugin says: where the start falls in the cloud copy.
+    preroll: float | None = None
     # Segments that start afresh (the plugin's ffmpeg restarted mid-event).
     discontinuities: list[int] = field(default_factory=list)
     # The init each segment needs, where it is not init.mp4 (k >= 1: init-<k>.mp4).
@@ -262,6 +265,8 @@ class EventFacts:
         self.segments = max(self.segments, other.segments)
         self.init = self.init or other.init
         self.segments_final = self.segments_final or other.segments_final
+        if other.preroll is not None:
+            self.preroll = max(self.preroll or 0.0, other.preroll)
         for number, value in other.durations.items():
             if number in self.durations or len(self.durations) < _MAX_DURATIONS:
                 self.durations[number] = value
@@ -295,6 +300,7 @@ class EventFacts:
             "init": self.init,
             "segments_final": self.segments_final,
             "durations": {str(k): v for k, v in self.durations.items()},
+            "preroll": self.preroll,
             "discontinuities": list(self.discontinuities),
             "init_of": {str(k): v for k, v in self.init_of.items()},
             "signals": dict(self.signals),
@@ -320,6 +326,7 @@ class EventFacts:
             init=bool(data.get("init")),
             segments_final=bool(data.get("segments_final")),
             durations={int(k): float(v) for k, v in (data.get("durations") or {}).items()},
+            preroll=data.get("preroll"),
             discontinuities=[int(n) for n in data.get("discontinuities") or ()],
             init_of={int(k): int(v) for k, v in (data.get("init_of") or {}).items()},
             signals={str(k): bool(v) for k, v in (data.get("signals") or {}).items()},
@@ -353,10 +360,12 @@ class EventFacts:
                 if (subject := Subject.parse(raw)) is not None:
                     subjects[subject.id] = subject
 
-        count, init, final = 0, False, False
+        count, init, final, preroll = 0, False, False, None
         segments = data.get("segments")
         if isinstance(segments, Mapping):
             count = _count(segments.get("next")) or 0
+            if (preroll_ms := _clamp(segments.get("preroll_ms"), 0.0, 60_000.0)) is not None:
+                preroll = preroll_ms / 1000
             init = bool(segments.get("init"))
             final = str(segments.get("state")) in SEGMENTS_FINAL
 
@@ -390,6 +399,7 @@ class EventFacts:
             segments=count,
             init=init,
             segments_final=final,
+            preroll=preroll,
             signals=signals,
             stamps={
                 _text(key): stamp
