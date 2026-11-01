@@ -532,12 +532,12 @@ async def test_panel_registers_and_reregisters(hass) -> None:
     panel.async_unregister_panel(hass)
 
 
-def test_the_panel_is_one_page() -> None:
-    """No view to navigate to: the event opens beside the list, or under its row."""
+def test_the_panel_is_two_tabs_and_no_history() -> None:
+    """Events and Cameras as tabs; the event opens beside the list, or under its row."""
     source = (panel.FRONTEND_DIR / "scrypted-stamina-panel.js").read_text()
     assert "pushState" not in source  # the URL is only ever replaced: Back leaves the panel
-    assert '"/cameras"' not in source and "_back(" not in source
-    for needed in ("WIDE_PX", "_preselect", "ArrowDown", "cam-chip", "aria-expanded"):
+    assert "_back(" not in source
+    for needed in ("WIDE_PX", "_preselect", "ArrowDown", "cam-chip", "aria-expanded", '"/cameras"'):
         assert needed in source, needed
 
 

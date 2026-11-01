@@ -74,7 +74,10 @@ const KEEP_REASONS = {
 
 /** Why an event was kept, in words: `classes: person` is a chosen class. */
 function keepReason(reason) {
-  if (reason && reason.startsWith("classes: ")) return `a ${reason.slice(9)} was confirmed (a chosen class)`;
+  if (reason && reason.startsWith("classes: ")) {
+    const cls = reason.slice(9);
+    return `${/^[aeiou]/i.test(cls) ? "an" : "a"} ${cls} was confirmed (a chosen class)`;
+  }
   return KEEP_REASONS[reason];
 }
 
@@ -113,18 +116,170 @@ export const NOTES = {
   dropped_for_follow_up_cap: "Not kept early: the space for waiting events was full.",
 };
 
-const TERMS = {
-  kind: "What",
-  clock: "Time",
-  solar: "Daylight",
-  duration: "Duration",
-  weekend: "Day",
-  predecessor: "Sequence",
+// ------------------------------------------------------------------ signals in plain words
+
+/** A number from a reading or from one of the model's bands ("3 to 8", "< 3", "18 and up"). */
+function reading(value) {
+  const text = String(value ?? "").trim();
+  let match = text.match(/^(-?[\d.]+) to (-?[\d.]+)$/);
+  if (match) return { low: Number(match[1]), high: Number(match[2]), mid: (Number(match[1]) + Number(match[2])) / 2 };
+  match = text.match(/^< ?(-?[\d.]+)$/);
+  if (match) return { high: Number(match[1]), mid: Number(match[1]) - 1 };
+  match = text.match(/^(-?[\d.]+) and up$/);
+  if (match) return { low: Number(match[1]), mid: Number(match[1]) + 1 };
+  const number = Number(text);
+  return text !== "" && Number.isFinite(number) ? { exact: number, mid: number } : null;
+}
+
+const round = (n) => String(Math.round(n));
+
+/** "6 s", "3–8 s", "under 3 s", "18 s or more". */
+function seconds(value) {
+  const r = reading(value);
+  if (!r) return humanise(value);
+  if (r.exact !== undefined) return `${round(r.exact)} s`;
+  if (r.low !== undefined && r.high !== undefined) return `${round(r.low)}–${round(r.high)} s`;
+  return r.high !== undefined ? `Under ${round(r.high)} s` : `${round(r.low)} s or more`;
+}
+
+/** "on" → "On", "not_home" → "Not home", "partlycloudy" → "Partly cloudy". */
+const WORDS = {
+  partlycloudy: "partly cloudy",
+  "clear-night": "clear night",
+  lightning: "thunder",
+  "lightning-rainy": "thunderstorm",
+  "snowy-rainy": "sleet",
+  exceptional: "unusual weather",
+  not_home: "away",
+  unknown: "unknown",
+  unavailable: "unavailable",
+};
+export function humanise(value) {
+  const text = String(value ?? "");
+  const known = WORDS[text.toLowerCase()];
+  if (known) return capitalise(known);
+  const r = reading(text);
+  if (r && r.exact === undefined) {
+    if (r.low !== undefined && r.high !== undefined) return `${r.low}–${r.high}`;
+    return r.high !== undefined ? `Under ${r.high}` : `${r.low} or more`;
+  }
+  return capitalise(text.replace(/[_-]+/g, " "));
+}
+
+const ON_OFF = (on, off, unknown = "Unknown") => (value) =>
+  value === "on" ? on : value === "off" ? off : value === "unknown" ? unknown : humanise(value);
+
+const VERDICTS = { confirmed: "Confirmed", vetoed: "Not confirmed", undecided: "No answer", none: "Nothing to check" };
+const COUNTS = { 0: "Nothing", 1: "One thing", 2: "Two things", "3+": "Three or more" };
+
+/** Sun elevation in degrees: what a person sees. */
+function daylight(value) {
+  const r = reading(value);
+  if (!r) return humanise(value);
+  if (r.mid < 0) return "Dark";
+  if (r.mid < 6) return "Dusk or dawn";
+  return "Daylight";
+}
+
+/** Wind speed in the unit Home Assistant shows: calm to strong. */
+function windWords(value, hass) {
+  const r = reading(value);
+  if (!r) return humanise(value);
+  const unit = hass?.config?.unit_system?.wind_speed || "km/h";
+  const kmh = unit === "mph" ? r.mid * 1.609 : unit === "m/s" ? r.mid * 3.6 : unit === "kn" ? r.mid * 1.852 : r.mid;
+  if (kmh < 6) return "Calm";
+  if (kmh < 20) return "Light wind";
+  if (kmh < 40) return "Windy";
+  return "Strong wind";
+}
+
+/** "@scope/scrypted-coral-guard+whole-frame" → "Coral Guard and the whole picture". */
+function sources(value) {
+  if (!value || value === "none") return "Nothing";
+  return joinWords(String(value).split("+").map((source) => (source === "whole-frame" ? "the whole picture" : sourceName(source))));
+}
+
+// Each of the model's own signals (relevance/features.py `LABELS`, and `trigger`), by the
+// subject the backend names it with: what the row is called, and its value in words.
+const SIGNALS = {
+  verdicts: ["Double-check", (v) => VERDICTS[v] || humanise(v)],
+  "detected by": ["Seen by", sources],
+  subjects: ["Things seen", (v) => COUNTS[v] || humanise(v)],
+  dwell: ["Stayed", seconds],
+  "night mode": ["Night vision", ON_OFF("On", "Off")],
+  tamper: ["Tampering", ON_OFF("Yes", "No")],
+  sound: ["Sound", ON_OFF("Heard", "Quiet")],
+  weather: ["Weather", humanise],
+  wind: ["Wind", windWords],
+  "sun elevation": ["Light", daylight],
+  trigger: ["Started by", humanise],
 };
 
-export function termName(reason) {
-  if (reason.term === "signal" && reason.subject) return capitalise(reason.subject);
-  return TERMS[reason.term] || capitalise(reason.term || "");
+/** "a Sunday" → "Sunday". */
+const day = (label) => capitalise(String(label || "").replace(/^an? /, ""));
+
+/** "~8s" → "About 8 s". */
+function length(label) {
+  if (label === "open") return "Still going";
+  if (label === "instant") return "Under a second";
+  const match = String(label || "").match(/^~(\d+)s$/);
+  return match ? `About ${match[1]} s` : humanise(label);
+}
+
+/** "90s after Gate" → "90 s after Gate"; "nothing fired first" → "Nothing just before". */
+function sequence(label) {
+  const text = String(label || "");
+  if (text === "nothing fired first") return "Nothing just before";
+  if (text.startsWith("alongside ")) return `Same time as ${text.slice(10)}`;
+  return capitalise(text.replace(/^(\d+)s after /, "$1 s after "));
+}
+
+const TERMS = {
+  kind: ["What", (label) => capitalise(label)],
+  clock: ["Time", (label) => label],
+  solar: ["Light", (label) => capitalise(label)],
+  duration: ["Length", length],
+  weekend: ["Day", day],
+  predecessor: ["Other cameras", sequence],
+};
+
+/**
+ * One reason in plain words: what it is called and what it was. Never a raw key or number:
+ * anything unknown is at least un-snake-cased. A linked entity keeps its own name.
+ */
+export function signalText(reason, hass) {
+  if (reason.term === "signal") {
+    const subject = reason.subject || "";
+    const known = SIGNALS[subject.toLowerCase()];
+    if (known) return { name: known[0], value: known[1](reason.label, hass) };
+    // Early and late evidence arrive as sentences already ("changed within 30 s before").
+    return { name: capitalise(subject.replace(/[_.]+/g, " ")), value: humanise(reason.label) };
+  }
+  const known = TERMS[reason.term];
+  if (known) return { name: known[0], value: known[1](reason.label) };
+  return { name: humanise(reason.term || ""), value: humanise(reason.label) };
+}
+
+// ------------------------------------------------------------------ evidence in plain words
+
+// What a linked sensor did, by its kind and the state it went to.
+const CHANGES = {
+  door: { on: "opened", off: "closed", open: "opened", closed: "closed" },
+  lock: { locked: "locked", unlocked: "unlocked", jammed: "jammed" },
+  light: { on: "turned on", off: "turned off" },
+  motion: { on: "detected motion", off: "went quiet" },
+  presence: { on: "detected someone", off: "cleared", home: "arrived", not_home: "left" },
+  vibration: { on: "felt a vibration", off: "went still" },
+  sound: { on: "heard a sound", off: "went quiet" },
+  alarm: { triggered: "went off", disarmed: "was disarmed", armed_away: "was armed (away)", armed_home: "was armed (home)", armed_night: "was armed (night)" },
+};
+
+/** "Front gate opened", "Alarm went off", "Porch light changed to dim". */
+export function evidenceText(item) {
+  const name = item.name || "A linked sensor";
+  const to = String(item.to ?? "");
+  const verb = CHANGES[item.kind]?.[to] || (to ? `changed to ${humanise(to).toLowerCase()}` : "changed");
+  return `${name} ${verb}`;
 }
 
 const KIND_WORDS = { door: "door", presence: "presence", alarm: "alarm", light: "light", motion: "motion" };

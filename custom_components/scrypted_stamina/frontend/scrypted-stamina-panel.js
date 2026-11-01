@@ -8,7 +8,8 @@
  *   it was and why, signal by signal, and the details folded beneath. From ROOMY_PX the
  *   cameras get their own narrow column on the left, grouped by area; below that they fold
  *   into one line above the list. On open the latest unusual event is selected (else the
- *   latest); a row click or the arrow keys change only the right side.
+ *   latest); a row click or the arrow keys change only the right side. The columns can be
+ *   dragged wider or narrower (a double click on the handle resets it), remembered per browser.
  *   Narrow (a phone): the list only. Tapping a row opens that event inline under it; tapping
  *   it again, or another row, closes it.
  *
@@ -16,7 +17,7 @@
  *
  * The camera list says how each camera is doing (online, learning progress, last event) and
  * filters the list to a camera or a whole area. Every row carries a usual-to-unusual meter,
- * beside its thumbnail from 720 px (at the row's end on a phone), and the one-line why when
+ * beside its thumbnail once the list is 640 px wide (at the row's end on a phone), and the one-line why when
  * the event was anything but usual.
  * The URL holds only the filters (`?unusual=1&camera=11`) and the selected event
  * (`/event/<id>`), replaced rather than pushed, so Back leaves the panel. Registered through `panel_custom`, so it runs inside Home Assistant's frontend with
@@ -41,10 +42,11 @@ import {
   formatTime,
   joinWords,
   notKept,
+  evidenceText,
   sensorsText,
   signalLevel,
+  signalText,
   sourceName,
-  termName,
   usualness,
   verdictText,
 } from "./format.js";
@@ -64,6 +66,19 @@ const NO_FILTERS = { unusual: false, cls: "", camera: "", area: "", dropped: fal
 const WIDE_PX = 900;
 // From this width the cameras get a column of their own, left of the list.
 const ROOMY_PX = 1200;
+// The desktop columns can be dragged wider or narrower; the widths stay in this browser.
+// Each is clamped against the panel's width in CSS too, so a smaller window never breaks it.
+const COLUMNS_KEY = "scrypted-stamina.columns";
+const COLUMNS = {
+  cams: { min: 160, max: 0.25, edge: "left", label: "Resize the camera column" },
+  detail: { min: 320, max: 0.6, edge: "right", label: "Resize the event column" },
+};
+// The list between them never gets narrower than this by a drag.
+const LIST_MIN_PX = 400;
+const KEY_STEP_PX = 16;
+// The Cameras page counts today's events from at most this many pages of the list.
+const TODAY_PAGES = 10;
+const TODAY_LIMIT = 200;
 // A camera with no event for this long reads "No recent events".
 const QUIET_S = 24 * 3600;
 
@@ -153,6 +168,11 @@ function meter(score, unusual, large = false) {
   );
 }
 
+/** While a camera learns, its events carry this instead of a meter: no judgement yet. */
+function learningTag(text, large = false) {
+  return el("span", { class: `learning-tag${large ? " learning-tag--large" : ""}`, title: "Not judged until the camera has learned what is normal", text });
+}
+
 /** How unusual one signal was: the same meter, without the camera's line (it has none). */
 function signalMeter(weight) {
   const level = signalLevel(weight);
@@ -203,8 +223,24 @@ class ScryptedStaminaPanel extends HTMLElement {
     this._detailPane = el("aside", { class: "pane pane--detail", "aria-label": "Event" });
     this._detail = el("div", { class: "detail", role: "region", "aria-label": "Selected event" });
     this._camPane = el("nav", { class: "pane pane--cams", "aria-label": "Cameras", hidden: true });
-    this._main = el("main", { class: "split" }, this._camPane, this._listPane, this._detailPane);
-    this._root.append(this._header, this._main);
+    this._columns = this._loadColumns();
+    this._camHandle = this._resizer("cams");
+    this._detailHandle = this._resizer("detail");
+    this._main = el(
+      "main",
+      { class: "split" },
+      this._camPane,
+      this._camHandle,
+      this._listPane,
+      this._detailHandle,
+      this._detailPane,
+    );
+    this._applyColumns();
+    this._camsPage = el("main", { class: "cams-page", hidden: true, "aria-label": "Cameras" });
+    this._root.append(this._header, this._main, this._camsPage);
+    // "events" or "cameras": the two tabs, from the route.
+    this._view = "events";
+    this._today = null;
 
     this._filters = { ...NO_FILTERS };
     this._list = this._freshList();
@@ -317,6 +353,7 @@ class ScryptedStaminaPanel extends HTMLElement {
   _placeCams() {
     this._main.classList.toggle("split--roomy", this._roomy);
     this._camPane.hidden = !this._roomy;
+    this._camHandle.hidden = !this._roomy;
     this._camBox.classList.toggle("is-open", this._roomy || this._camsOpen);
     const home = this._roomy ? this._camPane : this._camSlot;
     if (this._camBox.parentNode !== home) home.append(this._camBox);
@@ -325,6 +362,7 @@ class ScryptedStaminaPanel extends HTMLElement {
   _placeDetail() {
     this._main.classList.toggle("split--wide", this._wide);
     this._detailPane.hidden = !this._wide;
+    this._detailHandle.hidden = !this._wide;
     if (!this._wide) return;
     this._idle ??= empty("mdi:gesture-tap", "Pick an event", "Its video and why it was flagged show here.");
     const target = this._selected ? this._detail : this._idle;
@@ -332,6 +370,116 @@ class ScryptedStaminaPanel extends HTMLElement {
     if (this._detailPane.firstChild !== target || this._detailPane.childNodes.length !== 1) {
       replace(this._detailPane, target);
     }
+  }
+
+  // ---------------------------------------------------------------- column widths
+
+  _loadColumns() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(COLUMNS_KEY) || "{}");
+      const columns = {};
+      for (const name of Object.keys(COLUMNS)) {
+        if (Number.isFinite(saved?.[name])) columns[name] = saved[name];
+      }
+      return columns;
+    } catch {
+      return {};
+    }
+  }
+
+  _saveColumns() {
+    try {
+      if (Object.keys(this._columns).length) localStorage.setItem(COLUMNS_KEY, JSON.stringify(this._columns));
+      else localStorage.removeItem(COLUMNS_KEY);
+    } catch {
+      // Private mode or storage switched off: the widths last until the page closes.
+    }
+  }
+
+  /** A width set by hand overrides the default; CSS still clamps it against the panel. */
+  _applyColumns() {
+    for (const [name, spec] of Object.entries(COLUMNS)) {
+      const width = this._columns[name];
+      const handle = name === "cams" ? this._camHandle : this._detailHandle;
+      if (width === undefined) {
+        this._main.style.removeProperty(`--ss-${name}-w`);
+      } else {
+        this._main.style.setProperty(`--ss-${name}-w`, `clamp(${spec.min}px, ${Math.round(width)}px, ${spec.max * 100}%)`);
+      }
+      const shown = this._columnWidth(name);
+      if (shown) handle.setAttribute("aria-valuenow", String(Math.round(shown)));
+    }
+  }
+
+  _columnWidth(name) {
+    const pane = name === "cams" ? this._camPane : this._detailPane;
+    return pane.hidden ? 0 : pane.getBoundingClientRect().width;
+  }
+
+  _setColumn(name, width) {
+    const spec = COLUMNS[name];
+    const total = this._main.getBoundingClientRect().width;
+    const other = this._columnWidth(name === "cams" ? "detail" : "cams");
+    const max = Math.min(total * spec.max, total - other - LIST_MIN_PX);
+    this._columns[name] = Math.max(spec.min, Math.min(width, max));
+    this._applyColumns();
+  }
+
+  /**
+   * The handle on a column's inner edge: drag it, or focus it and use the arrow keys;
+   * a double click puts the default back.
+   */
+  _resizer(name) {
+    const spec = COLUMNS[name];
+    const handle = el("div", {
+      class: "resizer",
+      role: "separator",
+      tabindex: "0",
+      title: "Drag to resize, double-click to reset",
+      "aria-label": spec.label,
+      "aria-orientation": "vertical",
+      "aria-valuemin": String(spec.min),
+      hidden: true,
+    });
+    const widthAt = (x) => {
+      const box = this._main.getBoundingClientRect();
+      return spec.edge === "left" ? x - box.left : box.right - x;
+    };
+    handle.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0) return;
+      ev.preventDefault();
+      handle.setPointerCapture(ev.pointerId);
+      handle.classList.add("is-active");
+      this._main.classList.add("is-resizing");
+    });
+    handle.addEventListener("pointermove", (ev) => {
+      if (handle.hasPointerCapture(ev.pointerId)) this._setColumn(name, widthAt(ev.clientX));
+    });
+    const end = (ev) => {
+      if (!handle.hasPointerCapture(ev.pointerId)) return;
+      handle.releasePointerCapture(ev.pointerId);
+      this._saveColumns();
+    };
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+    handle.addEventListener("lostpointercapture", () => {
+      handle.classList.remove("is-active");
+      this._main.classList.remove("is-resizing");
+    });
+    handle.addEventListener("dblclick", () => {
+      delete this._columns[name];
+      this._applyColumns();
+      this._saveColumns();
+    });
+    handle.addEventListener("keydown", (ev) => {
+      if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+      ev.preventDefault();
+      // Right widens the column on the left, and narrows the one on the right.
+      const step = (ev.shiftKey ? 4 : 1) * KEY_STEP_PX * (ev.key === "ArrowRight" ? 1 : -1);
+      this._setColumn(name, this._columnWidth(name) + (spec.edge === "left" ? step : -step));
+      this._saveColumns();
+    });
+    return handle;
   }
 
   /** Videos in the open event that are playing now, to resume after the list is redrawn. */
@@ -373,6 +521,7 @@ class ScryptedStaminaPanel extends HTMLElement {
       if (this._list.loaded) this._refreshList();
       if (this._cams.loaded) this._loadCameras();
       if (this._event?.data) this._loadEvent(this._event.id);
+      if (this._view === "cameras") this._loadToday();
     }, wait);
   }
 
@@ -395,6 +544,8 @@ class ScryptedStaminaPanel extends HTMLElement {
     this._filterRoute = null;
 
     const filters = filtersFromSearch(search);
+    const view = path.startsWith("/cameras") ? "cameras" : "events";
+    if (view !== this._view) this._showView(view);
     const match = path.match(/^\/event\/([A-Za-z0-9_.-]+)/);
     const id = match ? match[1] : null;
     if (!sameFilters(filters, this._filters) || (!this._list.loaded && !this._list.loading)) {
@@ -405,8 +556,22 @@ class ScryptedStaminaPanel extends HTMLElement {
       this._listPane.scrollTop = 0;
       this._loadList();
     }
-    if (id !== this._selected) this._select(id, { route: false });
+    // The Cameras page leaves the open event as it is, for when Events comes back.
+    if (view === "events" && id !== this._selected) this._select(id, { route: false });
     this._placeDetail();
+  }
+
+  /** One tab or the other; the event list keeps its place while Cameras is up. */
+  _showView(view) {
+    this._view = view;
+    this._main.hidden = view !== "events";
+    this._camsPage.hidden = view !== "cameras";
+    this._renderHeader();
+    if (view === "cameras") {
+      for (const video of this._playing()) video.pause();
+      this._renderCamsPage();
+      this._loadToday();
+    }
   }
 
   _url(path, filters = this._filters) {
@@ -418,8 +583,8 @@ class ScryptedStaminaPanel extends HTMLElement {
    * Write the filters and the selection to the URL, replacing: Back leaves the panel.
    * `filtering` says a filter changed it, so an open event that no longer matches gives way.
    */
-  _setRoute({ filters = this._filters, id = this._selected, filtering = false } = {}) {
-    const path = id ? `/event/${id}` : "";
+  _setRoute({ filters = this._filters, id = this._selected, filtering = false, view = this._view } = {}) {
+    const path = view === "cameras" ? "/cameras" : id ? `/event/${id}` : "";
     this._filterRoute = filtering ? `${path}${searchFromFilters(filters)}` : null;
     history.replaceState(history.state, "", this._url(path, filters));
     window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: true } }));
@@ -505,6 +670,27 @@ class ScryptedStaminaPanel extends HTMLElement {
         "div",
         { class: "header__title" },
         el("h1", { class: "header__main", style: { margin: "0" }, text: this._panel?.title || "Events" }),
+      ),
+      el(
+        "nav",
+        { class: "tabs", role: "tablist", "aria-label": "View" },
+        [
+          ["events", "Events"],
+          ["cameras", "Cameras"],
+        ].map(([view, label]) =>
+          el(
+            "button",
+            {
+              class: "tab",
+              role: "tab",
+              "aria-selected": String(this._view === view),
+              onclick: () => {
+                if (this._view !== view) this._setRoute({ view });
+              },
+            },
+            label,
+          ),
+        ),
       ),
     );
   }
@@ -965,7 +1151,9 @@ class ScryptedStaminaPanel extends HTMLElement {
 
   _row(item) {
     const thumb = this._thumbnail(item);
+    const learning = this._learningText(item.camera);
     const signature = JSON.stringify([
+      learning,
       item.state, item.unusual, item.score, item.classes, item.reason, item.duration, item.ended, item.camera_name, item.area, thumb,
     ]);
     const cached = this._rows.get(item.id);
@@ -1008,11 +1196,11 @@ class ScryptedStaminaPanel extends HTMLElement {
           dropped ? badge("Not kept", "neutral") : null,
         ),
         // Why, in a line, wherever it is not plain usual: the meter already says "Usual".
-        item.reason && usualness(item.score, item.unusual).tone !== "low"
+        !learning && item.reason && usualness(item.score, item.unusual).tone !== "low"
           ? el("div", { class: `row__why${item.unusual ? "" : " row__why--usual"}`, text: item.reason })
           : null,
       ),
-      meter(item.score, item.unusual),
+      learning ? learningTag(learning) : meter(item.score, item.unusual),
     );
     this._rows.set(item.id, { signature, node });
     return node;
@@ -1170,26 +1358,29 @@ class ScryptedStaminaPanel extends HTMLElement {
   /** The one card under the player: how unusual, why, and how unusual each signal was. */
   _summaryCard(data) {
     const now = Date.now() / 1000;
+    // While the camera learns there is no judgement to show: no meter, no "usual", no why.
+    const learning = data.learning ? this._learningText(data.camera) || "Learning" : null;
     // Only the signals that made it rarer come through; whatever is not listed was usual.
-    const reasons = (data.reasons || []).filter((reason) => reason.label);
+    const reasons = learning ? [] : (data.reasons || []).filter((reason) => reason.label);
     return el(
       "section",
       { class: "card", "aria-label": "Verdict" },
-      el("div", { class: "verdict" }, meter(data.score, data.unusual, true)),
-      data.reason ? el("p", { class: "sentence", text: data.reason }) : null,
+      el("div", { class: "verdict" }, learning ? learningTag(learning, true) : meter(data.score, data.unusual, true)),
+      data.reason && !learning ? el("p", { class: "sentence", text: data.reason }) : null,
       reasons.length
         ? el(
             "div",
             { class: "reasons" },
-            reasons.map((reason) =>
-              el(
+            reasons.map((reason) => {
+              const words = signalText(reason, this._hass);
+              return el(
                 "div",
                 { class: "reason" },
-                el("span", { class: "reason__term", text: termName(reason) }),
-                el("span", { class: "reason__label", text: reason.label }),
+                el("span", { class: "reason__term", text: words.name }),
+                el("span", { class: "reason__label", text: words.value }),
                 typeof reason.weight === "number" ? signalMeter(reason.weight) : null,
-              ),
-            ),
+              );
+            }),
             el("p", { class: "reason__rest", text: "Everything else about it was usual for this camera." }),
           )
         : null,
@@ -1199,14 +1390,6 @@ class ScryptedStaminaPanel extends HTMLElement {
             { class: "note" },
             icon("mdi:eye-outline", "icon--sm"),
             `Still watching ${sensorsText(data.watching)} until ${formatTime(this._hass, data.follow_up_until)}.`,
-          )
-        : null,
-      data.learning
-        ? el(
-            "p",
-            { class: "note" },
-            icon("mdi:school-outline", "icon--sm"),
-            "This camera is still learning what is normal, so nothing on it is marked unusual yet.",
           )
         : null,
     );
@@ -1267,11 +1450,8 @@ class ScryptedStaminaPanel extends HTMLElement {
                   el(
                     "div",
                     { class: "item__body" },
-                    el("div", { class: "item__name", text: item.name }),
-                    el("div", {
-                      class: "item__sub",
-                      text: [`${item.from ?? "?"} → ${item.to}`, when(item.t_rel_s)].filter(Boolean).join(" · "),
-                    }),
+                    el("div", { class: "item__name", text: evidenceText(item) }),
+                    el("div", { class: "item__sub", text: when(item.t_rel_s) }),
                   ),
                 ),
               ),
@@ -1325,9 +1505,26 @@ class ScryptedStaminaPanel extends HTMLElement {
     } catch (err) {
       cams.error = err;
     }
-    this._renderCams();
-    this._syncFilters();
-    replace(this._bannerSlot, this._banner());
+    // The list too: a camera that learns shows a tag, not a meter, on its rows.
+    this._renderList();
+    this._renderCamsPage();
+  }
+
+  /** "Learning · day 3 of 7" while a camera learns, else null (ready, or not known yet). */
+  _learningText(cameraId) {
+    const cam = this._cams.items.find((item) => item.id === cameraId);
+    if (!cam || cam.learning?.active !== false) return null;
+    return `Learning · ${this._learningProgress(cam).text.toLowerCase()}`;
+  }
+
+  /** How far a learning camera is: "Day 3 of 7" until the days are in, then the events. */
+  _learningProgress(cam) {
+    const needs = this._cams.needs || { days: 7, events: 200 };
+    const days = Math.floor(cam.learning?.days || 0);
+    const events = cam.learning?.events || 0;
+    const progress = Math.min(1, days / needs.days, events / needs.events);
+    if (days < needs.days) return { text: `Day ${days + 1} of ${needs.days}`, progress };
+    return { text: `${events} of ${needs.events} events`, progress };
   }
 
   /**
@@ -1343,13 +1540,10 @@ class ScryptedStaminaPanel extends HTMLElement {
     if (!cam.learning?.active) {
       const days = Math.floor(cam.learning?.days || 0);
       const events = cam.learning?.events || 0;
-      const byDays = Math.min(1, days / needs.days);
-      const byEvents = Math.min(1, events / needs.events);
       return {
-        short: `Learning ${Math.min(days, needs.days)}/${needs.days} d`,
+        short: "Learning",
         text: `Learning what is normal: ${days} of ${needs.days} days, ${events} of ${needs.events} events`,
         tone: "accent",
-        progress: Math.min(byDays, byEvents),
       };
     }
     const last = cam.last_event;
@@ -1390,16 +1584,9 @@ class ScryptedStaminaPanel extends HTMLElement {
           title: `${cam.name}: ${status.text}`,
           onclick: () => this._setFilter({ camera: on ? "" : cam.id, area: "" }),
         },
-        el("span", { class: "dot", dataset: { tone: status.tone }, "aria-hidden": "true" }),
+        // Only a problem gets a dot here; the Cameras tab has the rest.
+        el("span", { class: "dot", dataset: { tone: ["error", "warn"].includes(status.tone) ? status.tone : "none" }, "aria-hidden": "true" }),
         el("span", { class: "cam-chip__name", text: cam.name }),
-        el(
-          "span",
-          { class: "cam-chip__state" },
-          status.progress === undefined
-            ? null
-            : el("span", { class: "mini", "aria-hidden": "true" }, el("span", { style: { width: `${Math.round(status.progress * 100)}%` } })),
-          status.short,
-        ),
       );
     };
     replace(
@@ -1434,6 +1621,137 @@ class ScryptedStaminaPanel extends HTMLElement {
           group.cams.map(row),
         );
       }),
+    );
+  }
+
+  // ---------------------------------------------------------------- the Cameras tab
+
+  /** Today's kept events per camera, from the list itself (newest first, until yesterday). */
+  async _loadToday() {
+    if (this._todayLoading) return;
+    this._todayLoading = true;
+    const key = dayKey(this._hass, Date.now() / 1000);
+    const counts = new Map();
+    let cursor = null;
+    let partial = false;
+    try {
+      for (let page = 0; ; page++) {
+        const result = await this._ws({ type: `${DOMAIN}/events`, limit: TODAY_LIMIT, ...(cursor ? { cursor } : {}) });
+        let older = false;
+        for (const item of result.events) {
+          if (dayKey(this._hass, item.started) !== key) {
+            older = true;
+            break;
+          }
+          const count = counts.get(item.camera) || { all: 0, unusual: 0 };
+          count.all += 1;
+          if (item.unusual) count.unusual += 1;
+          counts.set(item.camera, count);
+        }
+        cursor = result.cursor;
+        if (older || !cursor) break;
+        if (page + 1 >= TODAY_PAGES) {
+          partial = true;
+          break;
+        }
+      }
+      this._today = { counts, partial };
+    } catch {
+      // The counts are a nicety: without them the page still says everything else.
+      this._today ??= null;
+    }
+    this._todayLoading = false;
+    this._renderCamsPage();
+  }
+
+  /** Every camera at a glance, grouped by area; a row opens its events. */
+  _renderCamsPage() {
+    if (this._view !== "cameras") return;
+    const cams = this._cams.items;
+    if (!this._cams.loaded) {
+      replace(
+        this._camsPage,
+        this._cams.error
+          ? empty("mdi:alert-circle-outline", "Cameras could not be loaded", errorText(this._cams.error))
+          : el("div", { class: "more" }, el("div", { class: "spinner", role: "status", "aria-label": "Loading" })),
+      );
+      return;
+    }
+    if (!cams.length) {
+      replace(
+        this._camsPage,
+        empty("mdi:cctv", "No cameras yet", "Cameras appear here once the Stamina extension is on in Scrypted."),
+      );
+      return;
+    }
+    const offline = cams.filter((cam) => cam.online === false).length;
+    const learning = cams.filter((cam) => cam.learning?.active === false).length;
+    const summary = [`${cams.length} camera${cams.length === 1 ? "" : "s"}`];
+    if (offline) summary.push(`${offline} offline`);
+    if (learning) summary.push(`${learning} learning`);
+
+    const cell = (label, ...content) =>
+      el("span", { class: "cam-cell" }, el("span", { class: "cam-cell__label", text: label }), content);
+    const state = (tone, text) => [el("span", { class: "dot", dataset: { tone }, "aria-hidden": "true" }), text];
+
+    const row = (cam) => {
+      const now = Date.now() / 1000;
+      const last = cam.last_event;
+      const lastText = !last
+        ? "None yet"
+        : `${dayKey(this._hass, last.started) === dayKey(this._hass, now) ? formatTime(this._hass, last.started) : formatAgo(last.started)}${last.unusual ? " · unusual" : ""}`;
+      const today = this._today?.counts.get(cam.id);
+      const todayText = !this._today
+        ? "…"
+        : `${today?.all || 0}${this._today.partial ? "+" : ""}${today?.unusual ? ` · ${today.unusual} unusual` : ""}`;
+      const learn = cam.learning?.active === false ? this._learningProgress(cam) : null;
+      const names = joinWords((cam.verifiers || []).map(sourceName)) || "Double-check";
+      const check = !cam.verifier_present
+        ? state("none", "None")
+        : cam.verifier_live === false
+          ? state("warn", "Not responding")
+          : state("ok", "Working");
+      return el(
+        "button",
+        {
+          class: "cam-row",
+          title: `Show ${cam.name}'s events`,
+          onclick: () => this._setRoute({ view: "events", id: null, filters: { ...NO_FILTERS, camera: cam.id }, filtering: true }),
+        },
+        el("span", { class: "cam-row__name", text: cam.name }),
+        cell("Status", state(cam.online === false ? "error" : cam.online ? "ok" : "none", cam.online === false ? "Offline" : cam.online ? "Online" : "Unknown")),
+        cell("Last event", lastText),
+        cell("Today", el("span", { class: today?.unusual ? "cam-cell__unusual" : "", text: todayText })),
+        cell(
+          "Learning",
+          learn
+            ? [el("span", { class: "mini", "aria-hidden": "true" }, el("span", { style: { width: `${Math.round(learn.progress * 100)}%` } })), learn.text]
+            : state("ok", "Ready"),
+        ),
+        el("span", { class: "cam-cell", title: names }, el("span", { class: "cam-cell__label", text: names }), check),
+      );
+    };
+
+    replace(
+      this._camsPage,
+      el(
+        "div",
+        { class: "cams-page__inner" },
+        el("p", { class: "cams-page__summary", text: summary.join(" · ") }),
+        el(
+          "div",
+          { class: "cam-table", role: "list" },
+          el(
+            "div",
+            { class: "cam-head", "aria-hidden": "true" },
+            ["Camera", "Status", "Last event", "Today", "Learning", "Double-check"].map((text) => el("span", { text })),
+          ),
+          areaGroups([...cams]).map((group) => [
+            el("h2", { class: "cam-area", text: group.label }),
+            group.cams.map(row),
+          ]),
+        ),
+      ),
     );
   }
 }

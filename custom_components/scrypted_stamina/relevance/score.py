@@ -481,10 +481,77 @@ def _phrase(term: Term, *, lead: bool = True) -> str:
         # "alongside Gate".
         return term.label
     if term.name == "signal" and term.subject:
+        known = _signal_phrase(term.subject, term.label)
+        if known is not None:
+            return known
         # A chosen signal has a name of its own, and the state alone is meaningless in a
         # sentence: "with armed_away" says nothing about what was armed.
-        return f"with {term.subject} {term.label}"
+        return f"with {term.subject} {term.label.replace('_', ' ')}"
     return f"with {term.label}"
+
+
+# Detection sources as a person knows them; any other `@scope/scrypted-foo-bar` is "Foo Bar".
+_SOURCE_NAMES = {"whole-frame": "the whole picture"}
+
+
+def source_name(source: str) -> str:
+    """Return a plugin id as its plain name: "@scope/scrypted-coral-guard" → "Coral Guard"."""
+    if source in _SOURCE_NAMES:
+        return _SOURCE_NAMES[source]
+    bare = source.rsplit("/", 1)[-1]
+    if bare.startswith("scrypted-"):
+        bare = bare[len("scrypted-") :]
+    words = [word for word in bare.replace("_", "-").split("-") if word]
+    return " ".join(word.capitalize() for word in words) or "Scrypted"
+
+
+def _seconds(label: str) -> str:
+    """Return a dwell reading or band in seconds: "6.4" → "6 s", "3 to 8" → "3 to 8 s"."""
+    low, sep, high = label.partition(" to ")
+    try:
+        if sep:
+            return f"{round(float(low))} to {round(float(high))} s"
+        if label.startswith("< "):
+            return f"under {round(float(label[2:]))} s"
+        if label.endswith(" and up"):
+            return f"{round(float(label[: -len(' and up')]))} s or more"
+        return f"{round(float(label))} s"
+    except ValueError:
+        return label
+
+
+def _signal_phrase(subject: str, label: str) -> str | None:
+    """Return the model's own signals in words, never a raw id or number; None for others.
+
+    Display only, like the rest of the sentence: what is counted is the raw value.
+    """
+    if subject == "detected by":
+        if label in ("", "none"):
+            return "seen by nothing"
+        names = [source_name(source) for source in label.split("+")]
+        joined = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+        return f"seen by {joined}"
+    if subject == "dwell":
+        return f"staying {_seconds(label)}"
+    if subject == "night mode" and label in ("on", "off"):
+        return f"with night vision {label}"
+    if subject == "sun elevation":
+        low, sep, high = label.partition(" to ")
+        try:
+            if sep:
+                degrees = (float(low) + float(high)) / 2
+            elif label.startswith("< "):
+                degrees = float(label[2:]) - 1
+            elif label.endswith(" and up"):
+                degrees = float(label[: -len(" and up")]) + 1
+            else:
+                degrees = float(label)
+        except ValueError:
+            return None
+        if degrees < 0:
+            return "after dark"
+        return "around dusk or dawn" if degrees < 6 else "in daylight"
+    return None
 
 
 def calibrate(

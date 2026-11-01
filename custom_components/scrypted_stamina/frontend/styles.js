@@ -66,6 +66,15 @@ button { border: none; background: none; cursor: pointer; padding: 0; }
 .header__main { font-size: 1.2rem; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .header__sub { font-size: 0.82rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.tabs { display: flex; align-self: stretch; flex: 0 0 auto; margin-right: 4px; }
+.tab {
+  display: inline-flex; align-items: center; min-height: 44px; padding: 0 14px;
+  font-size: 0.95rem; font-weight: 500; opacity: 0.75;
+  border-bottom: 2px solid transparent;
+}
+.tab:hover { opacity: 1; }
+.tab[aria-selected="true"] { opacity: 1; border-bottom-color: currentColor; }
+
 .icon { --mdc-icon-size: 20px; width: 20px; height: 20px; flex: 0 0 auto; display: inline-flex; }
 .icon--sm { --mdc-icon-size: 16px; width: 16px; height: 16px; }
 .icon--lg { --mdc-icon-size: 36px; width: 36px; height: 36px; }
@@ -81,10 +90,24 @@ button { border: none; background: none; cursor: pointer; padding: 0; }
 
 .split { flex: 1 1 auto; min-height: 0; display: flex; }
 .pane { min-height: 0; overflow: auto; overscroll-behavior: contain; position: relative; }
-.pane--list { flex: 1 1 auto; }
+.pane--list { flex: 1 1 auto; container: list / inline-size; }
 /* The list is the main column; the event beside it never grows past a sane player width. */
-.split--wide { display: grid; grid-template-columns: minmax(0, 1fr) clamp(380px, 36%, 640px); }
-.split--wide.split--roomy { grid-template-columns: clamp(220px, 15%, 280px) minmax(0, 1fr) clamp(380px, 32%, 640px); }
+/* The zero-width tracks hold the drag handles; a width set by hand comes in as a variable. */
+.split--wide { display: grid; grid-template-columns: minmax(0, 1fr) 0 var(--ss-detail-w, clamp(380px, 36%, 640px)); }
+.split--wide.split--roomy {
+  grid-template-columns: var(--ss-cams-w, clamp(220px, 15%, 280px)) 0 minmax(0, 1fr) 0 var(--ss-detail-w, clamp(380px, 32%, 640px));
+}
+.resizer {
+  position: relative; z-index: 4; width: 10px; margin-left: -3px;
+  cursor: col-resize; touch-action: none;
+}
+.resizer::after {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 2px;
+  background: transparent; transition: background 120ms;
+}
+.resizer:hover::after, .resizer:focus-visible::after, .resizer.is-active::after { background: var(--ss-accent); }
+.resizer:focus-visible { outline: none; }
+.split.is-resizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
 /* Beside the event the list fills its column: no centred gutters on a wide screen. */
 .split--wide .pane--list .page { max-width: none; }
 .split--wide .pane--list { border-right: 1px solid var(--ss-line); }
@@ -335,8 +358,6 @@ button.cam-group__label:hover { color: var(--ss-text); background: color-mix(in 
 .cam-chip[aria-pressed="true"] { background: color-mix(in srgb, var(--ss-accent) 18%, transparent); }
 .cam-chip__name { flex: 1 1 auto; min-width: 0; font-weight: 500; font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* A long state drops under the name rather than cutting it short. */
-.cam-chip__state { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 0.76rem; color: var(--ss-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.cam-chip[data-tone="error"] .cam-chip__state { color: color-mix(in srgb, var(--ss-error) 70%, var(--ss-text)); }
 .mini { width: 28px; height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--ss-accent) 22%, transparent); overflow: hidden; }
 .mini > span { display: block; height: 100%; background: var(--ss-accent); }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; background: var(--tone, var(--ss-neutral)); }
@@ -344,11 +365,62 @@ button.cam-group__label:hover { color: var(--ss-text); background: color-mix(in 
 .dot[data-tone="warn"] { --tone: var(--ss-unusual); }
 .dot[data-tone="error"] { --tone: var(--ss-error); }
 .dot[data-tone="accent"] { --tone: var(--ss-accent); }
+.dot[data-tone="none"] { --tone: transparent; }
 
 /* Its own column when roomy: always open, no fold. */
 .pane--cams .cams { margin: 0; border-radius: 0; background: none; box-shadow: none; padding: 8px 4px 24px; }
 .pane--cams .cams__toggle { display: none; }
 .pane--cams .cams__body { display: flex; flex-direction: column; gap: 6px; padding: 0; }
+
+/* ------------------------------------------------------------------ the Cameras tab */
+
+.cams-page { flex: 1 1 auto; min-height: 0; overflow: auto; container: camspage / inline-size; }
+.cams-page__inner { max-width: 1280px; margin: 0 auto; padding: 8px 12px calc(24px + env(safe-area-inset-bottom, 0px)); }
+.cams-page__summary { margin: 8px 4px 12px; color: var(--ss-dim); font-size: 0.9rem; }
+.cam-table { background: var(--ss-surface); border-radius: var(--ss-radius); box-shadow: inset 0 0 0 1px var(--ss-line); overflow: hidden; }
+.cam-area {
+  margin: 0; padding: 14px 16px 6px; border-top: 1px solid var(--ss-line);
+  font-size: 0.75rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ss-dim);
+}
+.cam-head + .cam-area { border-top: none; }
+/* A phone: the name, then the facts wrapping under it, each with its own small label. */
+.cam-head { display: none; }
+.cam-row {
+  display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; width: 100%;
+  padding: 10px 16px; min-height: 48px; text-align: left; border-top: 1px solid var(--ss-line);
+}
+.cam-area + .cam-row { border-top: none; }
+.cam-row:hover { background: color-mix(in srgb, var(--ss-accent) 6%, transparent); }
+.cam-row__name { flex: 1 0 100%; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cam-cell { display: inline-flex; align-items: center; gap: 6px; font-size: 0.86rem; font-variant-numeric: tabular-nums; min-width: 0; }
+.cam-cell__label { color: var(--ss-dim); }
+.cam-cell__label::after { content: ":"; }
+.cam-cell__unusual { color: color-mix(in srgb, var(--ss-unusual) 60%, var(--ss-text)); font-weight: 600; }
+/* Wide enough: one table, a header row, no labels in the cells. */
+@container camspage (min-width: 760px) {
+  .cam-head, .cam-row {
+    display: grid; grid-template-columns: minmax(9em, 1.5fr) 0.8fr 1fr 1fr 1.1fr 1fr; gap: 12px; align-items: center;
+  }
+  .cam-head {
+    padding: 10px 16px; font-size: 0.75rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ss-dim);
+    border-bottom: 1px solid var(--ss-line);
+  }
+  .cam-row__name { flex: none; }
+  .cam-cell__label { display: none; }
+}
+
+/* ------------------------------------------------------------------ learning */
+
+/* In place of the meter while a camera learns: neutral, and plainly not a verdict. */
+.learning-tag {
+  flex: 0 0 auto; align-self: center; max-width: 110px; padding: 2px 8px; border-radius: 6px;
+  font-size: 0.72rem; font-weight: 500; line-height: 1.4; color: var(--ss-dim); text-align: center;
+  background: color-mix(in srgb, var(--ss-text) 7%, transparent);
+}
+.learning-tag--large { max-width: none; font-size: 0.9rem; padding: 4px 10px; }
+@container list (min-width: 640px) {
+  .row .learning-tag { width: 104px; order: -1; }
+}
 
 /* ------------------------------------------------------------------ how unusual */
 
@@ -404,12 +476,13 @@ button.cam-group__label:hover { color: var(--ss-text); background: color-mix(in 
 
 /* ------------------------------------------------------------------ wide */
 
-.pane--detail .event { padding: 16px; gap: 16px; max-width: 640px; }
+.pane--detail .event { padding: 16px; gap: 16px; }
 .pane--detail .detail__title { padding: 0; }
 .pane--detail .event__media .player { border-radius: var(--ss-radius); }
 .pane--detail .event .card { margin: 0; }
 
-@media (min-width: 720px) {
+/* By the list's own width, not the window's: a column dragged narrow gets the phone rows. */
+@container list (min-width: 640px) {
   .thumb { width: 128px; }
   .row { gap: 14px; }
   /* The meter sits by the thumbnail: one column to scan, never a long way from the row's text. */

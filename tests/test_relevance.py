@@ -24,7 +24,13 @@ from custom_components.scrypted_stamina.relevance.features import (
     to_event,
 )
 from custom_components.scrypted_stamina.relevance.rates import build, group_key, preceded
-from custom_components.scrypted_stamina.relevance.score import calibrate, score
+from custom_components.scrypted_stamina.relevance.score import (
+    Term,
+    _phrase,
+    calibrate,
+    score,
+    source_name,
+)
 
 POLICY = Policy()
 
@@ -270,3 +276,26 @@ async def test_a_gate_opened_just_before_is_a_reason(hass) -> None:
     term = next(term for term in result.terms if term.subject == "Door sensors")
     assert term.label == "changed within 30 s before"
     assert term.contribution > 0
+
+
+def test_signal_phrases_never_show_ids_or_raw_numbers() -> None:
+    """The reason sentence names sources and readings in words."""
+
+    def phrase(subject: str, label: str) -> str:
+        return _phrase(Term(name="signal", label=label, contribution=1.0, seen=0, subject=subject))
+
+    assert source_name("@example/scrypted-coral-guard") == "Coral Guard"
+    assert source_name("@example/scrypted-reolink") == "Reolink"
+    assert source_name("scrypted-audio-guard") == "Audio Guard"
+    assert source_name("@scrypted/core") == "Core"
+    assert (
+        phrase("detected by", "@example/scrypted-reolink+scrypted-coral-guard")
+        == "seen by Reolink and Coral Guard"
+    )
+    assert phrase("dwell", "6.4") == "staying 6 s"
+    assert phrase("dwell", "3 to 8") == "staying 3 to 8 s"
+    assert phrase("night mode", "on") == "with night vision on"
+    assert phrase("sun elevation", "22.4") == "in daylight"
+    assert phrase("sun elevation", "-3 to 2") == "after dark"
+    assert phrase("sun elevation", "2 to 5") == "around dusk or dawn"
+    assert phrase("Alarm panel", "armed_away") == "with Alarm panel armed away"
