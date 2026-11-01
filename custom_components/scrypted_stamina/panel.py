@@ -20,7 +20,7 @@ from .const import DOMAIN, TITLE
 
 PANEL_URL_PATH = "scrypted-stamina"
 PANEL_COMPONENT = "scrypted-stamina-panel"
-PANEL_ICON = "mdi:cctv"
+PANEL_ICON = "mdi:motion-play-outline"
 STATIC_PREFIX = f"/{DOMAIN}_panel"
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 
