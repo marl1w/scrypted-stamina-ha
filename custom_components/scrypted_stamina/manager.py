@@ -67,8 +67,8 @@ from homeassistant.util import dt as dt_util
 
 from .api import StaminaApiError, StaminaClient
 from .areas import area_key, slug_of, wanted_areas
+from .cameras import async_sync_camera_subentries, camera_settings, camera_subentries
 from .const import (
-    CONF_CAMERAS,
     CONF_FOLLOW_UP_MINUTES,
     CONF_HISTORY_SIZE_MB,
     CONF_LINKED,
@@ -251,6 +251,7 @@ class StaminaManager:
         # Recent changes of every linked entity, for the look-back window at each start.
         self.recent = RecentChanges(LOOK_BACK_MAX_MINUTES * 60.0)
         self._unsub: list[CALLBACK_TYPE] = []
+        self._linked_unsub: CALLBACK_TYPE | None = None
         self._thumbnails: set[str] = set()
         self._final_thumbnails: set[str] = set()
         self._one_shots: dict[str, CALLBACK_TYPE] = {}
@@ -272,8 +273,8 @@ class StaminaManager:
     # ------------------------------------------------------------------ options
 
     def camera_options(self, camera: str) -> dict[str, Any]:
-        """Return one camera's options."""
-        return dict((self.entry.options.get(CONF_CAMERAS) or {}).get(camera) or {})
+        """Return one camera's settings, from its subentry (`cameras.py`)."""
+        return dict(camera_settings(self.entry, camera))
 
     def linked(self, camera: str) -> list[str]:
         """Return a camera's linked entities."""
@@ -295,8 +296,13 @@ class StaminaManager:
 
     def _all_linked(self) -> list[str]:
         """Return every camera's linked entities, once each."""
-        cameras = self.entry.options.get(CONF_CAMERAS) or {}
-        return sorted({entity_id for camera in cameras for entity_id in self.linked(camera)})
+        return sorted(
+            {
+                entity_id
+                for camera in camera_subentries(self.entry)
+                for entity_id in self.linked(camera)
+            }
+        )
 
     def camera_names(self) -> dict[str, str]:
         """Return each camera's name, for the reason sentence."""
@@ -314,11 +320,8 @@ class StaminaManager:
             if mode in UPLOAD_MODES
         }
         await self.async_refresh_cameras()
-        if linked := self._all_linked():
-            # Before anything can start an event: the look-back window reads this ring.
-            self._unsub.append(
-                async_track_state_change_event(self.hass, linked, self._linked_changed)
-            )
+        # Before anything can start an event: the look-back window reads this ring.
+        self.async_track_linked()
         await self.uploader.async_start()
         slugs = {slug_of(key, title): key for key, title in self.areas.items()}
         self._event_areas = {
@@ -368,9 +371,23 @@ class StaminaManager:
             self.hass.bus.async_listen(ar.EVENT_AREA_REGISTRY_UPDATED, self._area_updated)
         )
 
+    @callback
+    def async_track_linked(self) -> None:
+        """Follow every camera's linked entities, again after a camera's settings change."""
+        if self._linked_unsub is not None:
+            self._linked_unsub()
+            self._linked_unsub = None
+        if linked := self._all_linked():
+            self._linked_unsub = async_track_state_change_event(
+                self.hass, linked, self._linked_changed
+            )
+
     async def async_stop(self) -> None:
         """Stop everything, keeping what is in the index."""
         self._stopping = True
+        if self._linked_unsub is not None:
+            self._linked_unsub()
+            self._linked_unsub = None
         for unsub in self._unsub:
             unsub()
         self._unsub.clear()
@@ -430,6 +447,11 @@ class StaminaManager:
         except StaminaApiError as err:
             _LOGGER.debug("Camera list unavailable: %s", err)
             return
+        listed = {info.id for info in cameras}
+        # A camera the plugin no longer lists goes, with its subentry, device and entities.
+        if listed:
+            for camera in [c for c in self.cameras if c not in listed]:
+                del self.cameras[camera]
         added = False
         for info in cameras:
             device = resolve_camera(self.hass, info.id, info.name, self.entry.entry_id)
@@ -439,9 +461,9 @@ class StaminaManager:
             else:
                 self.cameras[info.id] = CameraStatus(info=info, device=device)
                 added = True
+        self.async_sync_cameras(listed)
         if added:
             async_dispatcher_send(self.hass, signal_cameras(self.entry.entry_id))
-        self.async_sync_areas()
 
     def _camera(self, camera: str, name: str | None = None) -> CameraStatus:
         """Return a camera's status, creating a placeholder for one not listed yet."""
@@ -453,6 +475,7 @@ class StaminaManager:
                 device=resolve_camera(self.hass, camera, info.name, self.entry.entry_id),
             )
             self.cameras[camera] = status
+            self.async_sync_cameras()
             async_dispatcher_send(self.hass, signal_cameras(self.entry.entry_id))
             self._spawn(self.async_refresh_cameras(), "cameras")
         return status
@@ -481,7 +504,7 @@ class StaminaManager:
             self._changed(camera)
             found = True
         if found:
-            self.async_sync_areas()
+            self.async_sync_cameras()
 
     @callback
     def _area_updated(self, event: Event[ar.EventAreaRegistryUpdatedData]) -> None:
@@ -491,16 +514,19 @@ class StaminaManager:
         for camera, status in self.cameras.items():
             status.device = resolve_camera(self.hass, camera, status.info.name, self.entry.entry_id)
             self._changed(camera)
-        self.async_sync_areas()
+        self.async_sync_cameras()
 
     @callback
-    def async_sync_areas(self) -> None:
-        """Keep `areas` to the areas that hold a camera, and tell their entities.
+    def async_sync_cameras(self, listed: set[str] | None = None) -> None:
+        """Keep a subentry per camera, and `areas` to the areas that hold one.
 
-        With no camera known at all (the plugin unreachable at start), nothing is removed.
+        `listed`, the plugin's camera list when just read, lets unlisted cameras' subentries
+        go. With no camera known at all (the plugin unreachable at start), nothing is removed.
         """
         if self._stopping:
             return
+        names = {camera: status.device.name for camera, status in self.cameras.items()}
+        async_sync_camera_subentries(self.hass, self.entry, names, listed or set())
         wanted = wanted_areas([status.device for status in self.cameras.values()])
         if wanted and wanted != self.areas:
             self.areas = wanted

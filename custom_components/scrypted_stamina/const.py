@@ -70,7 +70,8 @@ DEFAULT_FOLLOW_UP_MINUTES: Final = 10
 CONF_LOOK_BACK_MINUTES: Final = "look_back_minutes"
 DEFAULT_LOOK_BACK_MINUTES: Final = 2
 LOOK_BACK_MAX_MINUTES: Final = 10
-# Per-camera options live under this key, by Scrypted camera id.
+# Where earlier versions kept the per-camera settings in the options, by Scrypted camera id;
+# now in camera subentries (`cameras.py`), and only read to migrate them.
 CONF_CAMERAS: Final = "cameras"
 # How long `binary_sensor.<cam>_unusual` pulses on for a late unusual.
 UNUSUAL_PULSE_SECONDS: Final = 30.0
@@ -94,9 +95,19 @@ THUMBNAIL_DROPPED_DAYS: Final = 7
 CONF_HISTORY_SIZE_MB: Final = "history_size_mb"
 DEFAULT_HISTORY_SIZE_MB: Final = 200
 
+# Which source the panel and `mode=auto` play first: the cloud copy (the default; the
+# destinations in the order they are listed) or the recording.
+CONF_PLAYBACK_ORDER: Final = "playback_order"
+PLAYBACK_CLOUD_FIRST: Final = "cloud_first"
+PLAYBACK_RECORDING_FIRST: Final = "recording_first"
+PLAYBACK_ORDERS: Final = (PLAYBACK_CLOUD_FIRST, PLAYBACK_RECORDING_FIRST)
+DEFAULT_PLAYBACK_ORDER: Final = PLAYBACK_CLOUD_FIRST
+
 # ------------------------------------------------------------------ destinations
 
 SUBENTRY_TYPE_DESTINATION: Final = "destination"
+# One per camera, managed by the integration (`cameras.py`); unique id: the Scrypted id.
+SUBENTRY_TYPE_CAMERA: Final = "camera"
 CONF_DESTINATION_ENTRY: Final = "destination_entry"
 CONF_FOLDER: Final = "folder"
 CONF_QUOTA_GB: Final = "quota_gb"

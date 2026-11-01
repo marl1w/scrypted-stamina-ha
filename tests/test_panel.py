@@ -407,7 +407,7 @@ async def test_event_without_any_video(hass, hass_ws_client, stamina_entry) -> N
     await stamina_entry.index.async_save(rec)
     client = await hass_ws_client(hass)
     event = (await call(client, type=f"{DOMAIN}/event", event_id=rec.id))["event"]
-    assert event["play"] == {"url": None, "recorder": False, "cloud": None}
+    assert event["play"] == {"url": None, "recorder": False, "cloud": None, "order": "cloud_first"}
     assert event["cloud_path"] is None and event["learning"] is True
     assert event["subjects"][0]["verified_by"] == []
 
@@ -449,6 +449,8 @@ async def test_cameras(hass, hass_ws_client, stamina_entry) -> None:
     assert driveway["online"] is False and driveway["recorder"] is False
     assert driveway["learning"]["active"] is False and driveway["last_event"] is None
     assert result["learning_needs"] == {"days": 7.0, "events": 200}
+    # Which source the panel plays first: the cloud copy unless the options say otherwise.
+    assert result["playback_order"] == "cloud_first"
 
 
 async def test_cameras_come_grouped_by_area(hass, hass_ws_client, stamina_entry) -> None:

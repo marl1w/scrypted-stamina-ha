@@ -48,7 +48,7 @@ Phase 0 answers decide the details of phases 2–4. S3 is done in the camera plu
 
 ## Phase 3: context and scoring
 
-- Linked entities per camera (options flow), and the context snapshot at start and end.
+- Linked entities per camera (in the camera's subentry), and the context snapshot at start and end.
 - Port `relevance/` from the earlier prototype: features, learned normal, score, and the predecessor ("what fired before") across cameras. Its pools become together / per HA area / per camera, with per area replacing per recorder.
 - Follow-up window (architecture §3.4a): late evidence from linked entities, a provisional score at the end and a final score after the window, the `FOLLOW_UP` decider state with its own pending cap, and a late `unusual` event.
 - Day/night: the camera's BinarySensor children (e.g. scrypted-reolink's "Night mode") as features.

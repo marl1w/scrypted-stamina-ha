@@ -13,7 +13,7 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
 from custom_components.scrypted_stamina import uploader as uploader_module
-from custom_components.scrypted_stamina.const import INDEX_FILENAME, NO_AREA
+from custom_components.scrypted_stamina.const import CONF_PLAYBACK_ORDER, INDEX_FILENAME, NO_AREA
 from custom_components.scrypted_stamina.decider import EventRecord, EventState
 from custom_components.scrypted_stamina.index import Copy, EventIndex
 from custom_components.scrypted_stamina.protocol import EventFacts
@@ -602,7 +602,7 @@ async def test_a_stopped_playback_session_is_started_again(
     from homeassistant.setup import async_setup_component
 
     assert await async_setup_component(hass, "media_source", {})
-    entry = await setup()
+    entry = await setup(options={CONF_PLAYBACK_ORDER: "recording_first"})
     manager = await wire(entry, Clock())
     eid = event_id(202)
     run_event(stamina, eid, "confirmed")

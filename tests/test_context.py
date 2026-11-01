@@ -241,6 +241,7 @@ async def test_a_shared_entity_counts_once_per_camera(hass, stamina, setup) -> N
     other = "39"
     hass.states.async_set(GATE, "off", {"device_class": "door"})
     linked = {CONF_LINKED: [GATE], CONF_FOLLOW_UP_MINUTES: 10}
+    stamina.cameras.append({**stamina.cameras[0], "id": other, "name": "Gate"})
     entry = await setup(options={CONF_CAMERAS: {CAMERA: linked, other: linked}})
     manager = entry.runtime_data.manager
     first, second = event_id(85), event_id(86)

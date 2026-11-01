@@ -208,7 +208,6 @@ async def test_the_class_option_defaults_to_people_and_vehicles(hass, stamina, s
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {CONF_UPLOAD_CLASSES: ["person", "animal"]}
     )
-    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert entry.options[CONF_UPLOAD_CLASSES] == ["person", "animal"]
     assert LEGACY_UNUSUAL_OVERRIDES not in entry.options

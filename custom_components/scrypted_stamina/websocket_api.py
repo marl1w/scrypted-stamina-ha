@@ -6,8 +6,9 @@ and camera list, the relevance analysis, the signed playback URLs — shaped for
 * `scrypted_stamina/events` — newest first, filtered (unusual, class, camera or area,
   not-kept included or not), paged with an opaque cursor.
 * `scrypted_stamina/event` — one event: why it scored as it did, what was decided, where
-  the copy is, and a signed URL that plays it (recorder first, then the cloud copy).
-* `scrypted_stamina/cameras` — each camera's status, capabilities and learning progress.
+  the copy is, and signed URLs that play it, with `order`, which plays first.
+* `scrypted_stamina/cameras` — each camera's status, capabilities and learning progress,
+  and `playback_order` (`cloud_first`, the default, or `recording_first`).
 * `scrypted_stamina/subscribe` — `{"changed": true}` when something the panel shows has
   changed, at most once per `NUDGE_SECONDS` (the manager's signals are coalesced here).
 
@@ -42,7 +43,7 @@ from .const import (
 )
 from .context import collapse
 from .decider import EventRecord, EventState
-from .playback import play_url, thumbnail_url
+from .playback import play_url, playback_order, thumbnail_url
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -367,6 +368,7 @@ async def event_detail(
             "url": play_url(hass, entry.entry_id, record.id) if recorder or cloud else None,
             "recorder": recorder,
             "cloud": play_url(hass, entry.entry_id, record.id, "cloud") if cloud else None,
+            "order": playback_order(entry.options),
         },
     }
 
@@ -549,6 +551,8 @@ def ws_cameras(
         msg["id"],
         {
             "cameras": camera_rows(data),
+            # Which source plays first: `cloud_first` (the default) or `recording_first`.
+            "playback_order": playback_order(entry.options),
             "link_healthy": data.manager.link_healthy,
             "learning_needs": {"days": SCORE_MIN_DAYS, "events": SCORE_MIN_EVENTS},
         },

@@ -3,9 +3,10 @@
 Views, all answering only URLs this module signed:
 
 * **Play** — `/api/scrypted_stamina/play/<entry>/<event>.m3u8?mode=auto|recorder|cloud` is
-  what the media source hands out. `auto` tries the camera's recording through the plugin
-  and falls back to a committed cloud copy when the recorder fails, has no recording that
-  old, or the camera has none.
+  what the media source hands out. `auto` plays the committed cloud copy (the first
+  destination listed that has one) and falls back to the camera's recording through the
+  plugin; the "Play from" option can put the recording first, which falls back to the cloud
+  copy when the recorder fails, has no recording that old, or the camera has none.
 * **Recording proxy** — `/api/scrypted_stamina/proxy/<entry>/<plugin path>` forwards a GET
   to the plugin with the bearer token added here. Redirects (playback answers with one to a
   session) are followed by the API client, same origin only. Playlists are rewritten so
@@ -29,7 +30,7 @@ response says `nosniff` and `sandbox`; playlists and cloud reads have size limit
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import hashlib
 import hmac
 import posixpath
@@ -45,7 +46,14 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant, callback
 
 from .api import StaminaApiError, async_read_limited, playback_path
-from .const import DOMAIN, MAX_SEGMENT_BYTES
+from .const import (
+    CONF_PLAYBACK_ORDER,
+    DEFAULT_PLAYBACK_ORDER,
+    DOMAIN,
+    MAX_SEGMENT_BYTES,
+    PLAYBACK_ORDERS,
+    PLAYBACK_RECORDING_FIRST,
+)
 from .destinations import DestinationError
 from .uploader import cloud_name, cloud_part, video_playlist
 
@@ -360,10 +368,14 @@ async def _async_cloud_playlist(
     record: EventRecord,
     cap: int | None = None,
 ) -> web.Response | None:
-    """Return a committed video's playlist, or None when there is none."""
-    for subentry, copy in (await _LOOKUPS.get(data, record.id)).items():
-        target = data.manager.uploader.targets.get(subentry)
-        if target is None or not copy.playable or not copy.ranges:
+    """Return a committed video's playlist, or None when there is none.
+
+    From the first destination, in the order they are listed, that holds a playable copy.
+    """
+    copies = await _LOOKUPS.get(data, record.id)
+    for subentry in data.manager.uploader.targets:
+        copy = copies.get(subentry)
+        if copy is None or not copy.playable or not copy.ranges:
             continue
         text = video_playlist(
             record,
@@ -396,6 +408,12 @@ def _byte_range(header: str | None, size: int) -> tuple[int, int] | None:
     if start >= size:
         return (size, size - 1)
     return (start, end) if 0 <= start <= end else None
+
+
+def playback_order(options: Mapping[str, Any]) -> str:
+    """Return which source plays first: `cloud_first` (the default) or `recording_first`."""
+    order = options.get(CONF_PLAYBACK_ORDER)
+    return order if order in PLAYBACK_ORDERS else DEFAULT_PLAYBACK_ORDER
 
 
 def _has_recorder(capabilities: dict) -> bool:
@@ -431,6 +449,14 @@ class PlayView(HomeAssistantView):
         record = data.manager.records.get(event_id) or await data.index.async_get(event_id)
         if record is None:
             return _response(404)
+        # `auto` tries the cloud copy first unless the options put the recording first.
+        recording_first = playback_order(data.manager.entry.options) == PLAYBACK_RECORDING_FIRST
+        if mode == "auto" and not recording_first:
+            played = await _async_cloud_playlist(
+                hass, entry_id, data, record, request_expiry(request)
+            )
+            if played is not None:
+                return played
         if mode in ("auto", "recorder"):
             status = data.manager.cameras.get(record.camera)
             age_days = (time.time() - record.facts.started) / 86400
@@ -452,7 +478,7 @@ class PlayView(HomeAssistantView):
                     )
                     if session is not None:
                         raise web.HTTPFound(session, headers=SECURITY_HEADERS)
-        if mode in ("auto", "cloud"):
+        if mode == "cloud" or (mode == "auto" and recording_first):
             played = await _async_cloud_playlist(
                 hass, entry_id, data, record, request_expiry(request)
             )

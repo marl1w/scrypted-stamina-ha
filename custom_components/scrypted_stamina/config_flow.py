@@ -2,13 +2,13 @@
 
 * **Setup** asks for the plugin URL and its token, and proves both with `/v1/health`.
 * **Options**: one page of global settings (what is compared with what, how much is
-  flagged), then one page per camera — linked entities pre-filled from the camera device's
-  area, and the follow-up window.
+  flagged, which copy plays first).
 * **Destinations** are subentries ("Add destination"), chosen from the storage integrations
   already set up, as in Reolink Stamina. Each has a folder, a quota, a retention, and a cap on
   the pending storage the follow-up window may hold.
-* **Areas** are subentries too, but the integration manages them (`areas.py`): their type
-  is not listed here, so the integration page offers no way to add one by hand.
+* **Cameras** are subentries too, but the integration adds and removes them (`cameras.py`):
+  adding one by hand is refused, and its reconfigure step holds that camera's settings —
+  linked entities, look-back and follow-up windows.
 """
 
 from __future__ import annotations
@@ -42,7 +42,6 @@ from .api import (
 )
 from .const import (
     BASE_CLASSES,
-    CONF_CAMERAS,
     CONF_DESTINATION_ENTRY,
     CONF_FINGERPRINT,
     CONF_FOLDER,
@@ -52,6 +51,7 @@ from .const import (
     CONF_LINKED,
     CONF_LOOK_BACK_MINUTES,
     CONF_ORPHAN_RETENTION_DAYS,
+    CONF_PLAYBACK_ORDER,
     CONF_QUOTA_GB,
     CONF_RECORDER_RETENTION_DAYS,
     CONF_RELEVANCE_SCOPE,
@@ -69,6 +69,7 @@ from .const import (
     DEFAULT_HISTORY_SIZE_MB,
     DEFAULT_LOOK_BACK_MINUTES,
     DEFAULT_ORPHAN_RETENTION_DAYS,
+    DEFAULT_PLAYBACK_ORDER,
     DEFAULT_QUOTA_GB,
     DEFAULT_RECORDER_RETENTION_DAYS,
     DEFAULT_RELEVANCE_SCOPE,
@@ -82,8 +83,10 @@ from .const import (
     DOMAIN,
     LEGACY_UNUSUAL_OVERRIDES,
     LOOK_BACK_MAX_MINUTES,
+    PLAYBACK_ORDERS,
     RELEVANCE_SCOPES,
     RELEVANCE_SENSITIVITY_FLOORS,
+    SUBENTRY_TYPE_CAMERA,
     SUBENTRY_TYPE_DESTINATION,
     TITLE,
 )
@@ -301,39 +304,26 @@ class StaminaConfigFlow(ConfigFlow, domain=DOMAIN):
     def async_get_supported_subentry_types(
         cls, config_entry: ConfigEntry
     ) -> dict[str, type[ConfigSubentryFlow]]:
-        """Destinations are subentries; area subentries are managed, so not offered."""
-        return {SUBENTRY_TYPE_DESTINATION: DestinationSubentryFlow}
+        """Destinations, and cameras (managed: only their reconfigure step is open)."""
+        return {
+            SUBENTRY_TYPE_DESTINATION: DestinationSubentryFlow,
+            SUBENTRY_TYPE_CAMERA: CameraSubentryFlow,
+        }
 
 
 class StaminaOptionsFlow(OptionsFlow):
-    """Global settings, then one page per camera."""
-
-    def __init__(self) -> None:
-        """Hold the answers until the last page."""
-        self._pending: dict[str, Any] = {}
-        self._cameras: list[tuple[str, str, str | None]] = []
-        self._at = 0
+    """The global settings, on one page; each camera's are in its subentry."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Ask the global settings."""
         options = self.config_entry.options
         if user_input is not None:
-            self._pending = {**options, **user_input}
-            self._pending.pop(LEGACY_UNUSUAL_OVERRIDES, None)
-            self._pending[CONF_CAMERAS] = dict(options.get(CONF_CAMERAS) or {})
-            runtime = getattr(self.config_entry, "runtime_data", None)
-            if runtime is not None:
-                self._cameras = [
-                    (camera, status.device.name, status.device.device_id)
-                    for camera, status in sorted(
-                        runtime.manager.cameras.items(), key=lambda item: item[1].device.name
-                    )
-                ]
-            return await self.async_step_camera()
+            data = {**options, **user_input}
+            data.pop(LEGACY_UNUSUAL_OVERRIDES, None)
+            return self.async_create_entry(data=data)
 
         return self.async_show_form(
             step_id="init",
-            last_step=False,
             data_schema=vol.Schema(
                 {
                     vol.Required(
@@ -415,6 +405,16 @@ class StaminaOptionsFlow(OptionsFlow):
                             min=0, max=1, step=0.05, mode=selector.NumberSelectorMode.BOX
                         )
                     ),
+                    vol.Required(
+                        CONF_PLAYBACK_ORDER,
+                        default=options.get(CONF_PLAYBACK_ORDER, DEFAULT_PLAYBACK_ORDER),
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=list(PLAYBACK_ORDERS),
+                            mode=selector.SelectSelectorMode.LIST,
+                            translation_key=CONF_PLAYBACK_ORDER,
+                        )
+                    ),
                 }
             ),
         )
@@ -431,11 +431,21 @@ class StaminaOptionsFlow(OptionsFlow):
                     found.update(str(cls) for cls in reported if isinstance(cls, str))
         return sorted(found)
 
-    async def async_step_camera(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Ask one camera's linked entities, and its look-back and follow-up windows."""
+
+class CameraSubentryFlow(ConfigSubentryFlow):
+    """One camera's settings; the integration adds and removes cameras itself."""
+
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
+        """Refuse: cameras come from Scrypted."""
+        return self.async_abort(reason="managed")
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> SubentryFlowResult:
+        """Ask the camera's linked entities, and its look-back and follow-up windows."""
+        subentry = self._get_reconfigure_subentry()
         if user_input is not None:
-            camera, _, _ = self._cameras[self._at]
-            self._pending[CONF_CAMERAS][camera] = {
+            data = {
                 CONF_LINKED: list(user_input.get(CONF_LINKED) or []),
                 CONF_LOOK_BACK_MINUTES: float(
                     user_input.get(CONF_LOOK_BACK_MINUTES, DEFAULT_LOOK_BACK_MINUTES)
@@ -444,20 +454,15 @@ class StaminaOptionsFlow(OptionsFlow):
                     user_input.get(CONF_FOLLOW_UP_MINUTES, DEFAULT_FOLLOW_UP_MINUTES)
                 ),
             }
-            self._at += 1
-        if self._at >= len(self._cameras):
-            return self.async_create_entry(data=self._pending)
-
-        camera, name, _device_id = self._cameras[self._at]
-        current = self._pending[CONF_CAMERAS].get(camera)
+            return self.async_update_and_abort(self._get_entry(), subentry, data=data)
+        current = subentry.data
         # A camera starts with nothing linked: the user picks what matters, nothing is guessed.
-        linked = list((current or {}).get(CONF_LINKED) or [])
-        minutes = (current or {}).get(CONF_FOLLOW_UP_MINUTES, DEFAULT_FOLLOW_UP_MINUTES)
-        before = (current or {}).get(CONF_LOOK_BACK_MINUTES, DEFAULT_LOOK_BACK_MINUTES)
+        linked = list(current.get(CONF_LINKED) or [])
+        minutes = current.get(CONF_FOLLOW_UP_MINUTES, DEFAULT_FOLLOW_UP_MINUTES)
+        before = current.get(CONF_LOOK_BACK_MINUTES, DEFAULT_LOOK_BACK_MINUTES)
         return self.async_show_form(
-            step_id="camera",
-            last_step=self._at == len(self._cameras) - 1,
-            description_placeholders={"camera": name},
+            step_id="reconfigure",
+            description_placeholders={"camera": subentry.title},
             data_schema=vol.Schema(
                 {
                     vol.Optional(CONF_LINKED, default=linked): selector.EntitySelector(
@@ -577,6 +582,7 @@ class DestinationSubentryFlow(ConfigSubentryFlow):
                 ): number(3650, 1, "d"),
                 vol.Required(
                     CONF_ORPHAN_RETENTION_DAYS,
+                    CONF_PLAYBACK_ORDER,
                     default=current.get(CONF_ORPHAN_RETENTION_DAYS, DEFAULT_ORPHAN_RETENTION_DAYS),
                 ): number(3650, 1, "d"),
                 vol.Required(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from homeassistant.components.media_source import async_browse_media, async_resolve_media
 from homeassistant.setup import async_setup_component
 
+from custom_components.scrypted_stamina.const import CONF_PLAYBACK_ORDER, SUBENTRY_TYPE_DESTINATION
 from custom_components.scrypted_stamina.decider import EventState
 from custom_components.scrypted_stamina.playback import proxy_url
 
@@ -44,7 +45,7 @@ async def test_media_source_browses_and_resolves(
     hass, hass_client_no_auth, stamina, destinations, setup
 ) -> None:
     assert await async_setup_component(hass, "media_source", {})
-    entry = await setup()
+    entry = await setup(options={CONF_PLAYBACK_ORDER: "recording_first"})
     manager = entry.runtime_data.manager
     eid = event_id(80)
     stamina.thumbnails[eid] = b"jpeg"
@@ -65,7 +66,7 @@ async def test_media_source_browses_and_resolves(
     client = await hass_client_no_auth()
     assert await (await client.get(item.thumbnail)).read() == b"jpeg"
 
-    # A camera with a recorder plays from the recorder, through the proxy.
+    # Recording first: a camera with a recorder plays from the recorder, through the proxy.
     uri = f"media-source://scrypted_stamina/{item.identifier}"
     played = await async_resolve_media(hass, uri, None)
     playlist = await (await client.get(played.url)).text()
@@ -103,4 +104,25 @@ async def test_media_source_browses_and_resolves(
     assert await response.read() == stamina.files[(eid, "0.m4s")]
     whole = await client.get(first)
     assert whole.status == 200 and await whole.read() == fake_video(destinations)
+    await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_cloud_first_plays_the_first_destination_listed(
+    hass, hass_client_no_auth, stamina, setup
+) -> None:
+    """The default: the cloud copy before the recording, destinations in the listed order."""
+    assert await async_setup_component(hass, "media_source", {})
+    entry = await setup(destinations=2)
+    manager = entry.runtime_data.manager
+    eid = event_id(97)
+    run_event(stamina, eid, "confirmed")
+    await until(
+        lambda: eid in manager.records and manager.records[eid].state is EventState.COMMITTED
+    )
+    first = entry.get_subentries_of_type(SUBENTRY_TYPE_DESTINATION)[0].subentry_id
+    played = await async_resolve_media(hass, f"media-source://scrypted_stamina/38/x/{eid}", None)
+    client = await hass_client_no_auth()
+    playlist = await (await client.get(played.url)).text()
+    assert "/playback/pb_" not in playlist
+    assert f"/api/scrypted_stamina/cloud/{entry.entry_id}/{first}/" in playlist
     await hass.config_entries.async_unload(entry.entry_id)

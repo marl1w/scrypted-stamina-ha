@@ -21,6 +21,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .areas import area_home, area_identifier, slug_of
+from .cameras import camera_subentries
 from .const import DOMAIN, signal_areas, signal_camera, signal_cameras, signal_update
 from .devices import async_ensure_device
 from .manager import CameraStatus, StaminaManager
@@ -194,22 +195,29 @@ def async_setup_per_area(
 def async_setup_per_camera(
     hass: HomeAssistant,
     manager: StaminaManager,
-    add: Callable[[list[Entity]], None],
+    add: AddConfigEntryEntitiesCallback,
     build: Callable[[str], list[Entity]],
     on_remove: Callable[[Callable[[], None]], None],
 ) -> None:
-    """Add entities for every camera now, and for cameras that appear later."""
+    """Add entities for every camera now, and for cameras that appear later.
+
+    Each camera's are filed under its subentry (`cameras.py`); a camera that leaves takes
+    them with its subentry, and is added again if it comes back.
+    """
+    # By subentry id: a camera back after leaving has a new subentry, so is added again.
     known: set[str] = set()
+    entry = manager.entry
 
     @callback
     def _add_new() -> None:
-        new = [camera for camera in manager.cameras if camera not in known]
-        known.update(new)
-        for camera in new:
-            async_ensure_device(hass, manager.entry.entry_id, manager.cameras[camera].device)
-        entities = [entity for camera in new for entity in build(camera)]
-        if entities:
-            add(entities)
+        subentries = camera_subentries(entry)
+        for camera, status in manager.cameras.items():
+            subentry = subentries.get(camera)
+            if subentry is None or subentry.subentry_id in known:
+                continue
+            known.add(subentry.subentry_id)
+            async_ensure_device(hass, entry.entry_id, status.device, subentry.subentry_id)
+            add(build(camera), config_subentry_id=subentry.subentry_id)
 
     _add_new()
     on_remove(async_dispatcher_connect(hass, signal_cameras(manager.entry.entry_id), _add_new))

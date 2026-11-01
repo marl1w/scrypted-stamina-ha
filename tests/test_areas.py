@@ -73,7 +73,7 @@ async def test_one_device_per_area_under_the_destination(hass, stamina, setup) -
     two_areas(hass, stamina)
     entry = await setup()
     # The destination is the only subentry: the areas are its devices, not entries.
-    assert [s.subentry_type for s in entry.subentries.values()] == [SUBENTRY_TYPE_DESTINATION]
+    assert {s.subentry_type for s in entry.subentries.values()} == {"destination", "camera"}
     assert area_device_names(hass, entry) == {"Garden", "Driveway"}
 
     devices, entities = dr.async_get(hass), er.async_get(hass)
@@ -91,9 +91,9 @@ async def test_one_device_per_area_under_the_destination(hass, stamina, setup) -
     # Health stays on the destinations: no per-area status.
     assert hass.states.get("sensor.stamina_garden_status") is None
 
-    # Cameras stay where they were: not filed under any subentry.
+    # Cameras are filed under their own subentries, not the destination.
     camera = devices.async_get(entities.async_get("event.garden_front_door_stamina").device_id)
-    assert camera.config_subentry_id is None
+    assert entry.subentries[camera.config_subentry_id].subentry_type == "camera"
     await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -215,7 +215,7 @@ async def test_old_area_subentries_fold_into_the_destination(hass, stamina, setu
     entities.async_update_entity(select.entity_id, name="Garden alarm uploads")
 
     await setup(entry=entry)
-    assert [s.subentry_type for s in entry.subentries.values()] == [SUBENTRY_TYPE_DESTINATION]
+    assert {s.subentry_type for s in entry.subentries.values()} == {"destination", "camera"}
     item = entities.async_get(GARDEN)
     assert item.id == select.id and item.name == "Garden alarm uploads"
     assert item.config_subentry_id == destination_id(entry)

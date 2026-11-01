@@ -2,8 +2,8 @@
 
 Scrypted provides the facts and the video; Home Assistant decides and stores. This package
 is the Home Assistant half (architecture §3): one config entry per plugin, destinations as
-subentries (each area's device filed under the first, `areas.py`), a manager that runs the
-link, the decider, scoring and the uploader.
+subentries (each area's device filed under the first, `areas.py`), one managed subentry per
+camera (`cameras.py`), a manager that runs the link, the decider, scoring and the uploader.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from homeassistant.loader import IntegrationNotFound, async_get_integration
 
 from .api import InsecureUrlError, StaminaApiError, StaminaAuthError, StaminaClient
 from .areas import async_file_area_devices, slug_of
+from .cameras import async_migrate_camera_options
 from .const import (
     CONF_DESTINATION_ENTRY,
     CONF_FINGERPRINT,
@@ -43,6 +44,7 @@ from .const import (
     INDEX_FILENAME,
     LEGACY_UNUSUAL_OVERRIDES,
     PLATFORMS,
+    SUBENTRY_TYPE_CAMERA,
     SUBENTRY_TYPE_DESTINATION,
 )
 from .destinations import DestinationError, async_create_destination
@@ -124,6 +126,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: StaminaConfigEntry) -> b
 
     await _async_title_destinations(hass, entry)
     async_file_area_devices(hass, entry)
+    async_migrate_camera_options(hass, entry)
     index = EventIndex(hass, hass.config.path(INDEX_FILENAME))
     await index.async_open()
 
@@ -240,21 +243,27 @@ def _async_tell_uploads_moved(hass: HomeAssistant, entry: StaminaConfigEntry) ->
 
 
 def _reload_key(entry: ConfigEntry) -> tuple[Any, ...]:
-    """Return what a reload depends on: the data, the options and the destinations."""
+    """Return what a reload depends on: everything but the camera subentries.
+
+    The integration adds and renames those itself while running, and a camera's settings
+    are read live, so none of that restarts the link.
+    """
     return (
         dict(entry.data),
         dict(entry.options),
         {
             subentry_id: (subentry.subentry_type, subentry.title, dict(subentry.data))
             for subentry_id, subentry in entry.subentries.items()
+            if subentry.subentry_type != SUBENTRY_TYPE_CAMERA
         },
     )
 
 
 async def _async_reload(hass: HomeAssistant, entry: StaminaConfigEntry) -> None:
-    """Reload when the options or the destinations change, not on an update to nothing."""
+    """Reload when the options or the destinations change; else re-follow linked entities."""
     data = getattr(entry, "runtime_data", None)
     if data is not None and data.reload_key == _reload_key(entry):
+        data.manager.async_track_linked()
         return
     await hass.config_entries.async_reload(entry.entry_id)
 

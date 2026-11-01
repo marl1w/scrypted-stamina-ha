@@ -93,6 +93,31 @@
         "no_destination": "No storage integration is set up, or each is already a destination. Set up Synology DSM, WebDAV, SFTP Storage, OneDrive or Google Drive first.",
         "reconfigure_successful": "The destination was updated."
       }
+    },
+    "camera": {
+      "title": "Camera",
+      "entry_type": "Camera",
+      "initiate_flow": {
+        "user": "Add camera"
+      },
+      "step": {
+        "reconfigure": {
+          "title": "{camera}",
+          "description": "Entities whose state is recorded with every event of this camera, and whose changes shortly before an event count as early evidence and after it as late evidence. Empty until you add some.",
+          "data": {
+            "linked_entities": "Linked entities",
+            "look_back_minutes": "Look-back window",
+            "follow_up_minutes": "Follow-up window"
+          },
+          "data_description": {
+            "look_back_minutes": "Changes of the linked entities this long before an event starts are linked to it, such as a gate opening just before the camera sees someone."
+          }
+        }
+      },
+      "abort": {
+        "managed": "Cameras are added and removed automatically, as they appear in and leave Scrypted.",
+        "reconfigure_successful": "The camera was updated."
+      }
     }
   },
   "options": {
@@ -106,23 +131,13 @@
           "recorder_retention_days": "Recorder keeps footage for",
           "history_size_mb": "History size",
           "unverified_min_seconds": "Without a verifier, keep subjects seen for at least",
-          "unverified_min_score": "Without a verifier, keep subjects scoring at least"
+          "unverified_min_score": "Without a verifier, keep subjects scoring at least",
+          "playback_order": "Play from"
         },
         "data_description": {
           "upload_classes": "Ordinary events with a confirmed subject of one of these classes are kept while Uploads is on 'Chosen classes'. Unusual events are kept whatever their class.",
-          "history_size_mb": "Room for the event history the model learns from. When it is full, routine dropped events are thinned out; kept and unusual events are never removed."
-        }
-      },
-      "camera": {
-        "title": "{camera}",
-        "description": "Entities whose state is recorded with every event of this camera, and whose changes shortly before an event count as early evidence and after it as late evidence. Empty until you add some.",
-        "data": {
-          "linked_entities": "Linked entities",
-          "look_back_minutes": "Look-back window",
-          "follow_up_minutes": "Follow-up window"
-        },
-        "data_description": {
-          "look_back_minutes": "Changes of the linked entities this long before an event starts are linked to it, such as a gate opening just before the camera sees someone."
+          "history_size_mb": "Room for the event history the model learns from. When it is full, routine dropped events are thinned out; kept and unusual events are never removed.",
+          "playback_order": "Which copy of an event plays first. With several destinations, they are tried in the order they are listed."
         }
       }
     }
@@ -140,6 +155,12 @@
         "few": "Few",
         "balanced": "Balanced",
         "many": "Many"
+      }
+    },
+    "playback_order": {
+      "options": {
+        "cloud_first": "Cloud copy, then recording",
+        "recording_first": "Recording, then cloud copy"
       }
     }
   },

@@ -162,9 +162,9 @@ The exact message and route shapes are in [api.md](api.md). All routes are under
 
 ### 3.2 Context
 
-**Configuration:** the integration's options have one page per camera with an entity picker. It starts empty: you pick the entities that matter (contacts, alarm panel, presence, lights); nothing is guessed. Each entity's kind (door, alarm, presence, light, other) comes from its domain and device class, and tells scoring how to read it.
+**Configuration:** each camera is a subentry of the integration (`cameras.py`), titled with the camera's name and added and removed by the integration as cameras appear in and leave the plugin's list (adding one by hand is refused); its reconfigure step has an entity picker. It starts empty: you pick the entities that matter (contacts, alarm panel, presence, lights); nothing is guessed. Each entity's kind (door, alarm, presence, light, other) comes from its domain and device class, and tells scoring how to read it.
 
-- Per camera device, an options picker of **linked entities** (contacts, alarm panel, presence, lights…).
+- Per camera, in its subentry, a picker of **linked entities** (contacts, alarm panel, presence, lights…).
 - At `event.start` and `event.end`, the integration records each linked entity's state and its last change relative to the event (e.g. "door opened 5 s before"). These features feed scoring and are stored with the event.
 
 ### 3.3 Scoring
@@ -202,7 +202,7 @@ No-verifier cameras follow the fallback policy: `unverified` subjects count as c
 
 Some evidence comes after the camera has stopped seeing anything: a door opened a few minutes after a person was seen, a shock sensor, the alarm actually triggering.
 
-- After `event.end` an event stays open for scoring for a **follow-up window**: default 10 min, set per camera on the same options page as its linked entities.
+- After `event.end` an event stays open for scoring for a **follow-up window**: default 10 min, set per camera in its subentry with its linked entities and look-back window.
 - Every state change of the camera's linked entities in that window is attached to the event as late evidence (`{entity, kind, from, to, t_rel_s}`).
 - **A change belongs to one event per camera, never two.** When the next event on the same camera starts, the earlier one stops collecting (its window still closes on time, for the decision). The new event's look-back window reaches back at most to the previous event's end, and takes over the changes there, which are nearer its start; a previous event whose window already closed keeps everything up to that close. The rule is per camera, not per entity: a gate linked to two cameras counts once for each camera's event, because each camera's own sequence is what its model learns.
 - Stored and sent compactly: once complete (the early side at the start, the late side when the window closes) evidence is one item per entity with `count`, how many changes it made; the item kept is the one scoring reads (a change to `triggered`, else the change nearest the event).
@@ -246,7 +246,7 @@ Sequences across cameras are already part of the ported relevance model: each ev
 
 ### 3.7 Entities
 
-Since Home Assistant 2026.8 a device belongs to exactly one config entry, so Stamina cannot put its entities on the camera device of another integration. Instead it creates **one Stamina device per camera**, named after the camera, with `via_device` pointing at the camera's device in the other integration (matched by Scrypted device id), and placed in that device's area. The camera's page then lists the Stamina device under its connected devices. When that integration is not installed, or its device appears later, the Stamina device exists without the link and gets it as soon as the camera device shows up. Home Assistant prefixes entity ids with the area of a device in one, so in an area the ids read `event.<area>_<cam>_stamina` and so on.
+Since Home Assistant 2026.8 a device belongs to exactly one config entry, so Stamina cannot put its entities on the camera device of another integration. Instead it creates **one Stamina device per camera**, named after the camera, with `via_device` pointing at the camera's device in the other integration (matched by Scrypted device id), and placed in that device's area. The camera's page then lists the Stamina device under its connected devices. When that integration is not installed, or its device appears later, the Stamina device exists without the link and gets it as soon as the camera device shows up. Home Assistant prefixes entity ids with the area of a device in one, so in an area the ids read `event.<area>_<cam>_stamina` and so on. The Stamina device and its entities are filed under the camera's subentry. Earlier versions kept each camera's settings in the options; setup moves them into the camera subentries once and moves existing devices and entities under them, so no entity id changes. Adding or renaming a camera subentry, or changing its settings, does not reload the entry: the settings are read live and the linked entities are followed again.
 
 | Entity | Content |
 |---|---|

@@ -43,7 +43,7 @@ class CameraDevice:
     name: str
     area: str | None
     shared: bool
-    # The area's id, which keys the area's subentry and its Uploads position.
+    # The area's id, which keys the area's device and its Uploads position.
     area_id: str | None = None
 
     @property
@@ -149,13 +149,21 @@ def async_sync_area(hass: HomeAssistant, entry_id: str, camera: str) -> None:
 
 
 @callback
-def async_ensure_device(hass: HomeAssistant, entry_id: str, device: CameraDevice) -> None:
-    """Create a camera's Stamina device and place it before any entity is added.
+def async_ensure_device(
+    hass: HomeAssistant, entry_id: str, device: CameraDevice, subentry_id: str | None
+) -> None:
+    """Create a camera's Stamina device under its subentry, and place it, before any entity.
 
     Done up front so every entity of the camera is named against the same device, area
-    included (Home Assistant prefixes entity ids with the area when there is one).
+    included (Home Assistant prefixes entity ids with the area when there is one). A device
+    from before camera subentries is moved under its camera's.
     """
-    dr.async_get(hass).async_get_or_create(config_entry_id=entry_id, **device.device_info)
+    registry = dr.async_get(hass)
+    entry = registry.async_get_or_create(
+        config_entry_id=entry_id, config_subentry_id=subentry_id, **device.device_info
+    )
+    if entry.config_subentry_id != subentry_id:
+        registry.async_update_device(entry.id, new_config_subentry_id=subentry_id)
     async_sync_area(hass, entry_id, device.camera)
 
 
