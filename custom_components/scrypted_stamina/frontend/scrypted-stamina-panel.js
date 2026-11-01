@@ -35,6 +35,7 @@ import {
   decision,
   formatAfter,
   formatAgo,
+  formatBefore,
   formatDay,
   formatDuration,
   formatTime,
@@ -1211,11 +1212,12 @@ class ScryptedStaminaPanel extends HTMLElement {
     );
   }
 
-  /** Everything else, folded: what was seen, what came after, the decision, the copy. */
+  /** Everything else, folded: what came before, what was seen, what came after, the decision, the copy. */
   _detailsCard(data) {
     const state = this._event;
     const verdict = decision(data);
     const subjects = mergeSubjects(data.subjects || []);
+    const early = data.early_evidence || [];
     const late = data.late_evidence || [];
     const notes = (data.notes || []).map((note) => NOTES[note]).filter(Boolean);
     if (data.gaps) notes.push(`${data.gaps} segment${data.gaps === 1 ? " is" : "s are"} missing from the copy.`);
@@ -1249,31 +1251,33 @@ class ScryptedStaminaPanel extends HTMLElement {
         )
       : el("p", { class: "note", text: "Motion only: nothing was recognised." });
 
-    const after = late.length
-      ? [
-          el("h3", { class: "card__title", text: "After the event" }),
-          el(
-            "div",
-            { class: "items" },
-            late.map((item) =>
-              el(
-                "div",
-                { class: "item" },
-                icon("mdi:timer-sand"),
+    // Sensor changes around the event, as one line each: what changed, and when.
+    const evidence = (title, items, when) =>
+      items.length
+        ? [
+            el("h3", { class: "card__title", text: title }),
+            el(
+              "div",
+              { class: "items" },
+              items.map((item) =>
                 el(
                   "div",
-                  { class: "item__body" },
-                  el("div", { class: "item__name", text: item.name }),
-                  el("div", {
-                    class: "item__sub",
-                    text: [`${item.from ?? "?"} → ${item.to}`, formatAfter(item.t_rel_s)].filter(Boolean).join(" · "),
-                  }),
+                  { class: "item" },
+                  icon("mdi:timer-sand"),
+                  el(
+                    "div",
+                    { class: "item__body" },
+                    el("div", { class: "item__name", text: item.name }),
+                    el("div", {
+                      class: "item__sub",
+                      text: [`${item.from ?? "?"} → ${item.to}`, when(item.t_rel_s)].filter(Boolean).join(" · "),
+                    }),
+                  ),
                 ),
               ),
             ),
-          ),
-        ]
-      : null;
+          ]
+        : null;
 
     const copies = (data.copies || []).map((copy) => {
       const status = copy.deleted ? "Removed to free space" : copy.committed ? "Stored" : "Uploading";
@@ -1292,9 +1296,10 @@ class ScryptedStaminaPanel extends HTMLElement {
       el(
         "div",
         { class: "details__body" },
+        evidence("Before the event", early, formatBefore),
         el("h3", { class: "card__title", text: "What was seen" }),
         seen,
-        after,
+        evidence("After the event", late, formatAfter),
         el("h3", { class: "card__title", text: "Decision" }),
         verdict.text ? el("p", { class: "sentence", style: { marginTop: "0" }, text: verdict.text }) : null,
         notes.map((note) => el("p", { class: "note" }, icon("mdi:information-outline", "icon--sm"), note)),

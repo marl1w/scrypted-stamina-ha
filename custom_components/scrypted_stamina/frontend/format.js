@@ -193,6 +193,14 @@ export function formatAgo(epochS, now = Date.now() / 1000) {
   return `${days} day${days === 1 ? "" : "s"} ago`;
 }
 
+/** "20 s before", "3 min before", for early evidence: `seconds` is negative, from the start. */
+export function formatBefore(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  const s = Math.abs(Math.round(seconds));
+  if (s === 0) return "as it started";
+  return s < 90 ? `${s} s before` : `${Math.round(s / 60)} min before`;
+}
+
 /** "40 s after", "3 min after", for late evidence. */
 export function formatAfter(seconds) {
   if (seconds === null || seconds === undefined) return "";
