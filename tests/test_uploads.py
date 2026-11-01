@@ -134,12 +134,22 @@ async def test_a_change_mid_event_applies_to_new_events_only(
     assert (await settle(hass, manager, clock, first)).state is EventState.COMMITTED
     assert uploaded(destinations, "events")
 
+    # The manager's clock is now 11 minutes ahead: the second event is stamped on that clock,
+    # or its follow-up window has already closed when it ends and it is gone before `settle`.
     second = event_id(321)
-    stamina.start(second, subjects=[subject("s1")])
+    began = clock()
+    stamina.start(second, start=began, subjects=[subject("s1")])
     await until(lambda: second in manager.records)
     await manager.async_set_uploads("classes", NO_AREA)
     stamina.segment(second, 0, init=True)
-    stamina.end(second, subjects=[subject("s1", verdict="confirmed")], next_segment=1, init=True)
+    stamina.end(
+        second,
+        start=began,
+        end=clock(),
+        subjects=[subject("s1", verdict="confirmed")],
+        next_segment=1,
+        init=True,
+    )
     stored = await settle(hass, manager, clock, second)
     assert stored.state is EventState.DROPPED and stored.upload_mode == "off"
     await hass.config_entries.async_unload(entry.entry_id)
