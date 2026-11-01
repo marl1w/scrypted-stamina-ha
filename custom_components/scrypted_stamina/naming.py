@@ -57,10 +57,26 @@ def camera_slug(name: str | None, fallback: str = "camera") -> str:
     return slugify(name, separator="-") or safe_part(fallback, fallback="camera")
 
 
-def event_folder_name(started: dt.datetime, camera: str, event_id: str) -> str:
+def camera_in_area(area: str | None, camera: str | None) -> str:
+    """Return the camera's slug without its area's, when it repeats it.
+
+    Area `area-2` and camera "Area 2 Gate" give `gate`, so a name reads
+    `area-2-gate-…`, not `area-2-area-2-gate-…`. A camera named just like its area keeps
+    its whole slug.
+    """
+    slug = camera_slug(camera)
+    if area and area != NO_AREA and slug.startswith(f"{area}-"):
+        return slug.removeprefix(f"{area}-")
+    return slug
+
+
+def event_folder_name(
+    started: dt.datetime, camera: str, event_id: str, area: str | None = None
+) -> str:
     """Name one event's folder after its start (local time), camera and id."""
     stamp = started.strftime("%y%m%d_%H%M%S")
-    return f"{stamp}_{camera_slug(camera)}_{safe_part(event_id, fallback='event')}"
+    camera_part = camera_in_area(area, camera)
+    return f"{stamp}_{camera_part}_{safe_part(event_id, fallback='event')}"
 
 
 def event_file_name(started: dt.datetime, area: str, camera: str) -> str:
@@ -69,7 +85,8 @@ def event_file_name(started: dt.datetime, area: str, camera: str) -> str:
     Computed once, when the event begins (local time), next to its folder name.
     """
     stamp = started.strftime("%y%m%d_%H%M%S")
-    return f"{safe_part(area, fallback=NO_AREA)}-{camera_slug(camera)}-{stamp}.mp4"
+    area = safe_part(area, fallback=NO_AREA)
+    return f"{area}-{camera_in_area(area, camera)}-{stamp}.mp4"
 
 
 def video_part_path(video: str, part: int) -> str:

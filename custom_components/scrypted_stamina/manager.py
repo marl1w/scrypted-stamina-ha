@@ -640,7 +640,7 @@ class StaminaManager:
             area=device.area_slug,
             area_key=area_key(device),
             camera_name=device.name,
-            folder=event_folder_name(local, device.name, facts.id),
+            folder=event_folder_name(local, device.name, facts.id, device.area_slug),
             file_name=event_file_name(local, device.area_slug, device.name),
         )
         if note:

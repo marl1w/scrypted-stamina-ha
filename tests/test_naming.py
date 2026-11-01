@@ -104,3 +104,14 @@ def test_what_a_video_receives_later_is_a_file_of_its_own() -> None:
     assert video_part_path(video, 2) == (
         "scrypted-stamina/events/garden-front-door-261031_211349-part2.mp4"
     )
+
+
+def test_a_camera_named_after_its_area_does_not_repeat_it() -> None:
+    when = dt.datetime(2026, 10, 31, 21, 13, 49)
+    # Used for events/ and unusual-unconfirmed/ alike.
+    assert event_file_name(when, "area-2", "area_2_gate") == "area-2-gate-261031_211349.mp4"
+    assert event_folder_name(when, "Area 2 Gate", "ev_1", "area-2") == "261031_211349_gate_ev_1"
+    # Only a whole leading area is dropped, and never the whole name.
+    assert event_file_name(when, "area-2", "Area 22 Gate").startswith("area-2-area-22-gate-")
+    assert event_file_name(when, "area-2", "Area 2").startswith("area-2-area-2-")
+    assert event_file_name(when, "no-area", "No area cam").startswith("no-area-no-area-cam-")
