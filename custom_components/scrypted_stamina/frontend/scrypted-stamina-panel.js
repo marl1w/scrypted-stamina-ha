@@ -115,7 +115,8 @@ function filtersFromSearch(search) {
     cls: params.get("cls") || "",
     camera: params.get("camera") || "",
     area: params.get("area") || "",
-    dropped: params.get("dropped") === "1",
+    // One choice in the Events select: an old link with both flags reads as Unusual.
+    dropped: params.get("dropped") === "1" && params.get("unusual") !== "1",
   };
 }
 
@@ -699,11 +700,17 @@ class ScryptedStaminaPanel extends HTMLElement {
 
   _buildList() {
     this._bannerSlot = el("div");
-    this._unusualChip = el(
-      "button",
-      { class: "chip chip--unusual", "aria-pressed": "false", onclick: () => this._setFilter({ unusual: !this._filters.unusual }) },
-      icon("mdi:alert-decagram-outline", "icon--sm"),
-      "Unusual",
+    // Which events: everything not dropped (default), only the unusual ones, or all, the dropped ones too.
+    this._showSelect = el(
+      "select",
+      {
+        class: "chip chip--show",
+        "aria-label": "Events",
+        onchange: (ev) => this._setFilter({ unusual: ev.target.value === "unusual", dropped: ev.target.value === "all" }),
+      },
+      el("option", { value: "", text: "Kept" }),
+      el("option", { value: "unusual", text: "Unusual" }),
+      el("option", { value: "all", text: "All" }),
     );
     this._classSelect = el("select", {
       class: "chip",
@@ -719,20 +726,13 @@ class ScryptedStaminaPanel extends HTMLElement {
         this._setFilter({ camera: kind === "camera" ? value : "", area: kind === "area" ? value : "" });
       },
     });
-    this._droppedChip = el(
-      "button",
-      { class: "chip is-set", "aria-label": "Stop including events that were not kept", onclick: () => this._setFilter({ dropped: false }) },
-      "Including not kept",
-      icon("mdi:close", "icon--sm"),
-    );
     this._clearButton = el("button", { class: "link-btn", onclick: () => this._setFilter(NO_FILTERS) }, "Clear");
     this._filterBar = el(
       "div",
       { class: "filters", role: "toolbar", "aria-label": "Filters" },
-      this._unusualChip,
+      this._showSelect,
       this._classSelect,
       this._whereSelect,
-      this._droppedChip,
       this._clearButton,
     );
     this._pillSlot = el("div");
@@ -905,7 +905,10 @@ class ScryptedStaminaPanel extends HTMLElement {
 
   _syncFilters() {
     const f = this._filters;
-    this._unusualChip.setAttribute("aria-pressed", String(f.unusual));
+    const show = f.unusual ? "unusual" : f.dropped ? "all" : "";
+    this._showSelect.value = show;
+    this._showSelect.classList.toggle("is-set", show !== "");
+    this._showSelect.classList.toggle("is-unusual", show === "unusual");
 
     const classes = new Set(DEFAULT_CLASSES);
     for (const item of this._list.items) for (const cls of item.classes) classes.add(cls);
@@ -949,7 +952,6 @@ class ScryptedStaminaPanel extends HTMLElement {
     this._whereSelect.value = where;
     this._whereSelect.classList.toggle("is-set", where !== "");
     this._whereSelect.hidden = cams.length === 0 && !where;
-    this._droppedChip.hidden = !f.dropped;
     this._clearButton.hidden = !this._filtersSet();
   }
 
@@ -1058,7 +1060,7 @@ class ScryptedStaminaPanel extends HTMLElement {
         "mdi:filter-variant-remove",
         f.unusual ? "No unusual events" : "Nothing matches",
         body,
-        el("button", { class: "btn", onclick: () => this._setFilter(NO_FILTERS) }, "Show all events"),
+        el("button", { class: "btn", onclick: () => this._setFilter(NO_FILTERS) }, "Clear filters"),
       );
     }
     if (list.hidden) {

@@ -142,7 +142,7 @@ button { border: none; background: none; cursor: pointer; padding: 0; }
   background-color: color-mix(in srgb, var(--ss-accent) 20%, var(--ss-surface));
   color: var(--ss-text);
 }
-.chip--unusual[aria-pressed="true"] {
+.chip--show.is-unusual {
   background-color: color-mix(in srgb, var(--ss-unusual) 32%, var(--ss-surface));
   color: var(--ss-text);
   font-weight: 600;
