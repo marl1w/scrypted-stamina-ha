@@ -115,6 +115,32 @@ test('sound added by a mixin is never the camera plugin\'s: unclaimed edges go t
     assert.equal(x.out.filter(m => m.type === 'event.start').length, before, 'ignored: no event');
 });
 
+test('a sensorless crop: Coral Guard\'s verified motion arrives plain only and opens a confirmed event', () => {
+    const x = setup({ interfaces: ['VideoCamera', 'Camera', 'MotionSensor', 'OccupancySensor', 'Online'] });
+    // the camera implements neither motion nor occupancy: Coral Guard (the outermost mixin) adds both
+    x.sc.devices.get('7')!.providedInterfaces = ['VideoCamera', 'Settings'];
+    x.core.unbind();
+    x.core.bind();
+    x.sc.emit('7', 'MotionSensor', true, {});
+    x.clock.advance(PLAIN_DEDUPE_MS + 1);
+    const start = x.out.find(m => m.type === 'event.start')!;
+    assert.equal(start.body.event.trigger.source, CG);
+    assert.equal(start.body.event.subjects[0].verdict, 'confirmed');
+    x.sc.emit('7', 'MotionSensor', false, {});
+    x.clock.advance(PLAIN_DEDUPE_MS + 10_000);
+    assert.ok(x.out.some(m => m.type === 'event.end'), 'the off edge ends the hold');
+});
+
+test('a camera with motion of its own keeps an unclaimed mixin occupancy as context', () => {
+    const x = setup();
+    x.sc.devices.get('7')!.providedInterfaces = ['VideoCamera', 'Camera', 'MotionSensor', 'ObjectDetector', 'Online'];
+    x.core.unbind();
+    x.core.bind();
+    x.sc.emit('7', 'OccupancySensor', true, {});
+    x.clock.advance(PLAIN_DEDUPE_MS + 1);
+    assert.ok(!x.out.some(m => m.type === 'event.start'), 'no owner: context only');
+});
+
 test('held motion keeps the event open until it turns off plus the margin', () => {
     const { sc, clock, out } = setup();
     sc.emit('7', 'MotionSensor', true, {}, '7');

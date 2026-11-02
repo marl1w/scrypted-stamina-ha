@@ -4,7 +4,7 @@
 import { DEFAULT_EPISODE, EpisodeConfig, EpisodeTracker, EventRecord, publicEvent, publicObservation } from './episode';
 import { publicSubject, Subject } from './fusion';
 import { attribute, fromBinary, fromDetections, NormalizeContext, Observation } from './normalize';
-import { KNOWN_VERIFIERS, RolesTable } from './roles';
+import { KNOWN_GATED, KNOWN_VERIFIERS, RolesTable } from './roles';
 import { Clock, errText } from './util';
 
 export type Iface = 'ObjectDetector' | 'MotionSensor' | 'OccupancySensor' | 'AudioSensor' | 'BinarySensor' | 'Online';
@@ -377,7 +377,7 @@ export class CameraCore {
         const ctx = this.ctx();
         if (!layerSource && !d.mixinId && device === this.env.id && this.mixinKinds.has(kind)) {
             // no layer claimed it and the camera does not implement it: the mixin that does, or nobody yet (context only)
-            layerSource = this.kindOwner[kind];
+            layerSource = this.kindOwner[kind] ?? this.sensorlessOwner(kind);
             if (!layerSource) {
                 this.contextChanged(device, kind === 'occupancy' ? 'occupied' : kind, on);
                 if (!on) this.tracker.hold(key, false);
@@ -401,6 +401,23 @@ export class CameraCore {
                 if (key !== `${kind}:plain`) { this.tracker.hold(`${kind}:plain`, false); this.plainOn.delete(kind); }
             }
         }
+    }
+
+    /**
+     * A sensorless camera (no motion of its own, e.g. a crop): its motion and occupancy can only be a gated verifier's (Coral
+     * Guard's verified motion). Such a mixin is outermost, so no layer listener hears it and its edges arrive plain only:
+     * they belong to the outermost gated mixin. A camera with motion of its own keeps its unclaimed edges as context.
+     */
+    private sensorlessOwner(kind: BinaryKind): string | undefined {
+        const st = this.env.state(this.env.id);
+        if (kind === 'audio' || !st?.providedInterfaces || st.providedInterfaces.includes('MotionSensor')) return undefined;
+        for (const m of [...(st.mixins ?? [])].reverse()) {
+            const p = this.env.pluginOf(m);
+            if (!p || p === this.env.selfPlugin) continue;
+            const row = this.env.roles.get(p);
+            if (row ? row.gated : KNOWN_GATED.includes(p)) return p;
+        }
+        return undefined;
     }
 
     /**
