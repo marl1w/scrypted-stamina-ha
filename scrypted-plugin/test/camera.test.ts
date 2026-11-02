@@ -378,6 +378,22 @@ test('split: capabilities name the views and the parent; mirrors are not views a
     assert.equal(isMirror(x.sc.devices.get('502')), false);
 });
 
+test('split: a mirror\'s presence child (a parked car) opens no event; its own motion does', () => {
+    const x = splitSetup();
+    x.sc.add({ id: '504', name: 'Parent mirror Vehicle presence', pluginId: CAMP, providerId: '503', interfaces: ['OccupancySensor'], mixins: [] });
+    const out: { type: string; body: any }[] = [];
+    const mirror = new CameraCore(x.sc.env('503', x.clock, x.roles), {
+        publish: (type, body) => out.push({ type, body }), eventStarted: () => { }, eventEnded: () => { }, subjectDecided: () => { },
+    });
+    mirror.bind();
+    x.sc.emit('504', 'OccupancySensor', true, {});
+    x.clock.advance(5000);
+    assert.equal(out.filter(m => m.type === 'event.start').length, 0, 'a parked car only sets context');
+    x.sc.emit('503', 'MotionSensor', true, {});
+    x.clock.advance(1000);
+    assert.equal(out.filter(m => m.type === 'event.start').length, 1);
+});
+
 test('split: the parent\'s whole-frame AI alone opens no event, on the parent or on the crop', () => {
     const x = splitSetup();
     for (let i = 0; i < 5; i++) { x.ai(); x.clock.advance(1000); }

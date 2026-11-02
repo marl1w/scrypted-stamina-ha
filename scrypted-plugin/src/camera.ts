@@ -232,7 +232,12 @@ export class CameraCore {
             if (!ks) continue;
             // a child camera (a view: crop or mirror) has its own mixin: not ours to observe
             if (has(ks, 'VideoCamera')) continue;
-            if (has(ks, 'OccupancySensor')) on(k, 'OccupancySensor', (d, v) => this.onBinary('occupancy', `occupancy:${k}`, d, !!v, k));
+            // a mirror's per-class presence children hold still subjects (a parked car): context only; its own
+            // motion and occupancy, the crop's verdict, start its events
+            if (has(ks, 'OccupancySensor')) {
+                if (isMirror(st)) on(k, 'OccupancySensor', (_d, v) => this.contextChanged(k, featureOf(ks.name), !!v));
+                else on(k, 'OccupancySensor', (d, v) => this.onBinary('occupancy', `occupancy:${k}`, d, !!v, k));
+            }
             if (has(ks, 'BinarySensor')) on(k, 'BinarySensor', (_d, v) => this.contextChanged(k, featureOf(ks.name), !!v));
             if (has(ks, 'ObjectDetector')) on(k, 'ObjectDetector', (d, data) => this.onDetections(d, data));
         }
