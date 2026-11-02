@@ -5,7 +5,7 @@ import sdk, { FFmpegInput, HttpRequest, HttpRequestHandler, HttpResponse, MixinP
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from '@scrypted/sdk/settings-mixin';
 import child_process from 'child_process';
 import { apiPath, ClipInfo, clipInfo } from './api';
-import { CameraCore, CameraEnv, DeviceState, Iface, isMirror } from './camera';
+import { CameraCore, CameraEnv, DeviceState, Iface } from './camera';
 import { NUMBER_SETTINGS, PLUGIN_ID, readNumber, NumberKey } from './config';
 import { Engine, Host, StreamOptionsInfo } from './engine';
 import { applySourceSetting, CameraStatus, cameraStatusLines, sourceSettings } from './settings';
@@ -42,7 +42,7 @@ async function toInput(mo: any): Promise<StreamInput> {
 }
 
 export class StaminaMixin extends SettingsMixinDeviceBase<any> {
-    /** undefined for a mirror camera: it is never observed (its source camera is), so no duplicate events */
+    /** the camera's tracker and open event (undefined only if attaching failed) */
     readonly core?: CameraCore;
 
     constructor(options: SettingsMixinDeviceOptions<any>, private provider: StaminaProvider) {
@@ -70,18 +70,15 @@ export class StaminaMixin extends SettingsMixinDeviceBase<any> {
             selfPlugin: PLUGIN_ID,
             listenAll: (iface, cb) => provider.listenAll(iface, cb),
         };
-        // a mirror view repeats a crop for another Home: observing it would duplicate that crop's events
-        if (isMirror(deviceState(id))) {
-            this.console.log(`${this.name || id}: a mirror view, not observed (its source camera is)`);
-            return;
-        }
+        // a mirror view (a crop repeated for another Home) is observed too, so it is listed in that Home's area;
+        // its events repeat the crop's
         // a rebuilt mixin chain re-creates the mixin: the camera's core (tracker, open event) carries over
         this.core = provider.engine.attach(env);
     }
 
     async getMixinSettings(): Promise<Setting[]> {
         if (!this.core)
-            return [{ key: 'stamina:status', title: 'Stamina', readonly: true, value: 'Mirror view: not watched. Its source camera is, so its events are not counted twice.' }];
+            return [{ key: 'stamina:status', title: 'Stamina', readonly: true, value: 'Starting…' }];
         const e = this.provider.engine;
         const info = e.camerasInfo().find(c => c.id === this.id);
         const caps = info?.capabilities;
