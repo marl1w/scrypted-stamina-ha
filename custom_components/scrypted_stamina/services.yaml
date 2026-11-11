@@ -1,0 +1,8 @@
+delete_copies:
+  fields:
+    event_id:
+      required: true
+      example: "ev_LeWsqniwfIAHrCi_rPwIyA"
+      selector:
+        text:
+          multiple: true

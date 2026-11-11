@@ -233,5 +233,31 @@
       "title": "{destination} is over its quota",
       "description": "Pending footage could not fit inside the quota of {destination}, and no committed event was left to remove for room. The footage was uploaded anyway, over the quota. Raise the quota, or free space on the destination."
     }
+  },
+  "services": {
+    "delete_copies": {
+      "name": "Delete event videos",
+      "description": "Deletes the videos of finished events from every destination. The events stay in the history, and the model keeps learning from them.",
+      "fields": {
+        "event_id": {
+          "name": "Event IDs",
+          "description": "The IDs of the events whose videos to delete, as the panel shows them."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "not_loaded": {
+      "message": "Scrypted Stamina is not loaded."
+    },
+    "event_undecided": {
+      "message": "Event {event_id} is still being decided; try again once it is finished."
+    },
+    "event_not_found": {
+      "message": "There is no event {event_id}."
+    },
+    "delete_failed": {
+      "message": "Could not delete the videos of event {event_id}: {error}"
+    }
   }
 }

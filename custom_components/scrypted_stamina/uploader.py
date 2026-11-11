@@ -933,6 +933,23 @@ class Uploader:
         self._on_quota()
         _LOGGER.debug("Evicted %s from %s", event_id, target.label)
 
+    async def async_delete_copies(self, event_id: str) -> list[str]:
+        """Delete one finished event's videos (and any pending folder) from every destination.
+
+        The quota's own eviction, asked for by hand: the index keeps the event, its copies are
+        marked deleted. Returns the labels of the destinations that held a copy; one that fails
+        raises, after the destinations before it were cleared.
+        """
+        copies = await self._index.async_copies(event_id)
+        cleared: list[str] = []
+        for subentry_id, target in self.targets.items():
+            copy = copies.get(subentry_id)
+            if copy is None or copy.deleted:
+                continue
+            await self._async_evict(target, event_id)
+            cleared.append(target.label)
+        return cleared
+
     async def async_retention(
         self, now: float, settled_orphan: Callable[[str], Awaitable[bool]]
     ) -> None:

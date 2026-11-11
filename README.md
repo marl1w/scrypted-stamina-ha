@@ -88,6 +88,7 @@ Status: design. See [docs/architecture.md](docs/architecture.md) and [docs/plan.
 
 **Release notes (next release).**
 
+- New admin service `scrypted_stamina.delete_copies` (`event_id`: one or more ids): deletes the videos of finished events from every destination, as the quota's eviction does. The events stay in the history and the model keeps learning from them. For a kept event that turned out to be a false alarm.
 - The area sensor's unique id changed from `…_quota` to `…_quota_used` (`sensor.stamina_<area>_quota_used`). The old entity is removed at startup and its history does not carry over; automations or dashboards that used the old entity id need the new one.
 - The commit spool moved from `<config>/scrypted_stamina_spool` to `<config>/.cache/scrypted_stamina_spool`, which Home Assistant's backups leave out. It is moved at the first startup; nothing to do.
 

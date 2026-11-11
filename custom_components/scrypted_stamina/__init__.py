@@ -52,6 +52,7 @@ from .index import EventIndex
 from .manager import StaminaManager
 from .panel import async_register_panel, async_unregister_panel
 from .playback import async_register_views
+from .services import async_register_services
 from .uploader import Target, Uploader
 from .websocket_api import async_register_commands
 
@@ -157,6 +158,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: StaminaConfigEntry) -> b
     await hass.config_entries.async_forward_entry_setups(entry, [Platform(p) for p in PLATFORMS])
     async_register_views(hass)
     async_register_commands(hass)
+    async_register_services(hass)
     await async_register_panel(hass, entry)
     entry.runtime_data.reload_key = _reload_key(entry)
     entry.async_on_unload(entry.add_update_listener(_async_reload))
