@@ -378,6 +378,37 @@ test('split: capabilities name the views and the parent; mirrors are not views a
     assert.equal(isMirror(x.sc.devices.get('502')), false);
 });
 
+test('split: the role is the announced model, whatever id the camera kept from its earlier role', () => {
+    assert.equal(isMirror({ nativeId: 'cam1-crop-spot-b', model: 'Mirror' }), true);
+    assert.equal(isMirror({ nativeId: 'cam1-mirror-spot-a', model: 'Crop' }), false);
+    assert.equal(isMirror({ nativeId: 'cam1-mirror-gate' }), true, 'no model announced: the native id');
+});
+
+test('split: a mirror (no verifier mixin of its own) vetoes by the verdicts its source relays', () => {
+    const x = splitSetup();
+    // the mirror keeps the id it had as a crop; Coral Guard runs on its source, not on it
+    x.sc.add({ id: '505', name: 'Spot B', pluginId: CAMP, nativeId: 'cam1-crop-spot-b', model: 'Mirror', providerId: '501', interfaces: ['VideoCamera', 'MotionSensor', 'ObjectDetector'], mixins: [] });
+    const out: { type: string; body: any }[] = [];
+    const mirror = new CameraCore(x.sc.env('505', x.clock, x.roles), {
+        publish: (type, body) => out.push({ type, body }), eventStarted: () => { }, eventEnded: () => { }, subjectDecided: () => { },
+    });
+    mirror.bind();
+    x.sc.emit('505', 'ObjectDetector', { sourceId: '913', timestamp: x.clock.now(), detections: [{ className: 'verified_person', score: 1 }] });
+    x.clock.advance(30_000);
+    assert.deepEqual(mirror.verifiers(), [CG]);
+    assert.equal(mirror.verifierLive(), true);
+    out.length = 0;
+    x.sc.emit('505', 'MotionSensor', true, {});            // wind: the source's verifier confirms nothing
+    x.clock.advance(1000);
+    x.sc.emit('505', 'MotionSensor', false, {});
+    x.clock.advance(20_000);
+    const end = out.filter(m => m.type === 'event.end').pop()!.body.event;
+    assert.deepEqual(end.subjects.map((s: any) => s.verdict), ['vetoed']);
+    // the same camera announced as a crop must carry the verifier itself
+    x.sc.devices.get('505')!.model = 'Crop';
+    assert.deepEqual(mirror.verifiers(), []);
+});
+
 test('split: a mirror\'s presence child (a parked car) opens no event; its own motion does', () => {
     const x = splitSetup();
     x.sc.add({ id: '504', name: 'Parent mirror Vehicle presence', pluginId: CAMP, providerId: '503', interfaces: ['OccupancySensor'], mixins: [] });

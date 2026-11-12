@@ -21,7 +21,7 @@ function deviceState(id: string): DeviceState | undefined {
     const d: any = systemManager.getDeviceById(id);
     if (!d || !Array.isArray(d.interfaces)) return undefined;
     return {
-        name: d.name, pluginId: d.pluginId, nativeId: d.nativeId, providerId: d.providerId, interfaces: d.interfaces,
+        name: d.name, pluginId: d.pluginId, nativeId: d.nativeId, model: d.info?.model, providerId: d.providerId, interfaces: d.interfaces,
         providedInterfaces: d.providedInterfaces, mixins: d.mixins,
         motionDetected: d.motionDetected, occupied: d.occupied, audioDetected: d.audioDetected, binaryState: d.binaryState, online: d.online,
     };

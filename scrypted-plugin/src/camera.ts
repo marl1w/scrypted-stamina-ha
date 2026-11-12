@@ -13,6 +13,8 @@ export interface DeviceState {
     name?: string;
     pluginId?: string;
     nativeId?: string;
+    /** the device's announced model: a derived camera's role ('Crop' or 'Mirror' from the Reolink plugin) */
+    model?: string;
     /** the device that provides it (a crop camera's parent camera) */
     providerId?: string;
     interfaces: string[];
@@ -84,8 +86,14 @@ const SAME_EDGE_MS = 1000;
 type BinaryKind = 'motion' | 'occupancy' | 'audio';
 const KIND_IFACE: Record<BinaryKind, Iface> = { motion: 'MotionSensor', occupancy: 'OccupancySensor', audio: 'AudioSensor' };
 
-/** A mirror camera repeats another camera's view (for another Home): never observed, so no duplicate events. */
-export function isMirror(st: Pick<DeviceState, 'nativeId'> | undefined): boolean {
+/**
+ * A mirror camera repeats another camera's view (for another Home) and its verdicts. The role is the announced model
+ * ('Mirror' / 'Crop'); the native id only for a camera plugin that announces none, because a derived camera keeps the id of
+ * its earlier role (a mirror on `...-crop-...` after the two swapped).
+ */
+export function isMirror(st: Pick<DeviceState, 'nativeId' | 'model'> | undefined): boolean {
+    if (st?.model === 'Mirror') return true;
+    if (st?.model === 'Crop') return false;
     return /-mirror-/i.test(String(st?.nativeId ?? ''));
 }
 
@@ -484,13 +492,15 @@ export class CameraCore {
 
     /**
      * Verifier sources (role verifier now) that emitted a detection on this camera in the last 7 days and are still among
-     * its mixins (a verifier removed from the camera is no longer present).
+     * its mixins (a verifier removed from the camera is no longer present). A mirror carries no verifier of its own: it repeats
+     * its source's verdicts, so a verifier whose detections reach it counts without being its mixin.
      */
     verifiers(): string[] {
         const now = this.env.clock.now();
         const mixins = this.mixinPlugins();
+        const mirror = isMirror(this.env.state(this.env.id));
         return Object.entries(this.verifiersSeen)
-            .filter(([s, t]) => now - t <= VERIFIER_RECENT_MS && this.env.roles.get(s)?.role === 'verifier' && mixins.has(s))
+            .filter(([s, t]) => now - t <= VERIFIER_RECENT_MS && this.env.roles.get(s)?.role === 'verifier' && (mirror || mixins.has(s)))
             .map(([s]) => s).sort();
     }
 
